@@ -3,6 +3,7 @@
   "productName": "gw-client",
   "version": "0.1.0",
   "identifier": "com.gawaty.client",
+  "license": "MIT",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:5173",

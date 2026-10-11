@@ -46,3 +46,17 @@ pnpm tauri build  # NSIS 安装包 + sidecar 打包
 - 健康 (channel × model) 粒度：401/403 整渠道隔离，404 只隔离该模型 6h，429/5xx 指数退避 15s→300s
 - 提交点：流式请求在收到第一个合法内容帧后才向客户端写首字节（I1：提交前零字节），失败切换对客户端完全透明
 - 中途断流：网关补 repair 帧（`gateway_upstream_interrupted`）+ 正常终止符，客户端永远拿到结构完整的响应
+
+## 下载与安装
+
+最新版本见 [Releases](https://github.com/iuuuuuuuu/ai-router-gateway/releases)。
+
+| 文件 | 说明 |
+|---|---|
+| `gw-client_0.1.0_x64-setup.exe` | 桌面控制台 NSIS 安装包（内含 `gw-server` sidecar，安装后托盘常驻、可开机自启） |
+| `gw-server-x86_64-pc-windows-msvc.exe` | 仅服务端，裸跑用（见上「快速开始」） |
+| `SHA256SUMS.txt` | 上述文件的 SHA256 校验和 |
+
+## 许可证
+
+[MIT](LICENSE) © 2026 杨鹏豪
