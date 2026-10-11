@@ -23,8 +23,47 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
+/// Shared reqwest client pool keyed by the configured connect timeout.
+///
+/// The connect timeout is a *config* value (retry.connect_timeout_ms), so it
+/// cannot be baked into one client at startup: a PUT /admin/api/config that
+/// tightens the timeout must take effect without a restart. The pool keeps at
+/// most one client per distinct ms value and rebuilds only when the value
+/// changes; every rebuild keeps the same idle-pool behaviour as before.
+#[derive(Default, Clone)]
+pub struct HttpPool {
+    // Arc so that every clone of AppState shares one cache: axum clones the
+    // state per request and each clone must see the same pooled client.
+    cached: std::sync::Arc<std::sync::Mutex<Option<(u64, reqwest::Client)>>>,
+}
+
+impl HttpPool {
+    /// Client whose TCP connect timeout is connect_timeout_ms.
+    pub fn client_for(&self, connect_timeout_ms: u64) -> reqwest::Client {
+        let ms = connect_timeout_ms.max(1);
+        let mut guard = match self.cached.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some((cached_ms, client)) = guard.as_ref() {
+            if *cached_ms == ms {
+                return client.clone();
+            }
+        }
+        let client = reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(90))
+            .connect_timeout(Duration::from_millis(ms))
+            .build()
+            // A client that cannot be built is a startup-level bug, not a
+            // per-request one; fall back to a default client rather than panic.
+            .unwrap_or_else(|_| reqwest::Client::new());
+        *guard = Some((ms, client.clone()));
+        client
+    }
+}
+
 pub struct AppState {
-    pub http: reqwest::Client,
+    pub http: HttpPool,
     pub config: crate::config::ConfigHolder,
     pub health: Arc<HealthRegistry>,
     pub store: Arc<crate::store::Store>,
@@ -282,6 +321,7 @@ async fn attempt_once(
     let body = render_upstream_body(ctx, cand);
 
     let req = ctx.state.http
+        .client_for(budget.connect_timeout.as_millis() as u64)
         .post(&url)
         .headers(upstream_headers(cand))
         .json(&body);

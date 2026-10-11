@@ -160,7 +160,9 @@ pub async fn test_channel(State(state): State<AppState>, headers: HeaderMap, Jso
     };
 
     let started = Instant::now();
-    let mut http = state.http.post(&url).json(&body);
+    // Probe with the SAME connect timeout the data plane uses right now, so a
+    // config change is reflected in the admin connectivity test too.
+    let mut http = state.http.client_for(snap.config.retry.connect_timeout_ms).post(&url).json(&body);
     http = match ch.protocol {
         crate::config::Protocol::Openai => http.bearer_auth(&ch.api_key),
         crate::config::Protocol::Anthropic => http.header("x-api-key", &ch.api_key).header("anthropic-version", "2023-06-01"),

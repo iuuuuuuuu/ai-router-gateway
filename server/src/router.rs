@@ -104,7 +104,13 @@ pub fn build_plan(cfg: &Config, group: &Group, exposed_model: &str, health: &Hea
 
     for tier in tiers {
         let mut members: Vec<&crate::config::TierMember> = tier.members.iter().collect();
-        members.sort_by(|a, b| b.weight.cmp(&a.weight).then(a.model_id.cmp(&b.model_id)));
+        if cfg.auto_weight {
+            // Opt-in auto weighting: heaviest member first; sort_by is stable,
+            // so equal weights keep the declared order.
+            members.sort_by(|a, b| b.weight.cmp(&a.weight));
+        }
+        // auto_weight = false (the default) leaves the declared order of
+        // tiers[].members untouched: no weight sort, no model_id sort.
         for member in members {
             let Some(m): Option<&ModelBinding> = cfg.find_model(&member.model_id) else { continue };
             if !m.enabled || m.exposed != exposed_model { continue }

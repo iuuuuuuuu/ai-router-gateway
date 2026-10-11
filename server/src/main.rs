@@ -33,13 +33,11 @@ async fn main() -> anyhow::Result<()> {
     let holder = config::ConfigHolder::default();
     holder.publish(config);
 
-    let http_client = reqwest::Client::builder()
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()?;
-
+    // The connect timeout lives in config.retry.connect_timeout_ms and is
+    // resolved per request through proxy::HttpPool, so an admin config update
+    // applies without a restart.
     let state = Arc::new(proxy::AppState {
-        http: http_client,
+        http: proxy::HttpPool::default(),
         config: holder,
         health: health.clone(),
         store: store.clone(),

@@ -43,11 +43,13 @@ export function normalize(cfg: any): AdminConfig {
   const c: AdminConfig = {
     listen: cfg?.listen ?? { http: "0.0.0.0:8080", https: "0.0.0.0:8443", https_enabled: true },
     admin: cfg?.admin ?? { bind: "127.0.0.1:9090", key: null },
+    // 默认关闭：同级按列表顺序依次尝试（与 server/src/config.rs 的 d_auto_weight 一致）。
+    auto_weight: cfg?.auto_weight ?? false,
     // Mirrors server/src/config.rs d_* defaults so a fresh DB looks sane.
     retry: cfg?.retry ?? {
-      max_attempts: 12, max_cycles: 2, total_deadline_ms: 600000, attempt_deadline_ms: 45000,
-      connect_timeout_ms: 10000, ttfb_timeout_ms: 30000, first_event_timeout_ms: 10000,
-      chunk_idle_timeout_ms: 20000, reserve_ms: 5000, cooldown_wait: true,
+      max_attempts: 6, max_cycles: 2, total_deadline_ms: 180000, attempt_deadline_ms: 25000,
+      connect_timeout_ms: 5000, ttfb_timeout_ms: 15000, first_event_timeout_ms: 8000,
+      chunk_idle_timeout_ms: 15000, reserve_ms: 3000, cooldown_wait: true,
     },
     channels: cfg?.channels ?? [],
     models: cfg?.models ?? [],

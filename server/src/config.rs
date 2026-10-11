@@ -40,16 +40,16 @@ pub struct RetryConfig {
     pub cooldown_wait: bool,
 }
 
-fn d_max_attempts() -> u32 { 12 }
+fn d_max_attempts() -> u32 { 6 }
 fn d_max_cycles() -> u32 { 2 }
-// Must satisfy I4 against the other defaults: 12 x 45_000 + 5_000 = 545_000 <= 600_000.
-fn d_total_deadline_ms() -> u64 { 600_000 }
-fn d_attempt_deadline_ms() -> u64 { 45_000 }
-fn d_connect_timeout_ms() -> u64 { 10_000 }
-fn d_ttfb_timeout_ms() -> u64 { 30_000 }
-fn d_first_event_timeout_ms() -> u64 { 10_000 }
-fn d_chunk_idle_timeout_ms() -> u64 { 20_000 }
-fn d_reserve_ms() -> u64 { 5_000 }
+// Must satisfy I4 against the other defaults: 6 x 25_000 + 3_000 = 153_000 <= 180_000.
+fn d_total_deadline_ms() -> u64 { 180_000 }
+fn d_attempt_deadline_ms() -> u64 { 25_000 }
+fn d_connect_timeout_ms() -> u64 { 5_000 }
+fn d_ttfb_timeout_ms() -> u64 { 15_000 }
+fn d_first_event_timeout_ms() -> u64 { 8_000 }
+fn d_chunk_idle_timeout_ms() -> u64 { 15_000 }
+fn d_reserve_ms() -> u64 { 3_000 }
 fn d_true() -> bool { true }
 
 impl Default for RetryConfig {
@@ -176,6 +176,12 @@ pub struct Config {
     pub admin: AdminConfig,
     #[serde(default)]
     pub retry: RetryConfig,
+    /// Routing-order switch. false (default): each tier is tried in the order
+    /// the members are declared in the config, with no weight/id sorting.
+    /// true: opt-in auto weighting — each tier is sorted by member weight
+    /// descending, ties keeping the declared order.
+    #[serde(default)]
+    pub auto_weight: bool,
     #[serde(default)]
     pub channels: Vec<Channel>,
     #[serde(default)]
@@ -192,6 +198,7 @@ impl Default for Config {
             listen: ListenConfig::default(),
             admin: AdminConfig::default(),
             retry: RetryConfig::default(),
+            auto_weight: false,
             channels: vec![],
             models: vec![],
             groups: vec![],

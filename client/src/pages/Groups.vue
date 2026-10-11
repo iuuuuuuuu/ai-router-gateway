@@ -2,7 +2,9 @@
 // 分组路由：一级 → 二级 → 三级 的故障转移可视化与编辑。
 // 页面只改 state.cfg 并 markDirty()，保存由顶栏统一负责。
 import { computed, onMounted, ref } from "vue";
-import { ChevronDown, LayoutDashboard, Pencil, Plus, RefreshCw, Trash2, Waypoints } from "@lucide/vue";
+import {
+  ArrowDown, ArrowUp, ChevronDown, LayoutDashboard, Pencil, Plus, RefreshCw, Trash2, Waypoints,
+} from "@lucide/vue";
 import {
   Alert, Badge, Btn, Card, Empty, Field, IconBtn, Modal,
   TInput, TSelect, TTextarea,
@@ -43,7 +45,15 @@ function exposedOf(g: Group): string[] {
 }
 
 /** 回环提示里的轮数来自全局重试配置。 */
-const maxCycles = computed(() => state.cfg?.retry.max_cycles ?? 3);
+const maxCycles = computed(() => state.cfg?.retry.max_cycles ?? 2);
+
+/**
+ * 自动权重开关（AdminConfig.auto_weight，默认关）：
+ * 关闭时同级成员按列表顺序依次尝试，权重不参与分配 —— 所以界面上把权重输入换成顺序号 + 上移/下移；
+ * 开启时才恢复权重输入框，由权重降序决定尝试次序。
+ * 顺序即数组顺序，保存时直接按 draft 里 members 的数组序写入，不需要额外排序。
+ */
+const autoWeight = computed(() => state.cfg?.auto_weight ?? false);
 
 /* ------------------------------ 分组统计 ------------------------------ */
 // 数据来自 GET /admin/api/stats（不传 group_id = 全量：summary 是全局汇总，
@@ -231,6 +241,14 @@ function removeTier(index: number) {
   if (!d || d.tiers.length <= 1) return;
   d.tiers.splice(index, 1);
   d.tiers.forEach((t, i) => { t.level = i + 1; });
+}
+/** 同级内上移 / 下移一位：直接调换数组顺序，界面顺序即保存顺序。 */
+function moveMember(tier: Tier, index: number, delta: number) {
+  const to = index + delta;
+  if (to < 0 || to >= tier.members.length) return;
+  const [m] = tier.members.splice(index, 1);
+  if (!m) return;
+  tier.members.splice(to, 0, m);
 }
 
 /* -------------------------------- 校验 -------------------------------- */
@@ -566,7 +584,7 @@ function confirmRemoveMember() {
                 <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
                   <template v-if="t.members.length">
                     <div
-                      v-for="m in t.members"
+                      v-for="(m, mi) in t.members"
                       :key="m.model_id"
                       class="flex items-center gap-2 rounded-[10px] border px-2.5 py-1"
                       :class="isActiveTier(t.level)
@@ -577,7 +595,9 @@ function confirmRemoveMember() {
                         class="font-mono text-[12.5px] text-ink"
                         :title="optionOf(m.model_id)?.hint ? '上游 ' + optionOf(m.model_id)?.hint : undefined"
                       >{{ bindingLabel(m.model_id) }}</span>
-                      <Badge tone="gray">权重 {{ m.weight }}</Badge>
+                      <Badge tone="gray" :data-test="autoWeight ? 'badge-weight' : 'badge-order'">
+                        {{ autoWeight ? `权重 ${m.weight}` : `顺序 ${mi + 1}` }}
+                      </Badge>
                     </div>
                   </template>
                   <span v-else class="py-1 text-[12px] text-ink-3">该级无成员</span>
@@ -628,7 +648,10 @@ function confirmRemoveMember() {
         <div>
           <div class="mb-2.5 flex items-end justify-between gap-2">
             <span class="text-[12.5px] font-medium text-ink-2">路由层级</span>
-            <span class="text-[11.5px] text-ink-3">按 一级 → 二级 → 三级 顺序尝试，同级内按权重分配</span>
+            <span class="text-[11.5px] text-ink-3" data-test="tier-hint">
+              <template v-if="autoWeight">按 一级 → 二级 → 三级 顺序尝试，同级内按权重降序分配</template>
+              <template v-else>按 一级 → 二级 → 三级 顺序尝试，同级内按列表顺序依次尝试（自动权重已关闭）</template>
+            </span>
           </div>
 
           <Alert v-if="!models.length" tone="warn" class="mb-2.5">
@@ -683,10 +706,49 @@ function confirmRemoveMember() {
                       该模型在本层被选了多次，请换一个。
                     </p>
                   </div>
-                  <span class="shrink-0 text-[11.5px] text-ink-3">权重</span>
-                  <div class="w-20 shrink-0">
-                    <TInput v-model.number="m.weight" type="number" size="sm" />
-                  </div>
+                  <!-- 自动权重关闭（默认）：不显示权重，用顺序号 + 上移/下移表达尝试次序 -->
+                  <template v-if="!autoWeight">
+                    <span
+                      class="shrink-0 rounded-md border border-line bg-app px-1.5 py-0.5 font-mono text-[11.5px] text-ink-2"
+                      data-test="member-order"
+                      :title="`同级第 ${mi + 1} 个尝试`"
+                    >{{ mi + 1 }}</span>
+                    <div class="flex shrink-0 items-center gap-0.5">
+                      <IconBtn
+                        title="上移"
+                        :disabled="mi === 0"
+                        @click="moveMember(t, mi, -1)"
+                      >
+                        <ArrowUp :size="14" />
+                      </IconBtn>
+                      <IconBtn
+                        title="下移"
+                        :disabled="mi === t.members.length - 1"
+                        @click="moveMember(t, mi, 1)"
+                      >
+                        <ArrowDown :size="14" />
+                      </IconBtn>
+                    </div>
+                  </template>
+                  <!-- 自动权重开启：恢复权重输入框（上移/下移同样可用） -->
+                  <template v-else>
+                    <span class="shrink-0 text-[11.5px] text-ink-3">权重</span>
+                    <div class="w-20 shrink-0" data-test="member-weight">
+                      <TInput v-model.number="m.weight" type="number" size="sm" />
+                    </div>
+                    <div class="flex shrink-0 items-center gap-0.5">
+                      <IconBtn title="上移" :disabled="mi === 0" @click="moveMember(t, mi, -1)">
+                        <ArrowUp :size="14" />
+                      </IconBtn>
+                      <IconBtn
+                        title="下移"
+                        :disabled="mi === t.members.length - 1"
+                        @click="moveMember(t, mi, 1)"
+                      >
+                        <ArrowDown :size="14" />
+                      </IconBtn>
+                    </div>
+                  </template>
                   <IconBtn title="删除成员" danger @click="removeMemberAt(t, mi)">
                     <Trash2 :size="15" />
                   </IconBtn>

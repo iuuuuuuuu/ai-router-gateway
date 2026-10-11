@@ -13,7 +13,7 @@ const props = defineProps<{
   models: ModelBinding[];
   /** 被一级故障转移层级引用的绑定 id，仅用于高亮。 */
   activeIds: Set<string>;
-  /** 权重最高的启用渠道 —— 仅用于「使用中」高亮，不参与调度决策。 */
+  /** 列表里第一个启用的渠道 —— 仅用于「使用中」高亮，不参与调度决策。 */
   active: boolean;
   /** 该渠道的连通测试是否进行中。 */
   testing: boolean;
@@ -66,7 +66,6 @@ const enabledModels = computed(() => props.models.filter(m => m.enabled).length)
         <div class="flex min-w-0 flex-wrap items-center gap-1.5">
           <span class="truncate text-[13.5px] font-semibold text-ink">{{ channel.name || channel.id }}</span>
           <Badge tone="teal">{{ channel.protocol }}</Badge>
-          <Badge tone="gray">权重 {{ channel.weight }}</Badge>
           <Badge v-if="!channel.enabled" tone="err">已停用</Badge>
         </div>
         <div class="mt-1 flex min-w-0 items-center gap-2">

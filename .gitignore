@@ -58,6 +58,7 @@
 /tools/verify-e2e-final.mjs
 /tools/cdp-i5.mjs
 /tools/verify-i5.mjs
+/tools/accept-task19.mjs
 
 # ── 根目录截图证据（开发期产物）─────────────────────────────
 /*.png

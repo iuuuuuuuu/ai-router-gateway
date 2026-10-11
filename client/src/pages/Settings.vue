@@ -45,11 +45,11 @@ type RetryNumbers = Pick<
 
 const RETRY_PRESETS: { value: string; label: string; hint: string; patch: RetryNumbers }[] = [
   {
-    value: "default", label: "服务端默认", hint: "12×45s",
+    value: "default", label: "服务端默认", hint: "6×25s",
     patch: {
-      max_attempts: 12, max_cycles: 2, total_deadline_ms: 600000, attempt_deadline_ms: 45000,
-      connect_timeout_ms: 10000, ttfb_timeout_ms: 30000, first_event_timeout_ms: 10000,
-      chunk_idle_timeout_ms: 20000, reserve_ms: 5000, cooldown_wait: true,
+      max_attempts: 6, max_cycles: 2, total_deadline_ms: 180000, attempt_deadline_ms: 25000,
+      connect_timeout_ms: 5000, ttfb_timeout_ms: 15000, first_event_timeout_ms: 8000,
+      chunk_idle_timeout_ms: 15000, reserve_ms: 3000, cooldown_wait: true,
     },
   },
   {
@@ -161,7 +161,7 @@ async function toggleAutostart() {
 onMounted(() => {
   // 老配置可能没有 reserve_ms，补一个默认值，避免预算公式算不出来。
   const r = retry.value;
-  if (r && typeof r.reserve_ms !== "number") r.reserve_ms = 5000;
+  if (r && typeof r.reserve_ms !== "number") r.reserve_ms = 3000;
   void loadAutostart();
 });
 </script>
@@ -233,6 +233,21 @@ onMounted(() => {
           <Field label="预留余量 (ms)" hint="预留余量（ms）：给收尾/补帧留的时间">
             <TInput v-model.number="retry.reserve_ms" type="number" @input="markDirty()" />
           </Field>
+        </div>
+
+        <div class="mt-4 border-t border-line-soft pt-4">
+          <TToggle
+            v-model="cfg.auto_weight"
+            label="自动权重"
+            data-test="auto-weight"
+            @update:model-value="markDirty()"
+          />
+          <p class="mt-1 text-[11.5px] leading-4 text-ink-3">
+            关闭时同级按列表顺序依次尝试；开启后同级按权重降序。
+          </p>
+          <p class="mt-1 text-[11.5px] leading-4 text-ink-3">
+            顺序在「分组路由」页用上移 / 下移调整；权重输入框只在开启本开关后出现。
+          </p>
         </div>
 
         <div class="mt-4 border-t border-line-soft pt-4">

@@ -17,6 +17,8 @@ export interface RetryConfig {
 export interface AdminConfig {
   listen: ListenConfig;
   admin: AdminPlane;
+  /** 同级候选的分配方式：false（默认）= 按列表顺序依次尝试；true = 按权重降序。 */
+  auto_weight: boolean;
   retry: RetryConfig;
   channels: Channel[];
   models: ModelBinding[];

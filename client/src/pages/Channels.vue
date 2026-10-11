@@ -24,17 +24,11 @@ const protocolOptions = [
 ];
 
 /**
- * 「使用中」标注口径：enabled === true 且 weight 最高的那个渠道；
- * 权重并列时取列表中最靠前的一个。仅用于列表高亮，不参与调度决策。
+ * 「使用中」标注口径：列表里第一个 enabled === true 的渠道。
+ * 渠道的 weight 在服务端不参与路由（同级候选由分组层级里的顺序/权重决定），
+ * 所以这里用「按顺序的第一个可用渠道」来标注，避免权重造成误导。仅用于高亮，不参与调度决策。
  */
-const activeId = computed(() => {
-  let best: Channel | null = null;
-  for (const c of channels.value) {
-    if (!c.enabled) continue;
-    if (!best || (c.weight ?? 0) > (best.weight ?? 0)) best = c;
-  }
-  return best?.id ?? "";
-});
+const activeId = computed(() => channels.value.find(c => c.enabled)?.id ?? "");
 
 /**
  * 「使用中」标注口径（模型）：被任意分组一级（level === 1）引用；
@@ -81,7 +75,6 @@ const form = reactive({
   base_url: "",
   protocol: "openai",
   api_key: "",
-  weight: "1",
   enabled: true,
   headersText: "",
 });
@@ -123,7 +116,6 @@ function openCreate() {
   form.base_url = "";
   form.protocol = "openai";
   form.api_key = "";
-  form.weight = "1";
   form.enabled = true;
   form.headersText = "";
   modalOpen.value = true;
@@ -138,7 +130,6 @@ function openEdit(ch: Channel) {
   form.base_url = ch.base_url;
   form.protocol = ch.protocol;
   form.api_key = ch.api_key;
-  form.weight = String(ch.weight ?? 1);
   form.enabled = ch.enabled;
   form.headersText = formatHeaders(ch.headers);
   modalOpen.value = true;
@@ -160,6 +151,9 @@ function save() {
     error.value = "渠道 ID「" + id + "」已存在，请换一个。";
     return;
   }
+  // weight 仍是服务端 Channel 的字段，但已不参与路由，界面不再暴露；
+  // 编辑时原样保留旧值，新增时用服务端缺省 1，避免写配置时丢字段。
+  const prev = cfg.channels.find(c => c.id === editingId.value);
   const payload: Channel = {
     id,
     name,
@@ -167,7 +161,7 @@ function save() {
     protocol: form.protocol as Channel["protocol"],
     api_key: form.api_key,
     enabled: form.enabled,
-    weight: num(form.weight, 1),
+    weight: prev?.weight ?? 1,
     headers: parseHeaders(form.headersText),
   };
   const i = cfg.channels.findIndex(c => c.id === editingId.value);
@@ -423,14 +417,9 @@ function confirmRemoveModel() {
           />
         </Field>
 
-        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <Field label="协议">
-            <TSelect v-model="form.protocol" :options="protocolOptions" />
-          </Field>
-          <Field label="权重" hint="同分组内按权重分配流量">
-            <TInput v-model="form.weight" type="number" />
-          </Field>
-        </div>
+        <Field label="协议" hint="决定请求体与鉴权头的拼装方式">
+          <TSelect v-model="form.protocol" :options="protocolOptions" />
+        </Field>
 
         <Field label="API Key" hint="仅写入本地配置文件，不会上传">
           <div class="flex items-center gap-2">

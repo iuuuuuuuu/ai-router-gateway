@@ -10,7 +10,7 @@ import {
 import {
   api, type CooldownRow as ApiCooldownRow, type Group, type RequestLog, type StatsPayload, type SwitchLog,
 } from "../api";
-import { apiKeys, bindingLabel, channelName, models } from "../store";
+import { apiKeys, bindingLabel, channelName, models, state } from "../store";
 import { closeGroupDetail } from "../nav";
 import { Alert, Badge, Btn, Card, Empty, PageHeader, Spinner, TToggle } from "../components/ui";
 
@@ -28,6 +28,12 @@ const props = defineProps<{ group: Group }>();
 // 整页有空间，日志一次多拉一些（服务端上限由路由决定，多拿不会报错）。
 const LIMIT = 200;
 const TIER_NAMES = ["一级", "二级", "三级", "四级", "五级", "六级"];
+
+/**
+ * 自动权重开关（AdminConfig.auto_weight，默认关）：
+ * 关闭时同级按列表顺序依次尝试，层级里显示「顺序 N」；开启时按权重降序，显示「权重 N」。
+ */
+const autoWeight = computed(() => state.cfg?.auto_weight ?? false);
 
 /* ------------------------------ 格式化兜底 ------------------------------ */
 // 与 Logs.vue / Stats.vue 保持同一份实现（两页各自复制了一份，这里照此复制）。
@@ -473,7 +479,10 @@ function shareText(row: Row): string {
           <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
             <Waypoints :size="15" class="text-ink-3" />
             <h2 class="text-[13.5px] font-semibold text-ink">路由层级</h2>
-            <span class="ml-auto text-[12px] text-ink-3">按 一级 → 二级 → 三级 顺序尝试</span>
+            <span class="ml-auto text-[12px] text-ink-3">
+              <template v-if="autoWeight">按 一级 → 二级 → 三级 顺序尝试，同级内按权重降序</template>
+              <template v-else>按 一级 → 二级 → 三级 顺序尝试，同级内按列表顺序</template>
+            </span>
           </div>
           <div v-if="sortedTiers.length" class="space-y-2.5 px-4 py-3.5">
             <div v-for="t in sortedTiers" :key="t.level" class="flex items-start gap-3">
@@ -483,11 +492,11 @@ function shareText(row: Row): string {
               <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
                 <template v-if="t.members?.length">
                   <div
-                    v-for="m in t.members" :key="m.model_id"
+                    v-for="(m, mi) in t.members" :key="m.model_id"
                     class="flex items-center gap-2 rounded-[10px] border border-line bg-app px-2.5 py-1"
                   >
                     <span class="font-mono text-[12px] text-ink">{{ bindingLabel(m.model_id) }}</span>
-                    <Badge tone="gray">权重 {{ m.weight }}</Badge>
+                    <Badge tone="gray">{{ autoWeight ? `权重 ${m.weight}` : `顺序 ${mi + 1}` }}</Badge>
                   </div>
                 </template>
                 <span v-else class="py-1 text-[12px] text-ink-3">该级无成员</span>

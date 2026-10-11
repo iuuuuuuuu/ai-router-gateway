@@ -669,3 +669,70 @@ async fn t28_reconcile_base_url_change_and_noop() {
     assert_eq!(cleared, 0, "a no-op PUT must not clear cooldowns");
     assert!(health.is_cooling(&CooldownKey::scoped("chB", "up-1")), "unchanged channel keeps cooling");
 }
+// =====================================================================
+// auto_weight: the routing-order switch (user requirement #1).
+// Default OFF => each tier follows the DECLARED order of tiers[].members.
+// =====================================================================
+
+// ---- 29. auto_weight=false: the declared order wins, weight/id are ignored ----
+#[tokio::test]
+async fn t29_auto_weight_off_uses_declared_order() {
+    // u0 = GoodJson, u1 = Fail500. Members are DECLARED as [m1, m0], so the
+    // declared-first candidate (m1 -> ch1 -> /u1) must be attempted FIRST and
+    // fail; only then m0 is tried. The old weight-then-id sort would have put
+    // m0 first and committed on attempt 1 with no failure at all.
+    let (base, prefixes) = spawn_fake_upstreams(&[Behavior::GoodJson, Behavior::Fail500]).await;
+    let mut cfg = test_config(&base, &prefixes, &[gw_server::config::Protocol::Openai; 2], 1, EXPOSED, test_retry());
+    cfg.retry.cooldown_wait = false; // keep the test fast
+    assert!(!cfg.auto_weight, "auto_weight must default to false");
+    cfg.groups[0].tiers = vec![Tier {
+        level: 1,
+        members: vec![
+            TierMember { model_id: "m1".into(), weight: 1 },
+            TierMember { model_id: "m0".into(), weight: 1 },
+        ],
+    }];
+    let (st, router) = gateway(cfg).await;
+    let (status, body) = post_chat(&router, EXPOSED, false).await;
+    assert_eq!(status, 200, "failover in declared order must still succeed: {body}");
+    leak_scan_json(&body);
+    let mut rows = st.store.list_switch_logs(100, None, None).unwrap();
+    rows.reverse(); // store returns newest-first; read oldest-first
+    assert_eq!(rows.len(), 2, "declared-first fails, declared-second commits: {rows:?}");
+    assert_eq!(rows[0]["channel_id"], "ch1", "declared first member is attempted first: {rows:?}");
+    assert_eq!(rows[0]["attempt_no"], 1);
+    assert_eq!(rows[0]["tier"], 1);
+    assert_eq!(rows[0]["outcome"], "failed");
+    assert_eq!(rows[1]["channel_id"], "ch0", "then the declared second member: {rows:?}");
+    assert_eq!(rows[1]["attempt_no"], 2);
+    assert_eq!(rows[1]["outcome"], "committed");
+}
+
+// ---- 30. auto_weight=true: the same config is reordered by weight ----
+#[tokio::test]
+async fn t30_auto_weight_on_sorts_by_weight() {
+    // Same upstreams and same DECLARED order [m0, m1], but m1 now weighs 5x.
+    // With the switch on, m1 (ch1 -> /u1 = 500) is attempted first, then m0.
+    let (base, prefixes) = spawn_fake_upstreams(&[Behavior::GoodJson, Behavior::Fail500]).await;
+    let mut cfg = test_config(&base, &prefixes, &[gw_server::config::Protocol::Openai; 2], 1, EXPOSED, test_retry());
+    cfg.retry.cooldown_wait = false;
+    cfg.auto_weight = true;
+    cfg.groups[0].tiers = vec![Tier {
+        level: 1,
+        members: vec![
+            TierMember { model_id: "m0".into(), weight: 1 },
+            TierMember { model_id: "m1".into(), weight: 5 },
+        ],
+    }];
+    let (st, router) = gateway(cfg).await;
+    let (status, body) = post_chat(&router, EXPOSED, false).await;
+    assert_eq!(status, 200, "weighted order must still fail over correctly: {body}");
+    leak_scan_json(&body);
+    let mut rows = st.store.list_switch_logs(100, None, None).unwrap();
+    rows.reverse();
+    assert_eq!(rows.len(), 2, "heaviest first fails, the other commits: {rows:?}");
+    assert_eq!(rows[0]["channel_id"], "ch1", "weight 5 outranks weight 1: {rows:?}");
+    assert_eq!(rows[0]["attempt_no"], 1);
+    assert_eq!(rows[1]["channel_id"], "ch0");
+    assert_eq!(rows[1]["attempt_no"], 2);
+}

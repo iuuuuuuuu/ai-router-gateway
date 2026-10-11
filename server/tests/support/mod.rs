@@ -289,11 +289,7 @@ pub async fn gateway(cfg: Config) -> (AppState, axum::Router) {
     let holder = gw_server::config::ConfigHolder::default();
     holder.publish(cfg);
     let health = Arc::new(HealthRegistry::new(Some(store.clone())));
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_millis(1000))
-        .build()
-        .unwrap();
-    let state = AppState { http, config: holder, health, store };
+    let state = AppState { http: Default::default(), config: holder, health, store };
     let router = gw_server::routes::data_plane_router(state.clone());
     (state, router)
 }

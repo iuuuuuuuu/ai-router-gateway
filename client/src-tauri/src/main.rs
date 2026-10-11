@@ -6,12 +6,27 @@ use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
+use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 
 struct GatewayChild(Mutex<Option<Child>>);
 
 /// Marker arg the autostart registration passes so a login launch stays in the
 /// tray instead of popping the window in the user's face.
 const AUTOSTART_ARG: &str = "--from-autostart";
+
+/// What the window-state plugin is allowed to persist between runs.
+///
+/// * SIZE + POSITION + MAXIMIZED + FULLSCREEN: what the user actually asked for
+///   ("remember the window size instead of always using the default one").
+/// * VISIBLE is excluded on purpose: the window is hidden on autostart and on
+///   close-to-tray, so a persisted "hidden" would make the next manual launch
+///   invisible. Excluding it also keeps the plugin from calling show()+set_focus()
+///   while restoring, so an autostart launch stays quietly in the tray.
+/// * DECORATIONS is excluded because this app never toggles decorations; keeping
+///   it would only add a way for a stale state file to strip the title bar.
+fn window_state_flags() -> StateFlags {
+    StateFlags::all() & !StateFlags::VISIBLE & !StateFlags::DECORATIONS
+}
 
 fn gw_data_dir() -> std::path::PathBuf {
     // keep db next to the exe in release; local dir in dev
@@ -252,6 +267,11 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(window_state_flags())
+                .build(),
+        )
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec![AUTOSTART_ARG]),
@@ -278,6 +298,12 @@ fn main() {
         .on_window_event(|window, event| {
             // closing the window keeps the tray alive; exit-to-quit stops gateway
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                // Persist the geometry right here as well: the tray "quit" path
+                // hard-exits the process 3s after app.exit(0), which can skip the
+                // plugin's RunEvent::Exit save.
+                let _ = window
+                    .app_handle()
+                    .save_window_state(window_state_flags());
                 let _ = window.hide();
                 api.prevent_close();
             }
