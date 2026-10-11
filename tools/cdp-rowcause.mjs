@@ -1,0 +1,39 @@
+const PORT = 9222;
+const list = await (await fetch("http://127.0.0.1:" + PORT + "/json/list")).json();
+const page = list.find(t => t.type === "page");
+const ws = new WebSocket(page.webSocketDebuggerUrl);
+let id = 0; const pending = new Map();
+await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+ws.onmessage = e => { const m = JSON.parse(e.data); if (m.id && pending.has(m.id)) { const p = pending.get(m.id); pending.delete(m.id); m.error ? p.rej(new Error(JSON.stringify(m.error))) : p.res(m.result); } };
+const send = (method, params = {}) => { const mid = ++id; ws.send(JSON.stringify({ id: mid, method, params })); return new Promise((res, rej) => pending.set(mid, { res, rej })); };
+const ev = async (expr, timeoutMs = 10000) => {
+  const t = await Promise.race([send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true }), new Promise((_, rj) => setTimeout(() => rj(new Error("EVAL_TIMEOUT")), timeoutMs))]);
+  if (t.exceptionDetails) return "EXC:" + t.exceptionDetails.text;
+  return t.result.value;
+};
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+await ev(`(() => { const b=[...document.querySelectorAll('button')].find(x=>x.textContent.trim()==='模型'); b&&b.click(); return 'ok'; })()`);
+await sleep(1200);
+const R = await ev(`(() => {
+  const tr = document.querySelector('main tbody tr');
+  const td0 = tr.children[5];
+  const wrap = td0.firstElementChild;
+  const inp = wrap.querySelector('input');
+  const out = { wrapH: wrap.getBoundingClientRect().height, wrapCls: wrap.className, inpFound: !!inp };
+  if (inp) { const s = getComputedStyle(inp); out.input = { h: inp.getBoundingClientRect().height, padT: s.paddingTop, padB: s.paddingBottom, border: s.borderTopWidth, fs: s.fontSize, lh: s.lineHeight, cls: inp.className.slice(0,120) }; }
+  const act = tr.children[10].firstElementChild;
+  out.actionDiv = { h: act.getBoundingClientRect().height, cls: act.className };
+  const btns = [...act.querySelectorAll('button')].map(b => { const s = getComputedStyle(b); return { h: b.getBoundingClientRect().height, pad: s.paddingTop, fs: s.fontSize, lh: s.lineHeight, cls: b.className.slice(0,60) }; });
+  out.actionBtns = btns;
+  // 行高由哪一格撑开：取每格 td 的 scrollHeight - 上下 padding
+  out.natural = [...tr.children].map((td, i) => {
+    const s = getComputedStyle(td);
+    const pt = parseFloat(s.paddingTop), pb = parseFloat(s.paddingBottom);
+    let maxChild = 0;
+    for (const c of td.children) maxChild = Math.max(maxChild, c.getBoundingClientRect().height);
+    return { i, pt, pb, maxChild: +maxChild.toFixed(1), need: +(pt + maxChild + pb).toFixed(1) };
+  });
+  return out;
+})()`);
+console.log(JSON.stringify(R, null, 1));
+ws.close(); process.exit(0);

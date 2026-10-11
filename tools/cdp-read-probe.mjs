@@ -1,0 +1,11 @@
+const PORT = 9222;
+const list = await (await fetch("http://127.0.0.1:" + PORT + "/json/list")).json();
+const page = list.find(t => t.type === "page");
+const ws = new WebSocket(page.webSocketDebuggerUrl);
+let id = 0; const pending = new Map();
+await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+ws.onmessage = ev => { const m = JSON.parse(ev.data); if (m.id && pending.has(m.id)) { const p = pending.get(m.id); pending.delete(m.id); m.error ? p.rej(new Error(JSON.stringify(m.error))) : p.res(m.result); } };
+const send = (method, params = {}) => { const mid = ++id; ws.send(JSON.stringify({ id: mid, method, params })); return new Promise((res, rej) => pending.set(mid, { res, rej })); };
+const ev = async expr => { const r = await send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true }); if (r.exceptionDetails) return "EXC:" + r.exceptionDetails.text; return r.result.value; };
+console.log("stored_probe=" + String(await ev("String(window.__probe)")));
+ws.close(); process.exit(0);

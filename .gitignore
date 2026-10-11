@@ -1,0 +1,69 @@
+# ── 构建产物 ────────────────────────────────────────────────
+/server/target/
+/client/src-tauri/target/
+/client/node_modules/
+/client/dist/
+/server/smoke/fake/target/
+/client/src-tauri/gen/schemas/
+
+# ── 运行时数据（SQLite 库 + WAL/SHM）────────────────────────
+*.db
+*.db-wal
+*.db-shm
+/server/smoke/
+/tools/db-backup-*/
+
+# ── 本地日志与构建转写 ──────────────────────────────────────
+*.log
+/server/*.txt
+/client/*.txt
+/client/src-tauri/*.txt
+
+# ── 本地凭据：绝不入库 ──────────────────────────────────────
+# 这三个文件保存的是本机真实配置（上游地址、上游密钥、网关密钥）
+/tools/real-config.json
+/tools/live-config-snapshot.json
+/tools/scaffold-config.json
+
+# ── 内部探针：硬编码了本机端点/密钥，仅供本机使用 ──────────
+# 保留在本地，不随仓库发布
+/tools/cdp.mjs
+/tools/cdp-shots.mjs
+/tools/cdp-probe.mjs
+/tools/cdp-accept.mjs
+/tools/cdp-dropdown.mjs
+/tools/cdp-diag-select.mjs
+/tools/cdp-dropdown2.mjs
+/tools/cdp-shots-all.mjs
+/tools/cdp-dialog-check.mjs
+/tools/cdp-verify.mjs
+/tools/cdp-modalshot.mjs
+/tools/probe-real.mjs
+/tools/real-models.mjs
+/tools/real-model-detail.mjs
+/tools/probe-real2.mjs
+/tools/live-real1.mjs
+/tools/live-real2.mjs
+/tools/live-real3.mjs
+/tools/live-real4.mjs
+/tools/live-accept.mjs
+/tools/verify-cooldown.mjs
+/tools/snap-config.mjs
+/tools/verify-temp-cooldown.mjs
+/tools/probe-reconfig-clears.mjs
+/tools/restore-live-config.mjs
+/tools/probe-scaffold.mjs
+/tools/scaffold-i5.mjs
+/tools/verify-reconfig.mjs
+/tools/verify-e2e-final.mjs
+/tools/cdp-i5.mjs
+/tools/verify-i5.mjs
+
+# ── 根目录截图证据（开发期产物）─────────────────────────────
+/*.png
+
+# ── 编辑器 / 系统 ───────────────────────────────────────────
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

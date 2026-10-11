@@ -1,0 +1,107 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   Design tokens (Tailwind v4 @theme). Reference: CC Switch desktop console.
+   Warm near-white surfaces, hairline borders, orange primary action,
+   teal "active" accent, soft tinted chips.
+--------------------------------------------------------------------------- */
+@theme {
+  --font-sans: "Segoe UI", "Microsoft YaHei", system-ui, -apple-system, "Helvetica Neue", sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, "SFMono-Regular", monospace;
+
+  /* surfaces */
+  --color-app: #f6f6f7;
+  --color-surface: #ffffff;
+  --color-rail: #fbfbfc;
+  --color-line: #e7e7ea;
+  --color-line-soft: #f1f1f3;
+
+  /* text */
+  --color-ink: #17171a;
+  --color-ink-2: #52525b;
+  --color-ink-3: #8e8e97;
+
+  /* brand — primary action */
+  --color-brand-50: #fff7ed;
+  --color-brand-100: #ffedd5;
+  --color-brand-200: #fed7aa;
+  --color-brand-500: #f97316;
+  --color-brand-600: #ea6a0a;
+  --color-brand-700: #c2540b;
+
+  /* teal — active / selected */
+  --color-teal-50: #f0fdfa;
+  --color-teal-100: #ccfbf1;
+  --color-teal-200: #99f6e4;
+  --color-teal-500: #14b8a6;
+  --color-teal-600: #0d9488;
+  --color-teal-700: #0f766e;
+
+  /* semantic */
+  --color-ok-50: #ecfdf5;
+  --color-ok-100: #d1fae5;
+  --color-ok-500: #10b981;
+  --color-ok-600: #059669;
+  --color-ok-700: #047857;
+
+  --color-warn-50: #fffbeb;
+  --color-warn-100: #fef3c7;
+  --color-warn-500: #f59e0b;
+  --color-warn-600: #d97706;
+  --color-warn-700: #b45309;
+
+  --color-err-50: #fef2f2;
+  --color-err-100: #fee2e2;
+  --color-err-500: #ef4444;
+  --color-err-600: #dc2626;
+  --color-err-700: #b91c1c;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app { height: 100%; margin: 0; }
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-app);
+  color: var(--color-ink);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+input, select, textarea, button { font: inherit; color: inherit; }
+input:focus-visible, select:focus-visible, textarea:focus-visible { outline: none; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: #d6d6dc;
+  border-radius: 8px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover { background: #bfbfc7; background-clip: content-box; }
+
+/* ------------------------------- motion -------------------------------- */
+/* Page switch: a short out-in fade + lift. Out-in (not crossfade) because the
+   content column is a scroll container and two absolutely-positioned pages
+   would fight over its height. */
+.page-enter-active { transition: opacity .16s ease-out, transform .16s ease-out; }
+.page-leave-active { transition: opacity .1s ease-in, transform .1s ease-in; }
+.page-enter-from { opacity: 0; transform: translateY(6px); }
+.page-leave-to { opacity: 0; transform: translateY(-4px); }
+
+/* Row / card entrance used by list pages after a load. */
+@media (prefers-reduced-motion: reduce) {
+  .page-enter-active, .page-leave-active { transition-duration: 0s; }
+}
+
+/* Native form controls still in use (TInput / TTextarea) — the only places
+   the browser's default chrome can leak through. */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+input[type="number"] { -moz-appearance: textfield; appearance: textfield; }
+input[type="text"], input[type="number"], input[type="password"], textarea { caret-color: var(--color-brand-500); }
+textarea { resize: vertical; }

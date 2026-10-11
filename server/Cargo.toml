@@ -1,0 +1,50 @@
+[package]
+name = "gw-server"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "gw_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gw-server"
+path = "src/main.rs"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tower = { version = "0.5", features = ["util"] }
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+reqwest = { version = "0.13", features = ["json", "stream", "gzip"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+futures = "0.3"
+sha2 = "0.10"
+anyhow = "1"
+hex = "0.4"
+rcgen = "0.13"
+eventsource-stream = "0.2"
+bytes = "1"
+async-stream = "0.3"
+dashmap = "6"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
