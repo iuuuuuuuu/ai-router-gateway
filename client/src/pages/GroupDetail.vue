@@ -31,7 +31,8 @@ const TIER_NAMES = ["一级", "二级", "三级", "四级", "五级", "六级"];
 
 /**
  * 自动权重开关（AdminConfig.auto_weight，默认关）：
- * 关闭时同级按列表顺序依次尝试，层级里显示「顺序 N」；开启时按权重降序，显示「权重 N」。
+ * 关闭时同级按列表顺序依次尝试，层级里显示「顺序 N · 权重 N」（权重已填但未参与调度）；
+ * 开启时按权重降序，显示「权重 N」。权重两种模式下都能在「分组路由」页手改。
  */
 const autoWeight = computed(() => state.cfg?.auto_weight ?? false);
 
@@ -496,7 +497,7 @@ function shareText(row: Row): string {
                     class="flex items-center gap-2 rounded-[10px] border border-line bg-app px-2.5 py-1"
                   >
                     <span class="font-mono text-[12px] text-ink">{{ bindingLabel(m.model_id) }}</span>
-                    <Badge tone="gray">{{ autoWeight ? `权重 ${m.weight}` : `顺序 ${mi + 1}` }}</Badge>
+                    <Badge tone="gray">{{ autoWeight ? `权重 ${m.weight}` : `顺序 ${mi + 1} · 权重 ${m.weight}` }}</Badge>
                   </div>
                 </template>
                 <span v-else class="py-1 text-[12px] text-ink-3">该级无成员</span>

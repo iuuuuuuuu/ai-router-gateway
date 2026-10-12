@@ -49,8 +49,9 @@ const maxCycles = computed(() => state.cfg?.retry.max_cycles ?? 2);
 
 /**
  * 自动权重开关（AdminConfig.auto_weight，默认关）：
- * 关闭时同级成员按列表顺序依次尝试，权重不参与分配 —— 所以界面上把权重输入换成顺序号 + 上移/下移；
- * 开启时才恢复权重输入框，由权重降序决定尝试次序。
+ * 关闭时同级成员按列表顺序依次尝试；开启时按权重降序（权重并列再退回列表顺序）。
+ * 权重输入框在两种模式下都常驻可改 —— 关闭时改的值会照常存盘，等开关打开后立即生效，
+ * 这样用户可以先填好权重再一次性开启，不必来回切页面。关闭模式额外显示顺序号，因为那时它才是真实次序。
  * 顺序即数组顺序，保存时直接按 draft 里 members 的数组序写入，不需要额外排序。
  */
 const autoWeight = computed(() => state.cfg?.auto_weight ?? false);
@@ -596,7 +597,7 @@ function confirmRemoveMember() {
                         :title="optionOf(m.model_id)?.hint ? '上游 ' + optionOf(m.model_id)?.hint : undefined"
                       >{{ bindingLabel(m.model_id) }}</span>
                       <Badge tone="gray" :data-test="autoWeight ? 'badge-weight' : 'badge-order'">
-                        {{ autoWeight ? `权重 ${m.weight}` : `顺序 ${mi + 1}` }}
+                        {{ autoWeight ? `权重 ${m.weight}` : `顺序 ${mi + 1} · 权重 ${m.weight}` }}
                       </Badge>
                     </div>
                   </template>
@@ -648,9 +649,15 @@ function confirmRemoveMember() {
         <div>
           <div class="mb-2.5 flex items-end justify-between gap-2">
             <span class="text-[12.5px] font-medium text-ink-2">路由层级</span>
-            <span class="text-[11.5px] text-ink-3" data-test="tier-hint">
-              <template v-if="autoWeight">按 一级 → 二级 → 三级 顺序尝试，同级内按权重降序分配</template>
-              <template v-else>按 一级 → 二级 → 三级 顺序尝试，同级内按列表顺序依次尝试（自动权重已关闭）</template>
+            <span class="flex flex-col items-end gap-0.5 text-[11.5px] text-ink-3">
+              <span data-test="tier-hint">
+                <template v-if="autoWeight">按 一级 → 二级 → 三级 顺序尝试，同级内按权重降序分配</template>
+                <template v-else>按 一级 → 二级 → 三级 顺序尝试，同级内按列表顺序依次尝试（自动权重已关闭）</template>
+              </span>
+              <span data-test="weight-hint">
+                <template v-if="autoWeight">权重可直接改；并列时按列表顺序</template>
+                <template v-else>权重可先填好，开启「自动权重」后生效</template>
+              </span>
             </span>
           </div>
 
@@ -706,49 +713,39 @@ function confirmRemoveMember() {
                       该模型在本层被选了多次，请换一个。
                     </p>
                   </div>
-                  <!-- 自动权重关闭（默认）：不显示权重，用顺序号 + 上移/下移表达尝试次序 -->
-                  <template v-if="!autoWeight">
-                    <span
-                      class="shrink-0 rounded-md border border-line bg-app px-1.5 py-0.5 font-mono text-[11.5px] text-ink-2"
-                      data-test="member-order"
-                      :title="`同级第 ${mi + 1} 个尝试`"
-                    >{{ mi + 1 }}</span>
-                    <div class="flex shrink-0 items-center gap-0.5">
-                      <IconBtn
-                        title="上移"
-                        :disabled="mi === 0"
-                        @click="moveMember(t, mi, -1)"
-                      >
-                        <ArrowUp :size="14" />
-                      </IconBtn>
-                      <IconBtn
-                        title="下移"
-                        :disabled="mi === t.members.length - 1"
-                        @click="moveMember(t, mi, 1)"
-                      >
-                        <ArrowDown :size="14" />
-                      </IconBtn>
-                    </div>
-                  </template>
-                  <!-- 自动权重开启：恢复权重输入框（上移/下移同样可用） -->
-                  <template v-else>
-                    <span class="shrink-0 text-[11.5px] text-ink-3">权重</span>
-                    <div class="w-20 shrink-0" data-test="member-weight">
-                      <TInput v-model.number="m.weight" type="number" size="sm" />
-                    </div>
-                    <div class="flex shrink-0 items-center gap-0.5">
-                      <IconBtn title="上移" :disabled="mi === 0" @click="moveMember(t, mi, -1)">
-                        <ArrowUp :size="14" />
-                      </IconBtn>
-                      <IconBtn
-                        title="下移"
-                        :disabled="mi === t.members.length - 1"
-                        @click="moveMember(t, mi, 1)"
-                      >
-                        <ArrowDown :size="14" />
-                      </IconBtn>
-                    </div>
-                  </template>
+                  <!-- 顺序号：自动权重关闭时它就是真实尝试次序；开启时仅作权重并列的兜底次序 -->
+                  <span
+                    v-if="!autoWeight"
+                    class="shrink-0 rounded-md border border-line bg-app px-1.5 py-0.5 font-mono text-[11.5px] text-ink-2"
+                    data-test="member-order"
+                    :title="`同级第 ${mi + 1} 个尝试`"
+                  >{{ mi + 1 }}</span>
+                  <!-- 权重：两种模式都可手动改；关闭时该值不参与调度，开启后立即按它降序 -->
+                  <span class="shrink-0 text-[11.5px] text-ink-3">权重</span>
+                  <div class="w-20 shrink-0" data-test="member-weight">
+                    <TInput
+                      v-model.number="m.weight"
+                      type="number"
+                      min="0"
+                      step="1"
+                      size="sm"
+                      :title="autoWeight
+                        ? `同级内按权重降序尝试，权重相同按列表顺序（当前第 ${mi + 1} 位）`
+                        : '自动权重已关闭：权重暂不参与调度，开启后立即按它降序'"
+                    />
+                  </div>
+                  <div class="flex shrink-0 items-center gap-0.5">
+                    <IconBtn title="上移" :disabled="mi === 0" @click="moveMember(t, mi, -1)">
+                      <ArrowUp :size="14" />
+                    </IconBtn>
+                    <IconBtn
+                      title="下移"
+                      :disabled="mi === t.members.length - 1"
+                      @click="moveMember(t, mi, 1)"
+                    >
+                      <ArrowDown :size="14" />
+                    </IconBtn>
+                  </div>
                   <IconBtn title="删除成员" danger @click="removeMemberAt(t, mi)">
                     <Trash2 :size="15" />
                   </IconBtn>
