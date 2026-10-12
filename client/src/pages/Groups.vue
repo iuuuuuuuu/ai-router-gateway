@@ -1,9 +1,10 @@
 <script setup lang="ts">
 // 分组路由：一级 → 二级 → 三级 的故障转移可视化与编辑。
 // 页面只改 state.cfg 并 markDirty()，保存由顶栏统一负责。
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import {
-  ArrowDown, ArrowUp, ChevronDown, LayoutDashboard, Pencil, Plus, RefreshCw, Trash2, Waypoints,
+  ArrowDown, ArrowUp, ChevronDown, GripVertical, LayoutDashboard, Pencil, Plus, RefreshCw, Trash2,
+  Waypoints,
 } from "@lucide/vue";
 import {
   Alert, Badge, Btn, Card, Empty, Field, IconBtn, Modal,
@@ -53,6 +54,7 @@ const maxCycles = computed(() => state.cfg?.retry.max_cycles ?? 2);
  * 权重输入框在两种模式下都常驻可改 —— 关闭时改的值会照常存盘，等开关打开后立即生效，
  * 这样用户可以先填好权重再一次性开启，不必来回切页面。关闭模式额外显示顺序号，因为那时它才是真实次序。
  * 顺序即数组顺序，保存时直接按 draft 里 members 的数组序写入，不需要额外排序。
+ * 改顺序有两条等价的路：拖住成员行首的抓手上下拖动（鼠标），或用上移 / 下移按钮（键盘 / 读屏）。
  */
 const autoWeight = computed(() => state.cfg?.auto_weight ?? false);
 
@@ -252,6 +254,190 @@ function moveMember(tier: Tier, index: number, delta: number) {
   tier.members.splice(to, 0, m);
 }
 
+/**
+ * 拖动排序：用 Pointer Events 自己实现，不引第三方拖拽库（拖拽库动辄几十 KB，
+ * 而这里只需要「同级内换顺序」「层级换顺序」两件事）。关键取舍：
+ *   - setPointerCapture 之后 move / up 都会回到抓手元素上，鼠标划出弹窗也不会丢事件；
+ *   - 拖动期间不改数组顺序（DOM 顺序冻结），开始时量一次行几何，之后只更新「落点槽位」
+ *     和跟手位移 —— 被拖行的原始位置始终是量到的那份，不会因为自己挪动而抖动；
+ *   - 松手才落位：槽位 0 = 插到第 1 行之前，N = 插到最后一行之后；
+ *   - 不用 HTML5 draggable：它的拖影、dragend 时机各内核差异大，触控板 / 手指体验也差。
+ * 按钮保留：拖拽是鼠标增强，键盘与读屏用户仍然靠上移 / 下移。
+ */
+type DragKind = "member" | "tier";
+
+const dragKind = ref<DragKind | null>(null);
+/** 成员拖动：所属层；层级拖动：被拖的那一层。两种情况都用来高亮整块。 */
+const dragTier = ref<Tier | null>(null);
+/** 正在被拖动的成员对象本身（按身份跟踪，比 index 更稳）。 */
+const dragMember = ref<TierMember | null>(null);
+/** 层级拖动时被拖层的下标。 */
+const dragTierFrom = ref(-1);
+/** 落点槽位：0 = 插到第 1 行之前，长度 = 插到最后一行之后。 */
+const dropIndex = ref(-1);
+/** 按下时的鼠标 Y、被拖元素的跟手纵向位移。 */
+const dragStartY = ref(0);
+const dragDelta = ref(0);
+/** 拖动开始时量好的几何 —— 拖动期间不改数组，DOM 顺序不变，所以量一次就够。 */
+const dragRects = ref<{ top: number; height: number }[]>([]);
+/** 定位容器 padding box 的顶边（落点指示线用它换算相对坐标）。 */
+const dragPadTop = ref(0);
+const dragLineTop = ref(0);
+
+const dragging = computed(() => dragKind.value !== null);
+
+/** 拖动期间给 body 挂一个类：锁住文本选中与光标形状，松手就摘掉。 */
+watch(dragging, (on) => {
+  document.body.classList.toggle("gw-dragging", on);
+});
+
+/** 被拖元素跟着鼠标走：位移 = 鼠标纵向增量（布局冻结，所以不需要自我修正）。 */
+const dragStyle = computed(() => (
+  dragging.value ? { transform: `translateY(${dragDelta.value}px)` } : undefined
+));
+
+/** 鼠标纵向落在哪个槽位：比每一行的中垂线，越过中线就算落到下一格。 */
+function slotAt(clientY: number): number {
+  const rects = dragRects.value;
+  for (let i = 0; i < rects.length; i++) {
+    const r = rects[i]!;
+    if (clientY < r.top + r.height / 2) return i;
+  }
+  return rects.length;
+}
+
+/** 指示线位置：插在某行之前画在它上方，插到末尾画在最后一行下方。 */
+function lineTopFor(slot: number, rects: { top: number; height: number }[], padTop: number): number {
+  if (!rects.length) return 0;
+  if (slot >= rects.length) {
+    const last = rects[rects.length - 1]!;
+    return Math.max(0, last.top + last.height - padTop + 3);
+  }
+  return Math.max(0, rects[slot]!.top - padTop - 5);
+}
+
+function endDrag() {
+  dragKind.value = null;
+  dragTier.value = null;
+  dragMember.value = null;
+  dragTierFrom.value = -1;
+  dropIndex.value = -1;
+  dragDelta.value = 0;
+  dragRects.value = [];
+}
+
+/** 量一次几何并进入拖动状态（成员 / 层级两种模式共用）。 */
+function startDrag(kind: DragKind, box: HTMLElement, rowSel: string, clientY: number) {
+  const padTop = box.getBoundingClientRect().top + box.clientTop;
+  const rects = Array.from(box.querySelectorAll<HTMLElement>(rowSel))
+    .map((el) => { const r = el.getBoundingClientRect(); return { top: r.top, height: r.height }; });
+  dragKind.value = kind;
+  dragStartY.value = clientY;
+  dragDelta.value = 0;
+  dragRects.value = rects;
+  dragPadTop.value = padTop;
+  dropIndex.value = slotAt(clientY);
+  dragLineTop.value = lineTopFor(dropIndex.value, rects, padTop);
+}
+
+/** 松手落位：摘下来再插进落点槽位；越过原位置时槽位要左移一位（自己已被摘掉）。 */
+function commitDrag() {
+  const kind = dragKind.value;
+  const slot = dropIndex.value;
+  const d = draft.value;
+  if (kind === "member") {
+    const tier = dragTier.value;
+    const m = dragMember.value;
+    if (tier && m && slot >= 0) {
+      const from = tier.members.indexOf(m);
+      if (from >= 0) {
+        tier.members.splice(from, 1);
+        tier.members.splice(slot > from ? slot - 1 : slot, 0, m);
+      }
+    }
+  } else if (kind === "tier" && d && slot >= 0) {
+    const from = dragTierFrom.value;
+    if (from >= 0 && from < d.tiers.length) {
+      const [t] = d.tiers.splice(from, 1);
+      if (t) {
+        d.tiers.splice(slot > from ? slot - 1 : slot, 0, t);
+        // 层级号跟位置绑定：一级 → 二级 → … 永远等于从上到下的顺序
+        d.tiers.forEach((x, i) => { x.level = i + 1; });
+      }
+    }
+  }
+  endDrag();
+}
+
+function onDragMove(e: PointerEvent) {
+  if (!dragging.value) return;
+  dragDelta.value = e.clientY - dragStartY.value;
+  const slot = slotAt(e.clientY);
+  if (slot !== dropIndex.value) {
+    dropIndex.value = slot;
+    dragLineTop.value = lineTopFor(slot, dragRects.value, dragPadTop.value);
+  }
+}
+
+/** 拖动中给层容器补样式：成员拖动只要定位，层级拖动还要抬高、描边、压暗。 */
+function tierDragClass(t: Tier): string {
+  if (dragKind.value === "tier") {
+    return dragTier.value === t ? "relative z-20 opacity-70 ring-2 ring-brand-500" : "relative";
+  }
+  return dragKind.value === "member" && dragTier.value === t ? "relative" : "";
+}
+
+/** 抓手：成员行内拖动（同级内换顺序）。 */
+function onMemberDragStart(e: PointerEvent, tier: Tier, index: number) {
+  if (e.button !== 0 || tier.members.length < 2) return; // 只接左键；只有一个成员时没什么可排的
+  e.preventDefault();
+  const m = tier.members[index];
+  const handle = e.currentTarget as HTMLElement | null;
+  const box = handle?.closest("[data-test=member-tier]") as HTMLElement | null;
+  if (!m || !box) return;
+  dragTier.value = tier;
+  dragMember.value = m;
+  startDrag("member", box, "[data-test=member-row]", e.clientY);
+  // 捕获后 move / up 都会回到抓手，鼠标划出窗口也不丢事件；失败也不影响 window 上的监听
+  try { handle?.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
+}
+
+/** 抓手：层头拖动（层级先后，也就是 一级 → 二级 的尝试顺序）。 */
+function onTierDragStart(e: PointerEvent, ti: number) {
+  const d = draft.value;
+  if (e.button !== 0 || !d || d.tiers.length < 2) return;
+  e.preventDefault();
+  const t = d.tiers[ti];
+  const handle = e.currentTarget as HTMLElement | null;
+  const box = handle?.closest("[data-test=tier-list]") as HTMLElement | null;
+  if (!t || !box) return;
+  dragTier.value = t;
+  dragTierFrom.value = ti;
+  startDrag("tier", box, "[data-test=member-tier]", e.clientY);
+  try { handle?.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
+}
+
+/** Esc 放弃本次拖动（不改顺序）。 */
+function onDragKey(e: KeyboardEvent) {
+  if (e.key === "Escape" && dragging.value) endDrag();
+}
+
+onMounted(() => {
+  // 挂在 window 上：鼠标划出弹窗、甚至划出窗口，move / up 一样能收到
+  window.addEventListener("pointermove", onDragMove);
+  window.addEventListener("pointerup", commitDrag);
+  window.addEventListener("pointercancel", endDrag);
+  window.addEventListener("keydown", onDragKey);
+});
+onBeforeUnmount(() => {
+  // 拖动途中切页 / 关弹窗时清干净，避免残留 transform 与光标锁定
+  document.body.classList.remove("gw-dragging");
+  window.removeEventListener("pointermove", onDragMove);
+  window.removeEventListener("pointerup", commitDrag);
+  window.removeEventListener("pointercancel", endDrag);
+  window.removeEventListener("keydown", onDragKey);
+});
+
 /* -------------------------------- 校验 -------------------------------- */
 
 const exposedList = computed(() =>
@@ -438,6 +624,18 @@ function confirmRemoveMember() {
   toast.ok(`已从${tierName(ti + 1)}移除「${bindingLabel(pm.modelId)}」`);
 }
 </script>
+
+<!--
+  拖动排序的全局兜底：抓手在弹窗里，但指针会跑到 window 上。
+  拖住时锁住整页文本选区与光标（否则划过文字会选中一片、光标变成 I 形），
+  user-select:none 对 WebView2 里的子元素同样生效，松手立刻恢复。
+-->
+<style scoped>
+:global(body.gw-dragging) {
+  cursor: grabbing;
+  user-select: none;
+}
+</style>
 
 <template>
   <div>
@@ -658,6 +856,7 @@ function confirmRemoveMember() {
                 <template v-if="autoWeight">权重可直接改；并列时按列表顺序</template>
                 <template v-else>权重可先填好，开启「自动权重」后生效</template>
               </span>
+              <span data-test="drag-hint">按住行首或层头的抓手可拖动排序</span>
             </span>
           </div>
 
@@ -665,14 +864,43 @@ function confirmRemoveMember() {
             还没有模型绑定，请先到「渠道与模型」页在某个渠道下添加 exposed → upstream 映射，再回来配置层级。
           </Alert>
 
-          <div class="space-y-2.5">
+          <div class="relative space-y-2.5" data-test="tier-list">
+            <!-- 层级拖动的落点指示线：画在层与层之间 -->
+            <div
+              v-if="dragKind === 'tier' && dropIndex >= 0"
+              class="pointer-events-none absolute inset-x-0 z-30 h-[3px] rounded-full bg-brand-500"
+              :style="{ top: dragLineTop + 'px' }"
+              data-test="drop-line"
+            />
             <div
               v-for="(t, ti) in draft.tiers"
               :key="ti"
               class="rounded-[10px] border border-line bg-app/60 p-3"
+              :class="tierDragClass(t)"
+              :style="dragKind === 'tier' && dragTier === t ? dragStyle : undefined"
+              data-test="member-tier"
             >
+              <!-- 成员拖动的落点指示线：画在行与行之间 -->
+              <div
+                v-if="dragKind === 'member' && dragTier === t && dropIndex >= 0"
+                class="pointer-events-none absolute inset-x-0 z-30 h-[3px] rounded-full bg-brand-500"
+                :style="{ top: dragLineTop + 'px' }"
+                data-test="drop-line"
+              />
               <div class="mb-2.5 flex items-center justify-between gap-2">
                 <div class="flex items-center gap-2">
+                  <button
+                    type="button"
+                    class="flex h-7 w-4 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-ink-3 transition-colors hover:bg-app hover:text-ink active:cursor-grabbing disabled:pointer-events-none disabled:opacity-40"
+                    :disabled="draft.tiers.length < 2"
+                    data-test="tier-drag"
+                    :title="draft.tiers.length < 2
+                      ? '只有一个层级，无需排序'
+                      : '按住拖动可调整层级先后（也就是 一级 → 二级 的尝试顺序）'"
+                    @pointerdown="onTierDragStart($event, ti)"
+                  >
+                    <GripVertical :size="14" />
+                  </button>
                   <Badge :tone="tierTone(ti + 1)">{{ tierName(ti + 1) }}</Badge>
                   <span class="text-[11.5px] text-ink-3">{{ t.members.length }} 个成员</span>
                 </div>
@@ -696,7 +924,25 @@ function confirmRemoveMember() {
                   v-for="(m, mi) in t.members"
                   :key="mi"
                   class="flex items-center gap-2 rounded-[10px] border border-line bg-surface px-2.5 py-1.5"
+                  :class="dragMember === m
+                    ? 'relative z-20 border-brand-200 bg-brand-50 shadow-lg'
+                    : 'relative'"
+                  :style="dragMember === m ? dragStyle : undefined"
+                  data-test="member-row"
+                  :data-model="m.model_id"
                 >
+                  <button
+                    type="button"
+                    class="flex h-7 w-4 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-ink-3 transition-colors hover:bg-app hover:text-ink active:cursor-grabbing disabled:pointer-events-none disabled:opacity-40"
+                    :disabled="t.members.length < 2"
+                    data-test="member-drag"
+                    :title="t.members.length < 2
+                      ? '同级只有一个成员，无需排序'
+                      : '按住拖动可调整同级顺序'"
+                    @pointerdown="onMemberDragStart($event, t, mi)"
+                  >
+                    <GripVertical :size="14" />
+                  </button>
                   <div class="min-w-0 flex-1" data-test="member-row-select">
                     <TSelect
                       v-model="m.model_id"
@@ -731,15 +977,21 @@ function confirmRemoveMember() {
                       size="sm"
                       :title="autoWeight
                         ? `同级内按权重降序尝试，权重相同按列表顺序（当前第 ${mi + 1} 位）`
-                        : '自动权重已关闭：权重暂不参与调度，开启后立即按它降序'"
+                        : `自动权重已关闭：权重暂不参与调度，开启后立即按它降序；现在的次序由拖动（或上移 / 下移）决定，当前第 ${mi + 1} 位`"
                     />
                   </div>
                   <div class="flex shrink-0 items-center gap-0.5">
-                    <IconBtn title="上移" :disabled="mi === 0" @click="moveMember(t, mi, -1)">
+                    <IconBtn
+                      title="上移（也可以直接拖动左侧抓手）"
+                      data-test="member-up"
+                      :disabled="mi === 0"
+                      @click="moveMember(t, mi, -1)"
+                    >
                       <ArrowUp :size="14" />
                     </IconBtn>
                     <IconBtn
-                      title="下移"
+                      title="下移（也可以直接拖动左侧抓手）"
+                      data-test="member-down"
                       :disabled="mi === t.members.length - 1"
                       @click="moveMember(t, mi, 1)"
                     >
