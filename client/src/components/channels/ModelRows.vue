@@ -21,8 +21,10 @@ const PRICE_COLS = [
 const props = defineProps<{
   /** 该渠道下挂的模型绑定（store.modelsOfChannel(channelId) 的结果）。 */
   models: ModelBinding[];
-  /** 被一级故障转移层级引用的绑定 id，仅用于高亮。 */
+  /** 被一级故障转移层级引用的绑定 id，仅用于「一级引用」高亮（静态声明，不是「使用中」）。 */
   activeIds: Set<string>;
+  /** "<渠道>::<上游模型>" → 此刻并发数（/admin/api/inflight）；缺键即 0。 */
+  inflightMembers: Record<string, number>;
   /** 父组件每次保存/删除模型后自增，用来丢弃就地编辑草稿。 */
   epoch: number;
 }>();
@@ -32,6 +34,11 @@ const emit = defineEmits<{
   remove: [m: ModelBinding];
   add: [];
 }>();
+
+/** 该 (渠道, 上游模型) 此刻的并发请求数；缺键即 0。 */
+function inflightOf(m: ModelBinding): number {
+  return props.inflightMembers[m.channel_id + "::" + m.upstream] ?? 0;
+}
 
 const drafts = reactive<Record<string, string>>({});
 
@@ -60,7 +67,7 @@ watch(() => props.epoch, () => {
 <template>
   <div>
     <div v-if="models.length" class="overflow-x-auto rounded-lg border border-line bg-surface">
-      <table class="w-full min-w-[778px] table-fixed text-[12.5px]">
+      <table class="w-full min-w-[806px] table-fixed text-[12.5px]">
         <thead>
           <tr>
             <th class="w-[62px] whitespace-nowrap px-1.5 py-1.5 text-left text-[11px] font-medium uppercase tracking-wide text-ink-3">绑定 ID</th>
@@ -71,7 +78,7 @@ watch(() => props.epoch, () => {
               class="w-[84px] whitespace-nowrap px-1.5 py-1.5 text-left text-[11px] font-medium uppercase tracking-wide text-ink-3"
               :title="'USD / 1M tokens · ' + c.hint"
             >{{ c.label }}</th>
-            <th class="w-[72px] whitespace-nowrap px-1.5 py-1.5 text-left text-[11px] font-medium uppercase tracking-wide text-ink-3">分组引用</th>
+            <th class="w-[100px] whitespace-nowrap px-1.5 py-1.5 text-left text-[11px] font-medium uppercase tracking-wide text-ink-3">分组引用</th>
             <th class="w-[44px] whitespace-nowrap px-1.5 py-1.5 text-left text-[11px] font-medium uppercase tracking-wide text-ink-3">启用</th>
             <th class="w-[64px] whitespace-nowrap px-1.5 py-1.5 text-right text-[11px] font-medium uppercase tracking-wide text-ink-3">操作</th>
           </tr>
@@ -93,9 +100,14 @@ watch(() => props.epoch, () => {
             <td class="px-1.5 py-1.5">
               <div class="flex min-w-0 items-center gap-1">
                 <span
+                  v-if="inflightOf(m) > 0"
+                  class="shrink-0 rounded bg-teal-100 px-1 py-0.5 text-[10.5px] font-medium text-teal-700"
+                  title="此刻正在使用该 (渠道, 上游模型) 的并发请求数"
+                >使用中 ×{{ inflightOf(m) }}</span>
+                <span
                   v-if="activeIds.has(m.id)"
                   class="h-1.5 w-1.5 shrink-0 rounded-full bg-teal-500"
-                  title="被某个分组的一级层级引用"
+                  title="一级引用：被某个分组的一级层级引用（静态声明，与实时并发无关）"
                 ></span>
                 <span
                   v-if="groupsUsingModel(m.id).length"

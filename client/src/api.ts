@@ -65,10 +65,15 @@ export interface GroupMember {
   avg_duration_ms: number | null; avg_ttft_ms: number | null;
   input_tokens: number; output_tokens: number; cost_usd: number;
   last_used_ts: string | null; last_outcome: string | null; last_error_class: string | null;
+  /** 最近一次成功请求的落点（last-success，不是 in-flight）。 */
   active: boolean;
+  /** 此刻正在使用该 (渠道, 上游模型) 的并发请求数；0 = 空闲。 */
+  inflight: number;
 }
 export interface GroupMembersPayload {
   group_id: string; group_name: string; active_key: string | null;
+  /** 该分组此刻正在处理中的请求总数。 */
+  inflight_total: number;
   /** 该分组的有效重试配置（跟随全局或分组自己的覆盖）。 */
   retry: RetryConfig;
   /** "group" = 用了分组自己的配置；"global" = 跟随全局。 */
@@ -92,6 +97,22 @@ export interface RequestLog {
   cost_usd: number; wasted_cost_usd: number; duration_ms: number; ttft_ms: number;
   /** 本次请求因输出退化被内部丢弃并重试的次数。 */
   loop_retries: number;
+}
+/** 实时并发快照："使用中" 的唯一数据来源。只含非零项，缺键即 0。 */
+export interface InflightSnapshot {
+  total: number;
+  /** "<channel_id>::<upstream_model>" → 并发数。 */
+  members: Record<string, number>;
+  /** channel_id → 该渠道所有模型的并发数之和。 */
+  channels: Record<string, number>;
+  /** group_id → 该分组的并发数之和。 */
+  groups: Record<string, number>;
+}
+/** 清空日志与统计。config 永不被触碰。 */
+export interface PurgeLogsRequest { request_logs?: boolean; switch_logs?: boolean; cooldowns?: boolean }
+export interface PurgeLogsResult {
+  ok: boolean;
+  deleted: { request_logs: number; switch_logs: number; cooldowns: number };
 }
 export interface CooldownRow {
   channel_id: string; upstream_model: string; kind: string; cooling_until_ms: number;
@@ -203,4 +224,11 @@ export const api = {
   // draft alone instead of looking the channel up in the config.
   channelModels: (channelId: string, draft?: ChannelModelsDraft): Promise<ChannelModelsResult> =>
     req("POST", "/admin/api/channel-models", { channel_id: channelId || undefined, ...(draft || {}) }),
+  // Live concurrency snapshot. Unlike /group-members this endpoint has no other
+  // parameter, so no "?" juggling is needed — qs() is not used here at all.
+  inflight: (): Promise<InflightSnapshot> => req("GET", "/admin/api/inflight"),
+  // Destructive: deletes log/stat rows only. The saved config is untouched, so
+  // channels/models/groups/keys survive and routing keeps working.
+  purgeLogs: (what: PurgeLogsRequest): Promise<PurgeLogsResult> =>
+    req("POST", "/admin/api/purge-logs", what),
 };

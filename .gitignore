@@ -86,6 +86,11 @@ Desktop.ini
 /tools/ui-settings-saved-own.png
 /tools/ui-group-detail.png
 /tools/ui-model-detail.png
+/tools/ui-groups-modal-own.png
+/tools/ui-groups-modal-saved-own.png
+/tools/ui-group-models-page.png
+/tools/ui-group-detail-settings-own.png
+/tools/ui-group-detail-settings-saved.png
 
 # ── 渠道与模型「添加模型」验收探针（本机证据，不入库）───────
 /tools/verify-channel-models.mjs

@@ -385,7 +385,7 @@ impl Store {
             // requests (a failed attempt's duration is dominated by timeouts and
             // would misrepresent latency), and with no successes at all they stay
             // NULL so the console shows "—" instead of a bogus 0ms.
-            "SELECT json_object('requests',COUNT(*),'success',SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),'exhausted',SUM(CASE WHEN status='exhausted' THEN 1 ELSE 0 END),'aborted',SUM(CASE WHEN status='aborted' THEN 1 ELSE 0 END),'loop_retries',COALESCE(SUM(loop_retries),0),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cache_read_tokens',COALESCE(SUM(cache_read_tokens),0),'cache_creation_tokens',COALESCE(SUM(cache_creation_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'avg_ttft_ms',ROUND(AVG(CASE WHEN status='success' THEN ttft_ms END))) FROM request_logs{scope}"
+            "SELECT json_object('requests',COUNT(*),'success',COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),'exhausted',COALESCE(SUM(CASE WHEN status='exhausted' THEN 1 ELSE 0 END),0),'aborted',COALESCE(SUM(CASE WHEN status='aborted' THEN 1 ELSE 0 END),0),'loop_retries',COALESCE(SUM(loop_retries),0),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cache_read_tokens',COALESCE(SUM(cache_read_tokens),0),'cache_creation_tokens',COALESCE(SUM(cache_creation_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'avg_ttft_ms',ROUND(AVG(CASE WHEN status='success' THEN ttft_ms END))) FROM request_logs{scope}"
         ))?;
         let v: String = match group_id {
             Some(g) if !g.is_empty() => stmt.query_row(params![g], |r| r.get(0))?,
@@ -447,4 +447,34 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
+
+    /// Delete the traffic history the console displays: request logs, switch
+    /// logs, and persisted cooldowns.
+    ///
+    /// The CONFIG IS NEVER TOUCHED. `config_json` and `meta` are deliberately
+    /// not in this list: "清空日志与统计" means "forget the traffic", not "reset
+    /// the gateway". A caller that wants a blank console keeps every channel,
+    /// model, group and API key it had.
+    ///
+    /// Each flag is independent, and the returned count is the number of rows
+    /// actually deleted (not merely requested), so the console can report the
+    /// real effect.
+    pub fn purge(&self, request_logs: bool, switch_logs: bool, cooldowns: bool) -> anyhow::Result<(usize, usize, usize)> {
+        let conn = self.conn.lock().unwrap();
+        let mut n_req = 0usize;
+        let mut n_sw = 0usize;
+        let mut n_cd = 0usize;
+        if request_logs {
+            n_req = conn.execute("DELETE FROM request_logs", [])?;
+        }
+        if switch_logs {
+            n_sw = conn.execute("DELETE FROM switch_logs", [])?;
+        }
+        if cooldowns {
+            n_cd = conn.execute("DELETE FROM cooldown_persist", [])?;
+        }
+        Ok((n_req, n_sw, n_cd))
+    }
 }
+
+

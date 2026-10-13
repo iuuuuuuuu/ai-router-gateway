@@ -1,4 +1,4 @@
-use gw_server::{admin, config, health, proxy, routes, store, tls};
+use gw_server::{admin, config, health, inflight, proxy, routes, store, tls};
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -41,6 +41,10 @@ async fn main() -> anyhow::Result<()> {
         config: holder,
         health: health.clone(),
         store: store.clone(),
+        // Live occupancy registry for the console's "使用中" badge. Fresh on
+        // every process start, and that is correct: a request cannot survive
+        // a restart, so there is never a stale in-flight count to recover.
+        inflight: Arc::new(inflight::Inflight::new()),
     });
 
     // data plane (HTTP + HTTPS, same router)

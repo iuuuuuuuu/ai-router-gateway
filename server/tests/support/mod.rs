@@ -1,6 +1,7 @@
 //! Shared test scaffolding: fake upstreams + gateway harness.
 use gw_server::config::{ApiKey, Channel, Config, Group, GroupOverrides, ModelBinding, Protocol, RetryConfig, Tier, TierMember};
 use gw_server::health::HealthRegistry;
+use gw_server::inflight::Inflight;
 use gw_server::proxy::AppState;
 use gw_server::store::Store;
 use std::sync::Arc;
@@ -74,6 +75,13 @@ pub enum Behavior {
     EmptyDataJson,
     /// 200 + a JSON object with no model list in it at all ({}).
     NoListJson,
+    /// 200 + full OpenAI JSON, but only after a deliberate delay, so a test can
+    /// observe the in-flight counter while the upstream is still thinking.
+    SlowJson,
+    /// 200 + SSE that COMMITS immediately (a first frame longer than the loop
+    /// guard's holdback) and then keeps the connection open for a while. Lets a
+    /// test prove occupancy survives the commit, not just the header arrival.
+    StreamSlow,
 }
 
 async fn handle_beh(beh: Behavior, body: String, hdrs: axum::http::HeaderMap, prefix: &str) -> axum::response::Response {
@@ -81,6 +89,39 @@ async fn handle_beh(beh: Behavior, body: String, hdrs: axum::http::HeaderMap, pr
     let _ = body;
     let _ = prefix;
     match beh {
+        Behavior::SlowJson => {
+            // Long enough to observe, short enough to keep tests quick.
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            (
+                axum::http::StatusCode::OK,
+                axum::Json(serde_json::json!({
+                    "id": "chatcmpl-x", "object": "chat.completion",
+                    "choices": [{"index": 0, "message": {"role": "assistant", "content": "hello from json"}, "finish_reason": "stop"}],
+                    "usage": {"prompt_tokens": 11, "completion_tokens": 7}
+                })),
+            ).into_response()
+        }
+        Behavior::StreamSlow => {
+            // Frame 1 is longer than the loop guard's holdback (min_chars = 64
+            // by default), so the gateway COMMITS on it. The sleep after it is
+            // the window where a naive in-flight implementation would already
+            // have released the account even though the client is still being
+            // served.
+            let head = "The quick brown fox jumps over the lazy dog while a tired postman waves at a passing tram.";
+            let first = format!(
+                "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"{head}\"}}}}]}}\n\n"
+            );
+            let s = async_stream::stream! {
+                yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from(first));
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                yield Ok(bytes::Bytes::from_static(
+                    b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\" end\"}}]}\n\n"));
+                yield Ok(bytes::Bytes::from_static(
+                    b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n"));
+                yield Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"));
+            };
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(s)).into_response()
+        }
         Behavior::GoodJson => (
             axum::http::StatusCode::OK,
             axum::Json(serde_json::json!({
@@ -498,8 +539,12 @@ pub async fn gateway(cfg: Config) -> (AppState, axum::Router) {
     let holder = gw_server::config::ConfigHolder::default();
     holder.publish(cfg);
     let health = Arc::new(HealthRegistry::new(Some(store.clone())));
-    let state = AppState { http: Default::default(), config: holder, health, store };
-    let router = gw_server::routes::data_plane_router(state.clone());
+    let state = AppState { http: Default::default(), config: holder, health, store, inflight: Arc::new(Inflight::new()) };
+    // The data plane lives at the root; the admin endpoints the in-flight tests
+    // need are MERGED in with the real admin router (same paths, same handlers,
+    // same auth), so a test cannot pass against a reimplementation.
+    let router = gw_server::routes::data_plane_router(state.clone())
+        .merge(gw_server::admin::admin_router(state.clone()));
     (state, router)
 }
 

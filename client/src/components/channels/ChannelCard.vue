@@ -11,10 +11,12 @@ const props = defineProps<{
   channel: Channel;
   /** 该渠道下挂的模型绑定。 */
   models: ModelBinding[];
-  /** 被一级故障转移层级引用的绑定 id，仅用于高亮。 */
+  /** 被一级故障转移层级引用的绑定 id，仅用于「一级引用」高亮（静态声明，不是「使用中」）。 */
   activeIds: Set<string>;
-  /** 列表里第一个启用的渠道 —— 仅用于「使用中」高亮，不参与调度决策。 */
-  active: boolean;
+  /** 该渠道此刻正在处理中的请求数（/admin/api/inflight）；0 = 空闲，不显示「使用中」。 */
+  inflight: number;
+  /** "<渠道>::<上游模型>" → 并发数，原样透传给 ModelRows 判断每个模型是否在用。 */
+  inflightMembers: Record<string, number>;
   /** 该渠道的连通测试是否进行中。 */
   testing: boolean;
   expanded: boolean;
@@ -47,7 +49,7 @@ const enabledModels = computed(() => props.models.filter(m => m.enabled).length)
 <template>
   <div
     class="overflow-hidden rounded-[10px] border transition-all"
-    :class="active ? 'border-teal-200 bg-teal-50/60' : (channel.enabled ? 'border-line bg-surface' : 'border-line bg-app opacity-70')"
+    :class="inflight > 0 ? 'border-teal-200 bg-teal-50/60' : (channel.enabled ? 'border-line bg-surface' : 'border-line bg-app opacity-70')"
   >
     <div class="flex items-center gap-3 px-3 py-2.5">
       <button
@@ -77,10 +79,11 @@ const enabledModels = computed(() => props.models.filter(m => m.enabled).length)
       </div>
 
       <span
-        v-if="active"
-        class="ml-1 inline-flex shrink-0 items-center gap-1 text-[11.5px] font-medium text-teal-700"
+        v-if="inflight > 0"
+        class="ml-1 inline-flex shrink-0 items-center gap-1 rounded-md bg-teal-100 px-1.5 py-0.5 text-[11.5px] font-medium text-teal-700"
+        title="此刻正在使用这个渠道的并发请求数"
       >
-        <span class="h-1.5 w-1.5 rounded-full bg-teal-500"></span>使用中
+        <span class="h-1.5 w-1.5 rounded-full bg-teal-500"></span>使用中 ×{{ inflight }}
       </span>
 
       <div class="flex shrink-0 items-center gap-0.5">
@@ -133,6 +136,7 @@ const enabledModels = computed(() => props.models.filter(m => m.enabled).length)
       <ModelRows
         :models="models"
         :active-ids="activeIds"
+        :inflight-members="inflightMembers"
         :epoch="epoch"
         @edit="(m) => emit('editModel', m)"
         @remove="(m) => emit('removeModel', m)"

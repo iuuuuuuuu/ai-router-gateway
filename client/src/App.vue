@@ -15,6 +15,7 @@ import IconBtn from "./components/ui/IconBtn.vue";
 import Channels from "./pages/Channels.vue";
 import Groups from "./pages/Groups.vue";
 import GroupDetail from "./pages/GroupDetail.vue";
+import GroupModels from "./pages/GroupModels.vue";
 import SettingsPage from "./pages/Settings.vue";
 import Logs from "./pages/Logs.vue";
 import Stats from "./pages/Stats.vue";
@@ -50,16 +51,19 @@ const detailGroup = computed(() =>
 
 // Model detail wins over the group detail: opening a member from the group page
 // keeps nav.groupId set, so the modelKey branch has to be checked first.
+// 分组详情下面还分两个子视图：概览（看）与模型配置（改层级/权重）。
 const pageComp = computed(() =>
-  nav.modelKey ? ModelDetail : {
-    channels: Channels, groups: Groups,
-    settings: SettingsPage, logs: Logs, stats: Stats,
-  }[nav.page]);
+  nav.modelKey ? ModelDetail
+    : nav.groupId ? (nav.groupView === "models" ? GroupModels : GroupDetail)
+    : {
+      channels: Channels, groups: Groups,
+      settings: SettingsPage, logs: Logs, stats: Stats,
+    }[nav.page]);
 
-/** Transition key: entering/leaving a detail page (or switching member) is a page change too. */
+/** Transition key: entering/leaving a detail page (or switching member/sub-view) is a page change too. */
 const viewKey = computed(() => nav.modelKey
   ? "model:" + nav.groupId + ":" + nav.modelKey
-  : nav.groupId ? "group:" + nav.groupId : nav.page);
+  : nav.groupId ? "group:" + nav.groupId + ":" + nav.groupView : nav.page);
 
 /** A detail view of either kind owns the title bar; the model detail renders its own
  *  in-page back button, so only the group detail gets one up here. */
@@ -82,7 +86,9 @@ onMounted(async () => {
 });
 onUnmounted(() => { if (timer) window.clearInterval(timer); });
 
-const heading = computed(() => (nav.modelKey ? "模型详情" : detailGroup.value ? "分组详情" : current.value.label));
+const heading = computed(() => (nav.modelKey ? "模型详情"
+  : detailGroup.value ? (nav.groupView === "models" ? "模型配置" : "分组详情")
+  : current.value.label));
 const headingHint = computed(() => (detailGroup.value
   ? `${detailGroup.value.name || detailGroup.value.id} · ${detailGroup.value.id}`
   : detailOpen.value ? "" : current.value.hint));
@@ -187,6 +193,7 @@ const headingHint = computed(() => (detailGroup.value
 
         <Transition v-else name="page" mode="out-in" appear>
           <ModelDetail v-if="nav.modelKey" :key="viewKey" />
+          <GroupModels v-else-if="detailGroup && nav.groupView === 'models'" :key="viewKey" :group="detailGroup" />
           <GroupDetail v-else-if="detailGroup" :key="viewKey" :group="detailGroup" />
           <div v-else :key="viewKey" class="px-5 py-5">
             <component :is="pageComp" />

@@ -455,7 +455,9 @@ pub async fn group_members(State(state): State<AppState>, headers: HeaderMap, Qu
     // The member that served this group's most recent successful request
     // ("<channel_id>::<upstream_model>"), or None when the group has never
     // had a success. NOTE: "active" is last-success-based, NOT in-flight — a
-    // long-running stream does not change it until it lands.
+    // long-running stream does not change it until it lands. The console must
+    // NOT render "active" as "使用中": the live badge comes from the
+    // `inflight` counter below, which really is "is this account busy now".
     let active_key: Option<String> = state.store.active_member_key(&group.id).unwrap_or(None);
     let stats = state.store.group_member_stats(&group.id).unwrap_or_default();
     let cooling_rows = state.health.snapshot_summary();
@@ -501,6 +503,9 @@ pub async fn group_members(State(state): State<AppState>, headers: HeaderMap, Qu
             let classes = st.and_then(|v| v.get("error_classes")).cloned().unwrap_or_else(|| json!([]));
             // True for the one member whose key equals active_key (at most one per payload).
             let active = active_key.as_deref() == Some(key.as_str());
+            // How many requests are using this account RIGHT NOW. 0 is the
+            // normal state; anything above 0 is what "使用中" means.
+            let inflight_n = state.inflight.member_count(&key) as i64;
 
             members.push(json!({
                 "key": key,
@@ -532,6 +537,7 @@ pub async fn group_members(State(state): State<AppState>, headers: HeaderMap, Qu
                 "last_outcome": num("last_outcome"),
                 "last_error_class": num("last_error_class"),
                 "active": active,
+                "inflight": inflight_n,
             }));
         }
     }
@@ -547,6 +553,9 @@ pub async fn group_members(State(state): State<AppState>, headers: HeaderMap, Qu
         "group_id": group.id,
         "group_name": group.name,
         "active_key": active_key,
+        // Sum over the members above, so the header can say "本分组正在并发 N"
+        // without re-adding the rows.
+        "inflight_total": state.inflight.total(),
         "retry": rc,
         "retry_source": retry_source,
         "global_retry": snap.config.retry,
@@ -574,6 +583,68 @@ fn cooling_for(rows: &[crate::health::CooldownRow], channel_id: &str, upstream_m
     (None, None)
 }
 
+/// Live concurrency for every upstream account, for the console's "使用中"
+/// badges on the Channels and Groups pages.
+///
+/// This is the ONLY honest source for that badge. Two cheaper substitutes were
+/// rejected on purpose:
+///   * `group_members.active` / `active_key` — the last SUCCESSFUL landing
+///     spot, which stays lit after the request is long gone;
+///   * the tier-1 reference highlight — a config declaration with no traffic
+///     meaning at all.
+/// A counter that only exists while an attempt really occupies an account
+/// cannot lie in either direction: it is 0 when idle and N when N requests are
+/// in flight.
+pub async fn inflight(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorize(&state, &headers) { return r }
+    // Config is optional here: the members/channels/total aggregations need no
+    // routing knowledge, and a gateway that has not published a config yet
+    // should still answer with real zeros instead of a 503.
+    let snap = state.config.get();
+    let cfg = snap.as_ref().map(|s| s.config.as_ref());
+    Json(state.inflight.snapshot_json(cfg)).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct PurgeLogsReq {
+    #[serde(default)]
+    pub request_logs: bool,
+    #[serde(default)]
+    pub switch_logs: bool,
+    #[serde(default)]
+    pub cooldowns: bool,
+}
+
+/// "清空日志与统计": drop the traffic history the console renders.
+///
+/// Deliberately NOT a config reset. The channels, models, groups and API keys
+/// survive, because the point is to clear the self-test noise that made a
+/// never-used account look busy — not to reconfigure the gateway.
+///
+/// `cooldowns` clears BOTH halves of the cooling state: the persisted table and
+/// the in-memory registry. Clearing only the table would leave the console
+/// showing a channel as cooling until the next restart.
+pub async fn purge_logs(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<PurgeLogsReq>) -> Response {
+    if let Err(r) = authorize(&state, &headers) { return r }
+    match state.store.purge(req.request_logs, req.switch_logs, req.cooldowns) {
+        Ok((n_req, n_sw, n_cd)) => {
+            if req.cooldowns {
+                state.health.clear_all();
+                state.health.persist();
+            }
+            Json(json!({
+                "ok": true,
+                "deleted": {
+                    "request_logs": n_req,
+                    "switch_logs": n_sw,
+                    "cooldowns": n_cd,
+                },
+            })).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
 pub fn admin_router(state: AppState) -> axum::Router {
     use axum::routing::{get, post, put};
     use tower_http::cors::{Any, CorsLayer};
@@ -591,6 +662,8 @@ pub fn admin_router(state: AppState) -> axum::Router {
         .route("/admin/api/logs/requests", get(request_logs))
         .route("/admin/api/stats", get(stats))
         .route("/admin/api/group-members", get(group_members))
+        .route("/admin/api/inflight", get(inflight))
+        .route("/admin/api/purge-logs", post(purge_logs))
         .route("/admin/api/health", get(health_summary))
         .route("/admin/api/test-channel", post(test_channel))
         .route("/admin/api/channel-models", post(channel_models))

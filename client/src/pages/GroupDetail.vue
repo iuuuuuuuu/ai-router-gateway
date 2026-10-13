@@ -1,19 +1,25 @@
 <script setup lang="ts">
-// 分组详情（整页版）：分组概览 + 该分组的用量统计 + 请求日志 + 切换日志 + 冷却状态。
+// 分组详情（整页版）：分组设置（内联编辑）+ 分组概览 + 该分组的用量统计 + 请求日志 + 切换日志 + 冷却状态。
+// 路由层级 / 成员 / 权重 不在这里 —— 那是「模型配置」子页（nav.groupView === "models"），
+// 因为改的是路由表，而且带拖动排序，塞进概览会把看板撑长；这里只留一份只读速览 + 跳转按钮。
 // 进入页面时用 Promise.all 一次性并发拉全四份数据，页签切换只切本地视图、不再发请求；
 // 「自动刷新 5s」开关控制 5s 轮询，离开页面（组件卸载）时定时器一并清掉。
 // 页面由 App.vue 按 nav.groupId 挂载，group 一定非空；Esc 等价于点顶栏「返回」。
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
-  Activity, Coins, KeyRound, RefreshCw, ScrollText, ShieldAlert, Waypoints,
+  Activity, ArrowRight, Coins, Copy, Info, KeyRound, Pencil, RefreshCw, RotateCcw,
+  Save, ScrollText, ShieldAlert, Waypoints,
 } from "@lucide/vue";
 import {
   api, type CooldownRow as ApiCooldownRow, type Group, type GroupMember, type GroupMembersPayload,
-  type RequestLog, type StatsPayload, type SwitchLog,
+  type RequestLog, type RetryConfig, type StatsPayload, type SwitchLog,
 } from "../api";
-import { apiKeys, bindingLabel, channelName, models, state } from "../store";
-import { closeGroupDetail, openModelDetail } from "../nav";
-import { Alert, Badge, Btn, Card, Empty, PageHeader, Spinner, TToggle } from "../components/ui";
+import { apiKeys, bindingLabel, channelName, markDirty, models, state } from "../store";
+import { closeGroupDetail, openModelDetail, setGroupView } from "../nav";
+import { toast } from "../toast";
+import {
+  Alert, Badge, Btn, Card, Empty, Field, PageHeader, Spinner, TInput, TTextarea, TToggle,
+} from "../components/ui";
 
 type Tone = "gray" | "teal" | "ok" | "warn" | "err" | "brand";
 type Row = Record<string, number | string | null>;
@@ -37,20 +43,27 @@ const TIER_NAMES = ["一级", "二级", "三级", "四级", "五级", "六级"];
  */
 const autoWeight = computed(() => state.cfg?.auto_weight ?? false);
 
-/* --------------------- 成员级真实数据（在用 / 请求数 / 失败） --------------------- */
-// 来自 GET /admin/api/group-members：member.active = 该分组最近一次成功请求的落点，
+/* --------------------- 成员级真实数据（并发 / 请求数 / 失败） --------------------- */
+// 来自 GET /admin/api/group-members：member.inflight = 该成员此刻正在处理的并发请求数，
 // requests / failed_attempts 是服务端按该成员聚合的真实计数。端点缺失或请求失败时
 // memberPayload 保持 null，chip 退化成「0 次」且不显示「使用中」，整页其余部分照常。
+//
+// 「使用中」的口径（task-40）：**真实 in-flight 并发 > 0** —— 只有此刻真的在打这个
+// (渠道, 上游模型) 才算在用。旧口径 member.active / active_key 是「最近一次成功请求的落点」
+// （last-success），与此刻是否在用无关，属于假状态，已不再用于徽章。
+// last-success 没有删掉：它仍在页头以「最近成功 …」单独呈现（见 activeMember）。
 const memberPayload = ref<GroupMembersPayload | null>(null);
 // 同一 model_id 可跨层出现，成员一律用 (tier, model_id) 复合定位。
 function memberOf(tierLevel: number, modelId: string): GroupMember | null {
   return memberPayload.value?.members.find(m => m.model_id === modelId && m.tier === tierLevel) ?? null;
 }
-function isMemberActive(tierLevel: number, modelId: string): boolean {
-  const p = memberPayload.value;
-  const m = memberOf(tierLevel, modelId);
-  if (!p || !m) return false;
-  return m.active || (!!p.active_key && p.active_key === m.key);
+/** 该成员此刻的并发请求数；成员数据不可用 / 不在用即 0。 */
+function memberInflight(tierLevel: number, modelId: string): number {
+  return memberOf(tierLevel, modelId)?.inflight ?? 0;
+}
+/** 是否正在被使用：**真实 in-flight 并发 > 0**（此刻真的在打这个账号）。 */
+function isMemberInUse(tierLevel: number, modelId: string): boolean {
+  return memberInflight(tierLevel, modelId) > 0;
 }
 function memberRequests(tierLevel: number, modelId: string): number {
   return memberOf(tierLevel, modelId)?.requests ?? 0;
@@ -64,11 +77,21 @@ function memberRequestsTitle(tierLevel: number, modelId: string): string {
   const n = memberRequests(tierLevel, modelId);
   return n > 0 ? `本分组内该成员成功请求 ${n} 次` : "本分组内该成员成功请求 0 次";
 }
-/** 最近一次成功请求落在哪个成员（active_key 指向的那个）。 */
+/**
+ * 最近一次成功请求落在哪个成员（active_key 指向的那个）——**last-success，不是「使用中」**。
+ * 只用于页头那句「最近成功 …」：让「上一个成功落点」与「此刻的并发」两个口径都看得见。
+ */
 const activeMember = computed<GroupMember | null>(() => {
   const p = memberPayload.value;
   if (!p?.active_key) return null;
   return p.members.find(m => m.key === p.active_key) ?? null;
+});
+/** 该分组此刻正在处理中的请求总数；服务端没给 inflight_total 时按成员求和兜底。 */
+const inflightTotal = computed(() => {
+  const p = memberPayload.value;
+  if (!p) return 0;
+  if (typeof p.inflight_total === "number") return p.inflight_total;
+  return p.members.reduce((n, m) => n + (m.inflight ?? 0), 0);
 });
 /** 「最多 N 轮」：优先用该分组实际生效的重试配置（task-28 起 group-members 会带），否则回落全局。 */
 const maxCycles = computed(() => memberPayload.value?.retry?.max_cycles ?? state.cfg?.retry.max_cycles ?? 2);
@@ -247,11 +270,11 @@ const tabs: { key: TabKey; label: string }[] = [
 
 /* -------------------------------- 数据拉取 -------------------------------- */
 // 进入页面一次性并发拉全：分组 scoped 的 stats + 该分组最近 LIMIT 条切换/请求日志 + 全局冷却列表。
-let inflight = false;
+let loadInflight = false;
 async function load(silent = false) {
   const g = props.group;
-  if (!g || inflight) return;
-  inflight = true;
+  if (!g || loadInflight) return;
+  loadInflight = true;
   if (!silent) loading.value = true;
   err.value = "";
   try {
@@ -260,7 +283,7 @@ async function load(silent = false) {
       api.switchLogs(LIMIT, undefined, g.id),
       api.requestLogs(LIMIT, undefined, g.id),
       api.health(),
-      // 成员数据失败不拖垮整页：单独吞掉错误，退化成「0 次 + 无使用中」。
+      // 成员数据失败不拖垮整页：单独吞掉错误，退化成「0 次 + 无使用中（并发未知）」。
       api.groupMembers(g.id).catch(() => null),
     ]);
     stats.value = (s ?? null) as StatsPayload | null;
@@ -271,7 +294,7 @@ async function load(silent = false) {
   } catch (e: any) {
     err.value = String(e?.message || e);
   } finally {
-    inflight = false;
+    loadInflight = false;
     loading.value = false;
   }
 }
@@ -440,6 +463,146 @@ function shareText(row: Row): string {
   if (!(total > 0)) return "—";
   return `${((c / total) * 100).toFixed(1)}%`;
 }
+
+/* ---------------------------- 分组设置（内联编辑） ---------------------------- */
+// 2026-10-13 起，分组自己的设置不再走「编辑分组」弹窗，而是在这一页直接改：
+//  · 名称 / 暴露模型 —— 分组对客户端暴露的身份；
+//  · 重试与超时      —— 这个分组自己的策略配置（跟随全局 ↔ 自有配置）。
+// 改动先进草稿（sName / sExposed / sRetry），点本卡右上「保存设置」才写回 state.cfg
+// 并 markDirty()；真正的落库仍然由顶栏「保存」统一负责 —— 与其它页面同一套语义。
+// 路由层级 / 成员 / 权重 不在这里：那是「模型配置」子页（nav.groupView === "models"），
+// 因为它是「另一件事」（改的是路由表，而且带拖动排序，塞进概览会把看板撑长）。
+
+const sName = ref("");
+const sExposed = ref("");
+/** null = 跟随全局；有对象 = 使用这个分组自己的配置（判据只有 overrides.retry 是否存在）。 */
+const sRetry = ref<RetryConfig | null>(null);
+
+/** 从当前分组把三份草稿重新灌一遍（进入页面、外部换配置、放弃修改时都走它）。 */
+function syncSettings() {
+  const g = props.group;
+  sName.value = g?.name ?? "";
+  sExposed.value = (g?.exposed_models ?? []).join("\n");
+  sRetry.value = g?.overrides?.retry ? normRetry(g.overrides.retry) : null;
+}
+syncSettings();
+// 分组对象被换掉（顶栏「重新加载配置」、保存成功）时重新灌草稿，别拿着上一份的残留。
+watch(() => props.group, syncSettings);
+
+const sExposedList = computed(() =>
+  sExposed.value.split(/[\s,，;；、]+/).map(x => x.trim()).filter(Boolean),
+);
+const sNameError = computed(() => (sName.value.trim() ? "" : "请填写分组名。"));
+const sExposedError = computed(() =>
+  sExposedList.value.length ? "" : "至少填写一个暴露模型名，客户端用这些名字发起请求。");
+
+/**
+ * 服务端不保证每个字段都回来（老服务端 / 以后会加新字段），缺的用全局值补齐，
+ * 避免出现空数字框；已有的一律保留，不做类型转换。
+ */
+function normRetry(src: RetryConfig): RetryConfig {
+  const base = state.cfg!.retry as unknown as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(src)) out[k] = (src as unknown as Record<string, unknown>)[k];
+  for (const k of Object.keys(base)) {
+    if (out[k] === undefined || out[k] === null) out[k] = base[k];
+  }
+  return out as unknown as RetryConfig;
+}
+
+/** 全局配置：服务端回报的 global_retry 优先，否则本地 state.cfg。 */
+function globalRetry(): RetryConfig {
+  return memberPayload.value?.global_retry ?? state.cfg!.retry;
+}
+/** 该分组当前实际生效的配置：优先服务端回报，其次它自己的，最后退回全局。 */
+function effRetry(): RetryConfig {
+  return memberPayload.value?.retry ?? props.group?.overrides?.retry ?? state.cfg!.retry;
+}
+/** 该分组的配置来源：优先服务端回报，否则按本地是否自有判断。 */
+function retrySrc(): "global" | "group" {
+  const srv = memberPayload.value?.retry_source;
+  if (srv === "group" || srv === "global") return srv;
+  return sRetry.value ? "group" : "global";
+}
+
+/** 切到「使用自己的配置」：从当前生效值克隆一份，之后改的就是这份独立副本。 */
+function useOwn() {
+  if (sRetry.value) return;
+  sRetry.value = normRetry(effRetry());
+}
+/** 切回「跟随全局配置」：写 null，绝不去复制全局值。 */
+function followGlobal() {
+  if (!sRetry.value) return;
+  sRetry.value = null;
+}
+/** 把当前全局配置整份复制到这个分组，之后它就和全局解耦、可以单独改了。 */
+function copyGlobal() {
+  sRetry.value = normRetry(globalRetry());
+}
+
+/** 该分组自己的配置里的预算校验 —— 与设置页「重试与超时」同一套公式。 */
+const sBudget = computed(() => {
+  const r = sRetry.value;
+  if (!r) return { ok: true, line: "" };
+  const worst = Number(r.max_attempts) * Number(r.attempt_deadline_ms) + Number(r.reserve_ms);
+  return {
+    ok: worst <= Number(r.total_deadline_ms),
+    line: `${r.max_attempts} × ${r.attempt_deadline_ms} ms + ${r.reserve_ms} ms = ${worst} ms`,
+  };
+});
+
+/** 跟随全局时的一句话摘要：用实际生效值，和生效的模型名一样能直接看。 */
+const followLine = computed(() => {
+  const r = effRetry();
+  const sec = Math.max(1, Math.round(Number(r.total_deadline_ms) / 1000));
+  return `跟随全局（当前：max_attempts=${r.max_attempts} / 总超时 ${sec}s / 死循环拦截 ${r.loop_guard_enabled ? "开" : "关"}）`;
+});
+
+/** 有没有未保存的设置改动（顶栏之外的第二处脏标记，只描述本卡）。 */
+const sDirty = computed(() => {
+  const g = props.group;
+  if (!g) return false;
+  const nextRetry = sRetry.value ? normRetry(sRetry.value) : null;
+  const curRetry = g.overrides?.retry ?? null;
+  return sName.value.trim() !== (g.name ?? "")
+    || JSON.stringify(sExposedList.value) !== JSON.stringify(g.exposed_models ?? [])
+    || JSON.stringify(nextRetry) !== JSON.stringify(curRetry);
+});
+
+const sValid = computed(() => !sNameError.value && !sExposedError.value && sBudget.value.ok);
+
+/** 写回配置（只进内存 + markDirty，落库交给顶栏「保存」）。 */
+function saveSettings() {
+  const cfg = state.cfg;
+  const g = props.group;
+  if (!cfg || !g || !sValid.value) return;
+  const clean: Group = {
+    id: g.id,
+    name: sName.value.trim(),
+    exposed_models: [...sExposedList.value],
+    // 层级归「模型配置」子页管，这里原样深拷贝带回去，免得把那边改好的路由表抹掉。
+    tiers: JSON.parse(JSON.stringify(g.tiers ?? [])),
+    // ★ overrides 必须显式写：不带这个字段等于把该分组自己的重试配置静默抹掉，
+    //   服务端会把它当成「跟随全局」（None 序列化成 "retry": null）。
+    overrides: { retry: sRetry.value ? normRetry(sRetry.value) : null },
+  };
+  const i = cfg.groups.findIndex(x => x.id === g.id);
+  if (i >= 0) cfg.groups.splice(i, 1, clean);
+  else cfg.groups.push(clean);
+  markDirty();
+  toast.ok(`已更新分组「${clean.name || clean.id}」的设置`);
+}
+
+/** 放弃本卡的改动：从当前分组重新灌一遍草稿。 */
+function resetSettings() {
+  syncSettings();
+  toast.ok("已放弃未保存的分组设置改动");
+}
+
+/** 跳到「模型配置」子页（路由层级 / 成员 / 权重）。 */
+function openModels() {
+  setGroupView("models");
+}
 </script>
 
 <template>
@@ -458,16 +621,23 @@ function shareText(row: Row): string {
       </template>
     </PageHeader>
 
-    <!-- 当前实际在用的成员（服务端最近一次成功请求的落点） -->
+    <!-- 两个不同口径，别混：左边是**此刻**的并发（真实 in-flight），右边是**上一次**成功落点（last-success） -->
     <div class="flex flex-wrap items-center gap-2 text-[12px]" data-test="gd-active-model">
-      <span class="text-ink-3">当前使用</span>
-      <Badge v-if="activeMember" tone="teal">
-        {{ activeMember.channel_name }} · {{ activeMember.upstream_model }}
-      </Badge>
-      <span v-else class="text-ink-3">—（本分组还没有成功请求）</span>
-      <span v-if="activeMember?.last_used_ts" class="ml-auto font-mono text-[11.5px] text-ink-3">
-        最近成功 {{ fmtTs(activeMember.last_used_ts) }}
+      <span class="text-ink-3">当前并发</span>
+      <span
+        v-if="inflightTotal > 0"
+        data-test="gd-inflight-total"
+        class="inline-flex items-center gap-1 rounded-md bg-teal-100 px-1.5 py-0.5 text-[11.5px] font-medium text-teal-700"
+        title="本分组此刻正在处理中的请求数（真实 in-flight 并发）"
+      >
+        <span class="h-1.5 w-1.5 rounded-full bg-teal-500"></span>{{ inflightTotal }} 个请求
       </span>
+      <span v-else class="text-ink-3" data-test="gd-inflight-total" title="此刻没有正在处理中的请求">空闲</span>
+      <span v-if="activeMember" class="ml-auto font-mono text-[11.5px] text-ink-3">
+        最近成功 {{ activeMember.last_used_ts ? fmtTs(activeMember.last_used_ts) : "—" }}
+        · {{ activeMember.channel_name }} · {{ activeMember.upstream_model }}
+      </span>
+      <span v-else class="ml-auto font-mono text-[11.5px] text-ink-3">最近成功 —（本分组还没有成功请求）</span>
     </div>
     <!-- ------------------------------ 吸顶页签条 ------------------------------ -->
     <div class="sticky top-0 z-10 -mx-5 mb-3.5 flex flex-wrap items-center gap-2 border-b border-line bg-app px-5">
@@ -495,6 +665,206 @@ function shareText(row: Row): string {
     <template v-else>
       <!-- ------------------------------ 概览 ------------------------------ -->
       <div v-if="tab === 'overview'" class="space-y-3.5">
+        <!-- ------------------------ 分组设置（内联编辑） ------------------------ -->
+        <Card :pad="false" class="overflow-hidden" data-test="group-settings-card">
+          <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+            <Pencil :size="15" class="text-ink-3" />
+            <h2 class="text-[13.5px] font-semibold text-ink">分组设置</h2>
+            <Badge v-if="sDirty" tone="warn" data-test="group-settings-dirty">有未保存的改动</Badge>
+            <span class="ml-auto flex shrink-0 items-center gap-2">
+              <Btn size="sm" variant="ghost" data-test="group-settings-reset" :disabled="!sDirty" @click="resetSettings">
+                <RotateCcw :size="13" />放弃修改
+              </Btn>
+              <Btn size="sm" variant="primary" data-test="group-settings-save" :disabled="!sValid || !sDirty" @click="saveSettings">
+                <Save :size="13" />保存设置
+              </Btn>
+            </span>
+          </div>
+
+          <div class="space-y-4 px-4 py-3.5">
+            <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <Field label="分组 ID" hint="已保存的分组不建议再改 ID（密钥与日志都按它归属）">
+                <TInput :model-value="group.id" mono disabled />
+              </Field>
+              <Field label="分组名" required hint="例如：主力池 / 备用池">
+                <TInput v-model="sName" data-test="group-name-input" :invalid="!!sNameError" placeholder="主力池" />
+              </Field>
+            </div>
+
+            <Field
+              label="暴露模型"
+              required
+              hint="客户端用这些模型名请求，会按本分组的路由表转发；逗号或换行分隔"
+            >
+              <TTextarea v-model="sExposed" data-test="group-exposed-input" :rows="2" placeholder="gpt-4o, claude-3-5-sonnet" />
+            </Field>
+
+            <Alert v-if="sNameError || sExposedError" tone="err" data-test="group-settings-error">
+              {{ sNameError || sExposedError }}
+            </Alert>
+
+        <!-- ------------------------ 重试与超时（本分组自己的策略配置） ------------------------ -->
+        <!-- 这块原先在设置页，按需求挪进「分组自己的配置」里：改哪个分组就在哪个分组的弹窗里改。 -->
+        <div class="border-t border-line-soft pt-4" data-test="group-retry-card">
+          <div class="mb-2.5 flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+            <div class="min-w-0">
+              <div class="flex flex-wrap items-center gap-2">
+                <span class="text-[12.5px] font-medium text-ink-2">重试与超时</span>
+                <Badge :tone="sRetry ? 'brand' : 'gray'">
+                  {{ sRetry ? "自己的配置" : "跟随全局" }}
+                </Badge>
+              </div>
+              <p class="mt-1 text-[11.5px] leading-4 text-ink-3">
+                这个分组可以跟随全局配置，也可以拥有自己的一份；有自己的配置时以它为准，全局改动不再影响它。
+              </p>
+            </div>
+
+            <div class="flex shrink-0 flex-wrap items-center gap-2" data-test="group-retry-source">
+              <Btn
+                size="sm" :variant="sRetry ? 'ghost' : 'primary'"
+                data-test="group-retry-follow"
+                @click="followGlobal"
+              >跟随全局配置</Btn>
+              <Btn
+                size="sm" :variant="sRetry ? 'primary' : 'ghost'"
+                data-test="group-retry-own"
+                @click="useOwn"
+              >使用自己的配置</Btn>
+            </div>
+          </div>
+
+          <p
+            v-if="!sRetry"
+            class="rounded-lg border border-line-soft bg-app/40 px-3 py-2 text-[12px] leading-5 text-ink-2"
+            data-test="group-retry-following"
+          >
+            {{ followLine }}
+          </p>
+
+          <div v-else>
+            <div class="mb-2.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+              <span class="text-[11.5px] font-medium uppercase tracking-wide text-ink-3">独立配置</span>
+              <Btn
+                size="sm" variant="subtle"
+                data-test="group-retry-copy-global"
+                @click="copyGlobal"
+              >
+                <Copy :size="12" />
+                复制当前全局配置
+              </Btn>
+            </div>
+
+            <div data-test="group-retry-fields" class="grid grid-cols-1 gap-x-5 gap-y-4 sm:grid-cols-2">
+                <Field label="最大尝试次数" hint="单个请求最多尝试多少次（含降级后的重试）">
+                  <div data-test="group-retry-max-attempts">
+                    <TInput v-model.number="sRetry.max_attempts" type="number" data-test="group-retry-max-attempts" />
+                  </div>
+                </Field>
+                <Field label="最大循环轮数" hint="走完全部层级算 1 轮，最多循环几轮">
+                  <div data-test="group-retry-max-cycles">
+                    <TInput v-model.number="sRetry.max_cycles" type="number" data-test="group-retry-max-cycles" />
+                  </div>
+                </Field>
+                <Field label="总预算 (ms)" hint="整个请求的总时间上限，超过即直接失败">
+                  <div data-test="group-retry-total-deadline-ms">
+                    <TInput v-model.number="sRetry.total_deadline_ms" type="number" data-test="group-retry-total-deadline-ms" />
+                  </div>
+                </Field>
+                <Field label="单次尝试上限 (ms)" hint="一次尝试的最长耗时，超时即判定失败并降级">
+                  <div data-test="group-retry-attempt-deadline-ms">
+                    <TInput v-model.number="sRetry.attempt_deadline_ms" type="number" data-test="group-retry-attempt-deadline-ms" />
+                  </div>
+                </Field>
+                <Field label="连接超时 (ms)" hint="与上游建立 TCP / TLS 连接的超时">
+                  <div data-test="group-retry-connect-timeout-ms">
+                    <TInput v-model.number="sRetry.connect_timeout_ms" type="number" data-test="group-retry-connect-timeout-ms" />
+                  </div>
+                </Field>
+                <Field label="首字节超时 (ms)" hint="发出请求到收到响应首字节的超时">
+                  <div data-test="group-retry-ttfb-timeout-ms">
+                    <TInput v-model.number="sRetry.ttfb_timeout_ms" type="number" data-test="group-retry-ttfb-timeout-ms" />
+                  </div>
+                </Field>
+                <Field label="首个事件超时 (ms)" hint="流式响应中第一个事件到达的超时">
+                  <div data-test="group-retry-first-event-timeout-ms">
+                    <TInput v-model.number="sRetry.first_event_timeout_ms" type="number" data-test="group-retry-first-event-timeout-ms" />
+                  </div>
+                </Field>
+                <Field label="流空闲超时 (ms)" hint="流式响应里两个数据块之间的最大空闲时间">
+                  <div data-test="group-retry-chunk-idle-timeout-ms">
+                    <TInput v-model.number="sRetry.chunk_idle_timeout_ms" type="number" data-test="group-retry-chunk-idle-timeout-ms" />
+                  </div>
+                </Field>
+                <Field label="预留余量 (ms)" hint="给收尾/补帧留的时间">
+                  <div data-test="group-retry-reserve-ms">
+                    <TInput v-model.number="sRetry.reserve_ms" type="number" data-test="group-retry-reserve-ms" />
+                  </div>
+                </Field>
+            </div>
+
+            <div class="mt-3 border-t border-line-soft pt-3">
+              <div data-test="group-retry-cooldown-wait">
+                <TToggle
+                  v-model="sRetry.cooldown_wait"
+                  label="全部冷却时等待而非直接失败"
+                  data-test="group-retry-cooldown-wait"
+                />
+              </div>
+              <p class="mt-1 text-[11.5px] leading-4 text-ink-3">
+                开启后，若该分组所有候选渠道都在冷却中，请求会等待最早解除冷却的渠道，而不是立刻返回失败。
+              </p>
+            </div>
+
+            <div class="mt-3 border-t border-line-soft pt-3">
+              <div data-test="group-retry-loop-guard-enabled">
+                <TToggle
+                  v-model="sRetry.loop_guard_enabled"
+                  label="拦截退化输出（死循环拦截）"
+                  data-test="group-retry-loop-guard-enabled"
+                />
+              </div>
+              <div class="mt-3 grid grid-cols-1 gap-x-5 gap-y-4 sm:grid-cols-2">
+                <Field label="检测起点 (字符)" hint="提交前先攒够这么多字符再开始判断：太小容易误判，太大则首字节推迟更久">
+                  <div data-test="group-retry-loop-guard-min-chars">
+                    <TInput v-model.number="sRetry.loop_guard_min_chars" type="number" min="1" data-test="group-retry-loop-guard-min-chars" />
+                  </div>
+                </Field>
+                <Field label="重复单元下限 (字符)" hint="被重复的那一段至少多长才算「无意义重复」，太短会把正常的中文/标点重复算进去">
+                  <div data-test="group-retry-loop-guard-repeat-min-chars">
+                    <TInput v-model.number="sRetry.loop_guard_repeat_min_chars" type="number" min="1" data-test="group-retry-loop-guard-repeat-min-chars" />
+                  </div>
+                </Field>
+                <Field label="重复占比阈值" hint="0~1 的小数，例如 0.75 表示重复部分要占到检测窗口的 75% 才判定为退化">
+                  <div data-test="group-retry-loop-guard-repeat-ratio">
+                    <TInput v-model.number="sRetry.loop_guard_repeat_ratio" type="number" min="0" max="1" step="0.05" data-test="group-retry-loop-guard-repeat-ratio" />
+                  </div>
+                </Field>
+                <Field label="同一段重复次数" hint="同一段内容重复到第几次判定为退化，越小越敏感">
+                  <div data-test="group-retry-loop-guard-max-repeats">
+                    <TInput v-model.number="sRetry.loop_guard_max_repeats" type="number" min="2" data-test="group-retry-loop-guard-max-repeats" />
+                  </div>
+                </Field>
+                <Field label="检测窗口 (字符)" hint="最多回看多少字符，超出只保留最近的；越大越吃内存，越小越容易漏判">
+                  <div data-test="group-retry-loop-guard-window-chars">
+                    <TInput v-model.number="sRetry.loop_guard_window_chars" type="number" min="1" data-test="group-retry-loop-guard-window-chars" />
+                  </div>
+                </Field>
+              </div>
+            </div>
+
+            <Alert v-if="!sBudget.ok" tone="err" class="mt-3" data-test="group-retry-invalid">
+              <Info :size="13" class="mt-0.5 shrink-0" />
+              <span>
+                预算不成立：{{ sBudget.line }} &gt; 总预算 {{ sRetry.total_deadline_ms }} ms，
+                服务端会拒绝保存，请调小尝试次数或单次上限。
+              </span>
+            </Alert>
+          </div>
+        </div>
+          </div>
+        </Card>
+
+        <!-- ------------------------ 分组概览（只读摘要） ------------------------ -->
         <Card :pad="false" class="overflow-hidden">
           <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
             <Activity :size="15" class="text-ink-3" />
@@ -547,6 +917,9 @@ function shareText(row: Row): string {
               <template v-if="autoWeight">按 一级 → 二级 → 三级 顺序尝试，同级内按权重降序</template>
               <template v-else>按 一级 → 二级 → 三级 顺序尝试，同级内按列表顺序</template>
             </span>
+            <Btn size="sm" variant="ghost" data-test="gd-open-models" @click="openModels">
+              <Pencil :size="12" />模型配置
+            </Btn>
           </div>
           <div v-if="sortedTiers.length" class="space-y-2.5 px-4 py-3.5">
             <div v-for="t in sortedTiers" :key="t.level" class="flex items-start gap-3">
@@ -573,10 +946,11 @@ function shareText(row: Row): string {
                       失败 {{ memberFailed(t.level, m.model_id) }}
                     </Badge>
                     <span
-                      v-if="isMemberActive(t.level, m.model_id)"
+                      v-if="isMemberInUse(t.level, m.model_id)"
                       data-test="gd-member-active"
-                      class="inline-flex items-center gap-1 text-[11.5px] font-medium text-teal-700"
-                    ><span class="h-1.5 w-1.5 rounded-full bg-teal-500"></span>使用中</span>
+                      class="inline-flex shrink-0 items-center gap-1 rounded-md bg-teal-100 px-1.5 py-0.5 text-[11.5px] font-medium text-teal-700"
+                      title="此刻正在使用该 (渠道, 上游模型) 的并发请求数"
+                    ><span class="h-1.5 w-1.5 rounded-full bg-teal-500"></span>使用中 ×{{ memberInflight(t.level, m.model_id) }}</span>
                   </div>
                 </template>
                 <span v-else class="py-1 text-[12px] text-ink-3">该级无成员</span>

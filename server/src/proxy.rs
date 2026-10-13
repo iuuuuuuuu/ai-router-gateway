@@ -67,6 +67,10 @@ pub struct AppState {
     pub config: crate::config::ConfigHolder,
     pub health: Arc<HealthRegistry>,
     pub store: Arc<crate::store::Store>,
+    /// Requests occupying each upstream account RIGHT NOW. This is the only
+    /// source of truth for "使用中" — not the last-success row, not the
+    /// static tier-1 reference highlight.
+    pub inflight: Arc<crate::inflight::Inflight>,
 }
 
 // Cloneable for axum::with_state (all fields are Arc/Client/Clone types)
@@ -77,6 +81,7 @@ impl Clone for AppState {
             config: self.config.clone(),
             health: self.health.clone(),
             store: self.store.clone(),
+            inflight: self.inflight.clone(),
         }
     }
 }
@@ -325,6 +330,13 @@ async fn attempt_once(
     client_gone: CancellationToken,
     feed_tx: mpsc::Sender<ClientFrame>,
 ) -> Result<Outcome, (ProxyError, ir::Usage)> {
+    // In-flight occupancy starts HERE, before the socket is opened, and ends
+    // when this attempt stops using the account. For a non-stream attempt that
+    // is this function's return; for a committed stream it is the end of the
+    // POST-COMMIT pump, so the guard is handed to attempt_stream and moved into
+    // the pump task. Every early return below (timeout, connect error, non-2xx)
+    // drops it on the way out, which is exactly the accounting we want.
+    let inflight = ctx.state.inflight.enter(&cand.channel_id, &cand.upstream_model);
     let attempt_deadline = Instant::now() + budget.attempt_deadline;
     let url = format!("{}{}", build_upstream_url(cand), upstream_path_suffix(cand, &ctx.ir));
     let body = render_upstream_body(ctx, cand);
@@ -351,7 +363,7 @@ async fn attempt_once(
 
     match ctx.ir.stream {
         false => attempt_non_stream(cand, resp, attempt_deadline).await,
-        true  => attempt_stream(ctx, cand, resp, budget, client_gone, feed_tx).await,
+        true  => attempt_stream(ctx, cand, resp, budget, client_gone, feed_tx, inflight).await,
     }
 }
 
@@ -473,6 +485,11 @@ async fn attempt_stream(
     budget: &crate::router::Budget,
     client_gone: CancellationToken,
     feed_tx: mpsc::Sender<ClientFrame>,
+    // Occupancy for this attempt, owned here so it can be moved into the pump
+    // task that outlives this function. A PRE-COMMIT failure returns early and
+    // drops it with the attempt, which is what "stopped using the account"
+    // means.
+    inflight: crate::inflight::InflightGuard,
 ) -> Result<Outcome, (ProxyError, ir::Usage)> {
     use crate::protocol::openai::Classified as CO;
     use crate::protocol::anthropic::Classified as CA;
@@ -670,6 +687,10 @@ async fn attempt_stream(
     let proto = cand.protocol;
 
     tokio::spawn(async move {
+        // The account stays "in use" until the pump stops relaying, not until
+        // the response headers arrived: `inflight` is moved in here and only
+        // released when this task ends, on every exit path below.
+        let _inflight = inflight;
         let mut tx = Some(usage_tx);
         let mut final_usage = usage_acc;
         let feed = feed_tx.clone();

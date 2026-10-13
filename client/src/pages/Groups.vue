@@ -1,23 +1,20 @@
 <script setup lang="ts">
-// 分组路由：一级 → 二级 → 三级 的故障转移可视化与编辑。
-// 页面只改 state.cfg 并 markDirty()，保存由顶栏统一负责。
+// 分组路由：分组列表 + 每组的概览统计与实时并发。
+//
+// 编辑去哪了（2026-10-13 重构）：
+//  · 分组本身的设置（名称 / 暴露模型 / 重试与超时）→ 分组详情页里内联改，看板与设置同屏；
+//  · 路由层级 / 成员 / 权重（也就是「模型配置」）→ 分组详情的「模型配置」子页；
+//  · 本页只剩两件事：把分组列出来、把每组的统计与「使用中」实时并发显示出来。
+// 因此本页是只读的（除了删除分组），不再有编辑弹窗，也不再有 draft/校验/保存逻辑。
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import {
-  ArrowDown, ArrowUp, ChevronDown, GripVertical, LayoutDashboard, Pencil, Plus, RefreshCw, Trash2,
-  Waypoints,
-} from "@lucide/vue";
-import {
-  Alert, Badge, Btn, Card, Empty, Field, IconBtn, Modal,
-  TInput, TSelect, TTextarea,
-} from "../components/ui";
-import { openGroupDetail, openModelDetail } from "../nav";
-import {
-  apiKeys, bindingLabel, channelName, groups, groupsUsingModel, markDirty, models, state, uid,
-} from "../store";
+import { ChevronDown, LayoutDashboard, Plus, RefreshCw, Trash2, Waypoints } from "@lucide/vue";
+import { Badge, Btn, Card, Empty, IconBtn } from "../components/ui";
+import { openGroupDetail, openGroupModels, openModelDetail } from "../nav";
+import { apiKeys, bindingLabel, channelName, groups, groupsUsingModel, markDirty, models, state, uid } from "../store";
 import { toast } from "../toast";
 import {
   api, type Group, type GroupMember, type GroupMembersPayload, type GroupStatRow,
-  type StatsPayload, type Tier, type TierMember,
+  type InflightSnapshot, type StatsPayload, type Tier,
 } from "../api";
 
 /* ------------------------------- 展示辅助 ------------------------------- */
@@ -31,9 +28,12 @@ function tierTone(level: number): "brand" | "gray" {
   return level === 1 ? "brand" : "gray";
 }
 // 两种「在用」口径并存，别混：
-//  · 成员 chip 的背景色是**静态**口径 —— level===1 表示声明上优先级最高的一层（模板里内联成 t.level === 1）；
-//  · 「使用中」徽章是**真实**口径 —— 来自 /admin/api/group-members 的 member.active（该分组最近一次成功请求的落点），
-//    例如一级全在冷却、请求实际落在二级时，只高亮二级。两者不一致时以真实口径为准。
+//  · 成员 chip 的背景色是**静态**口径 —— level===1 表示声明上优先级最高的一层（模板里内联成 t.level === 1），
+//    与此刻有没有流量无关；
+//  · 「使用中」徽章是**实时**口径 —— 此刻真的在用（in-flight 并发 > 0），唯一数据来源是
+//    GET /admin/api/inflight（groups: group_id → 并发数；members: "<渠道>::<上游模型>" → 并发数；缺键即 0），
+//    本页每 5s 拉一次。旧口径 member.active / active_key 是「最近一次成功请求的落点」（last-success），
+//    与此刻是否在用无关，属于假状态，已不再用于徽章。
 function sortedTiers(g: Group): Tier[] {
   return [...(g.tiers ?? [])].sort((a, b) => a.level - b.level);
 }
@@ -44,7 +44,10 @@ function exposedOf(g: Group): string[] {
   return g.exposed_models ?? [];
 }
 
-/* --------------------------- 成员定位与真实在用口径 --------------------------- */
+/** 全局路由口径：false = 同级按声明顺序（默认）；true = 同级按权重降序。只影响文案，不影响本页只读展示。 */
+const autoWeight = computed(() => state.cfg?.auto_weight ?? false);
+
+/* --------------------------- 成员定位与实时并发口径 --------------------------- */
 // 同一 model_id 可以同时出现在多个层级里，所以成员一律用 (tier, model_id) 复合定位，
 // 不能只用 model_id（否则 chip 会取到别层的数字）。
 function memberOf(groupId: string, tierLevel: number, modelId: string): GroupMember | null {
@@ -52,14 +55,23 @@ function memberOf(groupId: string, tierLevel: number, modelId: string): GroupMem
   if (!p) return null;
   return p.members.find(m => m.model_id === modelId && m.tier === tierLevel) ?? null;
 }
-/** 真实在用：以服务端算好的 member.active 为准；缺失时退回 active_key 比对（双保险）。 */
-function isMemberActive(groupId: string, tierLevel: number, modelId: string): boolean {
-  const p = membersByGroup.value[groupId];
-  const m = memberOf(groupId, tierLevel, modelId);
-  if (!p || !m) return false;
-  return m.active || (!!p.active_key && p.active_key === m.key);
+/**
+ * 该成员在实时并发快照里的键："<渠道>::<上游模型>"（与 /admin/api/inflight 的 members 键一致）。
+ * 优先用服务端 group-members 给的 key；端点不可用时用本地绑定推一个等价 key（与 openMember 同款）。
+ */
+function memberKey(groupId: string, tierLevel: number, modelId: string): string {
+  const fromServer = memberOf(groupId, tierLevel, modelId)?.key;
+  if (fromServer) return fromServer;
+  const b = models.value.find(x => x.id === modelId);
+  return b ? `${b.channel_id}::${b.upstream}` : "";
 }
-/** 该成员在本分组内的成功请求数；成员数据不可用时是 0，配合 title 说明原因。 */
+/** 该成员此刻的并发数：优先成员级快照（服务端按 key 聚合），缺失时退回全组口径。 */
+function memberInflight(groupId: string, tierLevel: number, modelId: string): number {
+  const key = memberKey(groupId, tierLevel, modelId);
+  const fromKey = key ? inflight.value?.members?.[key] : undefined;
+  if (typeof fromKey === "number") return fromKey;
+  return memberOf(groupId, tierLevel, modelId)?.inflight ?? 0;
+}
 function memberRequests(groupId: string, tierLevel: number, modelId: string): number {
   return memberOf(groupId, tierLevel, modelId)?.requests ?? 0;
 }
@@ -70,67 +82,39 @@ function memberRequestsTitle(groupId: string, tierLevel: number, modelId: string
   const n = memberOf(groupId, tierLevel, modelId)?.requests ?? 0;
   return n > 0 ? `本分组内该成员成功请求 ${n} 次` : "本分组内该成员成功请求 0 次";
 }
-/** chip 点击进模型详情：优先用服务端 key；端点缺失时用本地绑定推一个等价 key。 */
-function openMember(groupId: string, tierLevel: number, modelId: string) {
-  const fromServer = memberOf(groupId, tierLevel, modelId)?.key;
-  const b = models.value.find(x => x.id === modelId);
-  const key = fromServer || (b ? `${b.channel_id}::${b.upstream}` : "");
+/** 该分组此刻正在处理中的请求数（/admin/api/inflight 的 groups 口径；缺键即 0）。 */
+function groupInflight(groupId: string): number {
+  return inflight.value?.groups?.[groupId] ?? 0;
+}
+/** 该层级此刻的并发数 = 该层各成员并发之和。 */
+function tierInflight(g: Group, t: Tier): number {
+  return (t.members ?? []).reduce((n, m) => n + memberInflight(g.id, t.level, m.model_id), 0);
+}
+/** 点成员 chip → 模型详情页（在「模型配置」子视图里打开，回来仍停在那一页）。 */
+function openMember(g: Group, tierLevel: number, modelId: string) {
+  const key = memberKey(g.id, tierLevel, modelId);
   if (!key) return;
-  openModelDetail({ groupId, key, modelId });
+  openModelDetail({ groupId: g.id, key, modelId });
+}
+/**
+ * 「最多 N 轮」里的 N：优先取该分组的**生效** max_cycles（group-members 响应里的 retry
+ * 已经是服务端算好的 group ?? global 生效值），端点不可用时退回全局值。
+ * 分组有自己 overrides.retry 时全局值不准，所以不能像旧版那样只读 state.cfg.retry。
+ */
+function maxCyclesOf(g: Group): number {
+  return membersByGroup.value[g.id]?.retry?.max_cycles ?? state.cfg?.retry.max_cycles ?? 2;
 }
 
-/**
- * 自动权重开关（AdminConfig.auto_weight，默认关）：
- * 关闭时同级成员按列表顺序依次尝试；开启时按权重降序（权重并列再退回列表顺序）。
- * 权重输入框在两种模式下都常驻可改 —— 关闭时改的值会照常存盘，等开关打开后立即生效，
- * 这样用户可以先填好权重再一次性开启，不必来回切页面。关闭模式额外显示顺序号，因为那时它才是真实次序。
- * 顺序即数组顺序，保存时直接按 draft 里 members 的数组序写入，不需要额外排序。
- * 改顺序有两条等价的路：拖住成员行首的抓手上下拖动（鼠标），或用上移 / 下移按钮（键盘 / 读屏）。
- */
-const autoWeight = computed(() => state.cfg?.auto_weight ?? false);
-
-// 「最多 N 轮」里的 N 是全局 retry 的值。分组有自己 overrides.retry 时（task-28）应以
-// groupMembers 响应里的 retry.max_cycles 为准 —— 等该端点带 retry 字段后再切换。
-const maxCycles = computed(() => state.cfg?.retry.max_cycles ?? 2);
-
 /* ------------------------------ 分组统计 ------------------------------ */
-// 数据来自 GET /admin/api/stats（不传 group_id = 全量：summary 是全局汇总，
-// by_group 恒为跨分组概览，字段见 server/src/store.rs:275）。
-// 刻意不轮询：进页面拉一次 + 手动刷新，避免在分组页上持续打管理面。
 const stats = ref<StatsPayload | null>(null);
 const statsErr = ref("");
 const statsLoading = ref(false);
 const statsAt = ref(0);
 
-/* --------------------------- 成员级数据（真实在用 / 请求数） --------------------------- */
-// 数据来自 GET /admin/api/group-members（每个分组一份，进页面并发拉一次）。
-// 服务端还没这个端点（老版本 / 404）或单个分组失败时整块静默降级：chip 显示「0 次」且不显示
-// 「使用中」徽章，不弹错、不写 statsErr，页面其余部分照常。
-const membersByGroup = ref<Record<string, GroupMembersPayload>>({});
-// 防重入 + 「跑完再补一次」：配置在页面停留期间被换掉（顶栏「重新加载配置」）时，
-// 键集合会变，必须在当前这轮结束后再拉一次，否则会漏掉一次刷新。
-let membersRun: Promise<void> | null = null;
-let membersAgain = false;
-async function loadGroupMembers() {
-  if (!groups.value.length) { membersByGroup.value = {}; return; }
-  if (membersRun) { membersAgain = true; return membersRun; }
-  membersRun = (async () => {
-    const pairs = await Promise.all(groups.value.map(async (g) => {
-      try { return [g.id, await api.groupMembers(g.id)] as const; }
-      catch { return null; } // 单组失败不拖累其它组，也不冒泡成未捕获异常
-    }));
-    const out: Record<string, GroupMembersPayload> = {};
-    for (const p of pairs) if (p) out[p[0]] = p[1];
-    membersByGroup.value = out;
-  })();
-  try { await membersRun; } finally {
-    membersRun = null;
-    if (membersAgain) { membersAgain = false; void loadGroupMembers(); }
-  }
-}
-// 分组集合变了（例如点过「重新加载配置」）就重新拉，避免旧 group_id 的陈旧数字。
-watch(() => groups.value.map(g => g.id).join(","), () => { void loadGroupMembers(); });
-
+// ★这一整段统计辅助（statNum/fmt*/statOf/stat*/sum*/STATS_UNAVAILABLE/loadStats）在 2026-10-13 的
+// 「编辑弹窗搬去详情页」重构里被切片脚本整段删掉过：vite build 与 tsc 都不校验 <script setup> 里
+// 模板引用的标识符是否存在，直到真机运行才以 `TypeError: statOf is not a function` 炸掉整个分组卡片列表。
+// 今后重写 SFC 必须逐个人工核对模板里出现的每个名字。
 function statNum(v: unknown): number | null {
   if (v === null || v === undefined || v === "") return null;
   const n = typeof v === "number" ? v : Number(v);
@@ -210,7 +194,7 @@ function statTokens(groupId: string): { short: string; full: string } {
 /** 接口失败时统计条统一显示这行灰字（不报错、不占位）。 */
 const STATS_UNAVAILABLE = "统计不可用";
 
-// summary 是服务端 json_object 拼的（server/src/store.rs:241）：requests / success /
+// summary 是服务端 json_object 拼的（server/src/store.rs）：requests / success /
 // cost_usd / input_tokens / output_tokens …；空库时 SUM 系列为 null，一律按 0 兜底。
 const sumRequests = computed(() => statNum(stats.value?.summary?.requests) ?? 0);
 const sumCost = computed(() => fmtCost(statNum(stats.value?.summary?.cost_usd) ?? 0));
@@ -234,352 +218,82 @@ async function loadStats() {
   }
 }
 
-// App.vue 切页是 <Transition> + <component :is>，没有 keep-alive，
-// 每次切回本页都会重新挂载，onMounted 拉一次就够（因此不额外监听路由）。
-// 成员数据（真实在用 / 请求数）与统计并列，各自独立降级。
-onMounted(() => { void loadStats(); void loadGroupMembers(); });
+/* --------------------------- 成员级数据（请求数 / 失败） --------------------------- */
+// 数据来自 GET /admin/api/group-members（每个分组一份，进页面并发拉一次）。
+// 服务端还没这个端点（老版本 / 404）或单个分组失败时整块静默降级：chip 显示「0 次」，不弹错、
+// 不写 statsErr，页面其余部分照常。★「使用中」徽章不依赖这份数据（它来自 /admin/api/inflight），
+// 端点缺失时仍由实时并发快照决定。
+const membersByGroup = ref<Record<string, GroupMembersPayload>>({});
+// 防重入 + 「跑完再补一次」：配置在页面停留期间被换掉（顶栏「重新加载配置」）时，
+// 键集合会变，必须在当前这轮结束后再拉一次，否则会漏掉一次刷新。
+let membersRun: Promise<void> | null = null;
+let membersAgain = false;
+async function loadGroupMembers() {
+  if (!groups.value.length) { membersByGroup.value = {}; return; }
+  if (membersRun) { membersAgain = true; return membersRun; }
+  membersRun = (async () => {
+    const pairs = await Promise.all(groups.value.map(async (g) => {
+      try { return [g.id, await api.groupMembers(g.id)] as const; }
+      catch { return null; } // 单组失败不拖累其它组，也不冒泡成未捕获异常
+    }));
+    const out: Record<string, GroupMembersPayload> = {};
+    for (const p of pairs) if (p) out[p[0]] = p[1];
+    membersByGroup.value = out;
+  })();
+  try { await membersRun; } finally {
+    membersRun = null;
+    if (membersAgain) { membersAgain = false; void loadGroupMembers(); }
+  }
+}
+// 分组集合变了（例如点过「重新加载配置」）就重新拉，避免旧 group_id 的陈旧数字。
+watch(() => groups.value.map(g => g.id).join(","), () => { void loadGroupMembers(); });
+
+/* ------------------------------ 实时并发（「使用中」的唯一依据） ------------------------------ */
+// GET /admin/api/inflight：groups = group_id → 该分组此刻正在处理中的请求数，
+// members = "<渠道>::<上游模型>" → 并发数。这是「使用中」的**唯一**数据来源（task-40）：
+// 只有并发 > 0 才算在用。统计与成员数据仍然刻意不轮询（进去一次 + 手动刷新），
+// 这里单独按 5s 轮询（与分组详情页同频），错了就静默保留上一帧，不要把徽章抖没、也不要弹错。
+const inflight = ref<InflightSnapshot | null>(null);
+async function refreshInflight() {
+  try {
+    inflight.value = await api.inflight();
+  } catch {
+    // 静默保留上一次快照：管理面瞬时抖动不该让「使用中」闪断。
+  }
+}
+let inflightTimer: ReturnType<typeof setInterval> | undefined;
+onMounted(() => {
+  void refreshInflight();
+  inflightTimer = setInterval(() => void refreshInflight(), 5000);
+});
+onBeforeUnmount(() => {
+  if (inflightTimer !== undefined) {
+    clearInterval(inflightTimer);
+    inflightTimer = undefined;
+  }
+});
 
 /** 工具条的刷新按钮：统计与成员数据一起重拉（两者都做了防重入）。 */
 function refreshAll() { void loadStats(); void loadGroupMembers(); }
 
-/* ------------------------------- 编辑草稿 ------------------------------- */
-
-const draft = ref<Group | null>(null);
-const isNew = ref(false);
-const exposedText = ref("");
-
-/* 选模型下拉：每一行都是「渠道-模型」（bindingLabel），
-   hint 放上游名 —— 两个渠道暴露同名模型时（例如都叫 gpt-4o），
-   行内仍然能看出渠道与真实上游，搜索框按 label/hint/group 过滤。 */
-const modelOptions = computed(() =>
-  models.value.map(m => ({
-    value: m.id,
-    label: bindingLabel(m.id),
-    hint: m.upstream,
-    group: channelName(m.channel_id),
-  })),
-);
-
-/** 下拉当前值对应的那一行（用来在触发器下方补一句上下文，例如重复提示）。 */
-function optionOf(modelId: string) {
-  return modelOptions.value.find(o => o.value === modelId);
-}
-
-function newMember(modelId: string, weight = 1): TierMember {
-  return { model_id: modelId, weight };
-}
-/** 优先挑该层还没用过的模型，避免一上来就撞重复。 */
-function firstFreeModelId(tier: Tier): string {
-  const used = new Set(tier.members.map(m => m.model_id));
-  return models.value.find(m => !used.has(m.id))?.id ?? models.value[0]?.id ?? "";
-}
-
-function openNew() {
-  const t: Tier = { level: 1, members: [] };
-  if (models.value.length) t.members.push(newMember(models.value[0].id));
-  draft.value = { id: uid("grp"), name: "", exposed_models: [], tiers: [t] };
-  exposedText.value = "";
-  isNew.value = true;
-}
-
-function openEdit(g: Group) {
-  draft.value = JSON.parse(JSON.stringify(g)) as Group;
-  if (!draft.value.tiers || !draft.value.tiers.length) {
-    draft.value.tiers = [{ level: 1, members: [] }];
-  }
-  exposedText.value = (g.exposed_models ?? []).join("\n");
-  isNew.value = false;
-}
-
-function closeModal() {
-  draft.value = null;
-}
-
-/* --------------------------- 层级编辑器交互 --------------------------- */
-
-function addMember(tier: Tier) {
-  tier.members.push(newMember(firstFreeModelId(tier)));
-}
-function addTier() {
-  const d = draft.value;
-  if (!d) return;
-  const t: Tier = { level: d.tiers.length + 1, members: [] };
-  if (models.value.length) t.members.push(newMember(firstFreeModelId(t)));
-  d.tiers.push(t);
-}
-function removeTier(index: number) {
-  const d = draft.value;
-  if (!d || d.tiers.length <= 1) return;
-  d.tiers.splice(index, 1);
-  d.tiers.forEach((t, i) => { t.level = i + 1; });
-}
-/** 同级内上移 / 下移一位：直接调换数组顺序，界面顺序即保存顺序。 */
-function moveMember(tier: Tier, index: number, delta: number) {
-  const to = index + delta;
-  if (to < 0 || to >= tier.members.length) return;
-  const [m] = tier.members.splice(index, 1);
-  if (!m) return;
-  tier.members.splice(to, 0, m);
-}
-
-/**
- * 拖动排序：用 Pointer Events 自己实现，不引第三方拖拽库（拖拽库动辄几十 KB，
- * 而这里只需要「同级内换顺序」「层级换顺序」两件事）。关键取舍：
- *   - setPointerCapture 之后 move / up 都会回到抓手元素上，鼠标划出弹窗也不会丢事件；
- *   - 拖动期间不改数组顺序（DOM 顺序冻结），开始时量一次行几何，之后只更新「落点槽位」
- *     和跟手位移 —— 被拖行的原始位置始终是量到的那份，不会因为自己挪动而抖动；
- *   - 松手才落位：槽位 0 = 插到第 1 行之前，N = 插到最后一行之后；
- *   - 不用 HTML5 draggable：它的拖影、dragend 时机各内核差异大，触控板 / 手指体验也差。
- * 按钮保留：拖拽是鼠标增强，键盘与读屏用户仍然靠上移 / 下移。
- */
-type DragKind = "member" | "tier";
-
-const dragKind = ref<DragKind | null>(null);
-/** 成员拖动：所属层；层级拖动：被拖的那一层。两种情况都用来高亮整块。 */
-const dragTier = ref<Tier | null>(null);
-/** 正在被拖动的成员对象本身（按身份跟踪，比 index 更稳）。 */
-const dragMember = ref<TierMember | null>(null);
-/** 层级拖动时被拖层的下标。 */
-const dragTierFrom = ref(-1);
-/** 落点槽位：0 = 插到第 1 行之前，长度 = 插到最后一行之后。 */
-const dropIndex = ref(-1);
-/** 按下时的鼠标 Y、被拖元素的跟手纵向位移。 */
-const dragStartY = ref(0);
-const dragDelta = ref(0);
-/** 拖动开始时量好的几何 —— 拖动期间不改数组，DOM 顺序不变，所以量一次就够。 */
-const dragRects = ref<{ top: number; height: number }[]>([]);
-/** 定位容器 padding box 的顶边（落点指示线用它换算相对坐标）。 */
-const dragPadTop = ref(0);
-const dragLineTop = ref(0);
-
-const dragging = computed(() => dragKind.value !== null);
-
-/** 拖动期间给 body 挂一个类：锁住文本选中与光标形状，松手就摘掉。 */
-watch(dragging, (on) => {
-  document.body.classList.toggle("gw-dragging", on);
-});
-
-/** 被拖元素跟着鼠标走：位移 = 鼠标纵向增量（布局冻结，所以不需要自我修正）。 */
-const dragStyle = computed(() => (
-  dragging.value ? { transform: `translateY(${dragDelta.value}px)` } : undefined
-));
-
-/** 鼠标纵向落在哪个槽位：比每一行的中垂线，越过中线就算落到下一格。 */
-function slotAt(clientY: number): number {
-  const rects = dragRects.value;
-  for (let i = 0; i < rects.length; i++) {
-    const r = rects[i]!;
-    if (clientY < r.top + r.height / 2) return i;
-  }
-  return rects.length;
-}
-
-/** 指示线位置：插在某行之前画在它上方，插到末尾画在最后一行下方。 */
-function lineTopFor(slot: number, rects: { top: number; height: number }[], padTop: number): number {
-  if (!rects.length) return 0;
-  if (slot >= rects.length) {
-    const last = rects[rects.length - 1]!;
-    return Math.max(0, last.top + last.height - padTop + 3);
-  }
-  return Math.max(0, rects[slot]!.top - padTop - 5);
-}
-
-function endDrag() {
-  dragKind.value = null;
-  dragTier.value = null;
-  dragMember.value = null;
-  dragTierFrom.value = -1;
-  dropIndex.value = -1;
-  dragDelta.value = 0;
-  dragRects.value = [];
-}
-
-/** 量一次几何并进入拖动状态（成员 / 层级两种模式共用）。 */
-function startDrag(kind: DragKind, box: HTMLElement, rowSel: string, clientY: number) {
-  const padTop = box.getBoundingClientRect().top + box.clientTop;
-  const rects = Array.from(box.querySelectorAll<HTMLElement>(rowSel))
-    .map((el) => { const r = el.getBoundingClientRect(); return { top: r.top, height: r.height }; });
-  dragKind.value = kind;
-  dragStartY.value = clientY;
-  dragDelta.value = 0;
-  dragRects.value = rects;
-  dragPadTop.value = padTop;
-  dropIndex.value = slotAt(clientY);
-  dragLineTop.value = lineTopFor(dropIndex.value, rects, padTop);
-}
-
-/** 松手落位：摘下来再插进落点槽位；越过原位置时槽位要左移一位（自己已被摘掉）。 */
-function commitDrag() {
-  const kind = dragKind.value;
-  const slot = dropIndex.value;
-  const d = draft.value;
-  if (kind === "member") {
-    const tier = dragTier.value;
-    const m = dragMember.value;
-    if (tier && m && slot >= 0) {
-      const from = tier.members.indexOf(m);
-      if (from >= 0) {
-        tier.members.splice(from, 1);
-        tier.members.splice(slot > from ? slot - 1 : slot, 0, m);
-      }
-    }
-  } else if (kind === "tier" && d && slot >= 0) {
-    const from = dragTierFrom.value;
-    if (from >= 0 && from < d.tiers.length) {
-      const [t] = d.tiers.splice(from, 1);
-      if (t) {
-        d.tiers.splice(slot > from ? slot - 1 : slot, 0, t);
-        // 层级号跟位置绑定：一级 → 二级 → … 永远等于从上到下的顺序
-        d.tiers.forEach((x, i) => { x.level = i + 1; });
-      }
-    }
-  }
-  endDrag();
-}
-
-function onDragMove(e: PointerEvent) {
-  if (!dragging.value) return;
-  dragDelta.value = e.clientY - dragStartY.value;
-  const slot = slotAt(e.clientY);
-  if (slot !== dropIndex.value) {
-    dropIndex.value = slot;
-    dragLineTop.value = lineTopFor(slot, dragRects.value, dragPadTop.value);
-  }
-}
-
-/** 拖动中给层容器补样式：成员拖动只要定位，层级拖动还要抬高、描边、压暗。 */
-function tierDragClass(t: Tier): string {
-  if (dragKind.value === "tier") {
-    return dragTier.value === t ? "relative z-20 opacity-70 ring-2 ring-brand-500" : "relative";
-  }
-  return dragKind.value === "member" && dragTier.value === t ? "relative" : "";
-}
-
-/** 抓手：成员行内拖动（同级内换顺序）。 */
-function onMemberDragStart(e: PointerEvent, tier: Tier, index: number) {
-  if (e.button !== 0 || tier.members.length < 2) return; // 只接左键；只有一个成员时没什么可排的
-  e.preventDefault();
-  const m = tier.members[index];
-  const handle = e.currentTarget as HTMLElement | null;
-  const box = handle?.closest("[data-test=member-tier]") as HTMLElement | null;
-  if (!m || !box) return;
-  dragTier.value = tier;
-  dragMember.value = m;
-  startDrag("member", box, "[data-test=member-row]", e.clientY);
-  // 捕获后 move / up 都会回到抓手，鼠标划出窗口也不丢事件；失败也不影响 window 上的监听
-  try { handle?.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
-}
-
-/** 抓手：层头拖动（层级先后，也就是 一级 → 二级 的尝试顺序）。 */
-function onTierDragStart(e: PointerEvent, ti: number) {
-  const d = draft.value;
-  if (e.button !== 0 || !d || d.tiers.length < 2) return;
-  e.preventDefault();
-  const t = d.tiers[ti];
-  const handle = e.currentTarget as HTMLElement | null;
-  const box = handle?.closest("[data-test=tier-list]") as HTMLElement | null;
-  if (!t || !box) return;
-  dragTier.value = t;
-  dragTierFrom.value = ti;
-  startDrag("tier", box, "[data-test=member-tier]", e.clientY);
-  try { handle?.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
-}
-
-/** Esc 放弃本次拖动（不改顺序）。 */
-function onDragKey(e: KeyboardEvent) {
-  if (e.key === "Escape" && dragging.value) endDrag();
-}
-
-onMounted(() => {
-  // 挂在 window 上：鼠标划出弹窗、甚至划出窗口，move / up 一样能收到
-  window.addEventListener("pointermove", onDragMove);
-  window.addEventListener("pointerup", commitDrag);
-  window.addEventListener("pointercancel", endDrag);
-  window.addEventListener("keydown", onDragKey);
-});
-onBeforeUnmount(() => {
-  // 拖动途中切页 / 关弹窗时清干净，避免残留 transform 与光标锁定
-  document.body.classList.remove("gw-dragging");
-  window.removeEventListener("pointermove", onDragMove);
-  window.removeEventListener("pointerup", commitDrag);
-  window.removeEventListener("pointercancel", endDrag);
-  window.removeEventListener("keydown", onDragKey);
-});
-
-/* -------------------------------- 校验 -------------------------------- */
-
-const exposedList = computed(() =>
-  exposedText.value
-    .split(/[\s,，;；、]+/)
-    .map(s => s.trim())
-    .filter(Boolean),
-);
-
-const nameError = computed(() =>
-  draft.value && !draft.value.name.trim() ? "请填写分组名。" : "",
-);
-const exposedError = computed(() =>
-  draft.value && exposedList.value.length === 0
-    ? "至少填写一个暴露模型名，客户端用这些名字发起请求。"
-    : "",
-);
-const emptyTierError = computed(() => {
-  const d = draft.value;
-  if (!d) return "";
-  const i = d.tiers.findIndex(t => t.members.length === 0);
-  return i >= 0 ? `${tierName(i + 1)}还没有成员，每一级至少需要一个模型。` : "";
-});
-const dupErrors = computed<string[]>(() => {
-  const d = draft.value;
-  if (!d) return [];
-  const out: string[] = [];
-  d.tiers.forEach((t, i) => {
-    const seen = new Set<string>();
-    for (const m of t.members) {
-      if (!m.model_id) {
-        out.push(`${tierName(i + 1)}有成员还没有选择模型。`);
-        break;
-      }
-      if (seen.has(m.model_id)) {
-        out.push(`${tierName(i + 1)}内重复选择了「${bindingLabel(m.model_id)}」。`);
-        break;
-      }
-      seen.add(m.model_id);
-    }
-  });
-  return out;
-});
-const valid = computed(() =>
-  !nameError.value && !exposedError.value && !emptyTierError.value && dupErrors.value.length === 0,
-);
-const totalMembers = computed(() =>
-  draft.value ? draft.value.tiers.reduce((n, t) => n + t.members.length, 0) : 0,
-);
-
-/* -------------------------------- 写回 -------------------------------- */
-
-function save() {
-  const d = draft.value;
+/* ------------------------------- 新建分组 ------------------------------- */
+// 新增分组不再开弹窗：直接建一个空壳塞进配置、进详情页填内容。
+// 只进内存（markDirty），要落库仍然得点顶栏「保存」—— 与其它页面同一套语义。
+// 起手给一个一级空层，用户到了「模型配置」子页就能直接加成员，不用先点「添加一级」。
+function createGroup() {
   const cfg = state.cfg;
-  if (!d || !cfg || !valid.value) return;
-  const clean: Group = {
-    id: d.id.trim() || uid("grp"),
-    name: d.name.trim(),
-    exposed_models: exposedList.value,
-    tiers: d.tiers.map((t, i) => ({
-      level: i + 1,
-      members: t.members.map(m => ({
-        model_id: m.model_id,
-        weight: Number(m.weight) || 0,
-      })),
-    })),
+  if (!cfg) return;
+  const g: Group = {
+    id: uid("grp"),
+    name: "新分组",
+    exposed_models: [],
+    tiers: [{ level: 1, members: [] }],
+    overrides: { retry: null },
   };
-  const index = cfg.groups.findIndex(g => g.id === clean.id);
-  if (index >= 0) cfg.groups.splice(index, 1, clean);
-  else cfg.groups.push(clean);
+  cfg.groups.push(g);
   markDirty();
-  toast.ok(isNew.value ? `已添加分组「${clean.name}」` : `已更新分组「${clean.name}」`);
-  closeModal();
+  toast.ok("已添加分组，接着填名称、暴露模型与模型配置");
+  openGroupDetail(g.id);
 }
 
 /* ------------------------------- 删除影响面 ------------------------------- */
@@ -638,63 +352,10 @@ function confirmRemoveGroup() {
   ].filter(Boolean).join("，");
   toast.ok(tail ? `已删除分组「${g.name}」，${tail}` : `已删除分组「${g.name}」`);
 }
-
-/* ------------------------------ 成员删除影响面 ------------------------------ */
-
-// 删除成员本身只影响当前草稿，但被删掉的模型可能正在被这个分组的其它层使用，
-// 删之前把「还有哪些层也在用它」「它挂在哪个渠道」讲清楚，避免误删。
-const pendingMember = ref<{ tier: Tier; index: number; modelId: string } | null>(null);
-const memberConfirming = ref(false);
-
-function removeMemberAt(tier: Tier, index: number) {
-  const m = tier.members[index];
-  if (!m) return;
-  pendingMember.value = { tier, index, modelId: m.model_id };
-  memberConfirming.value = true;
-}
-
-/** 同一分组内其它层是否也引用了这个模型（含未保存的改动）。 */
-const pendingMemberOtherTiers = computed(() => {
-  const pm = pendingMember.value;
-  const d = draft.value;
-  if (!pm || !d) return 0;
-  return d.tiers.filter(t => t !== pm.tier).filter(t => t.members.some(m => m.model_id === pm.modelId)).length;
-});
-
-/** 该模型还被哪些已保存的分组引用（用 groupsUsingModel，删完还剩几处）。 */
-const pendingMemberGroups = computed(() => {
-  const pm = pendingMember.value;
-  return pm ? groupsUsingModel(pm.modelId).length : 0;
-});
-
-/** 该绑定所属渠道（渠道名-模型名里的前半截，缺绑定/缺渠道时退化）。 */
-const pendingMemberChannel = computed(() => {
-  const pm = pendingMember.value;
-  if (!pm) return "—";
-  const m = models.value.find(x => x.id === pm.modelId);
-  return m ? channelName(m.channel_id) : "（绑定已删除）";
-});
-
-/** 确认删除成员：同样是页面内 Modal，不用 window.confirm。 */
-function confirmRemoveMember() {
-  const pm = pendingMember.value;
-  const d = draft.value;
-  if (!pm || !d) return;
-  // 位置可能已经变了（比如期间删过别的层），按对象重新定位一次再删。
-  const ti = d.tiers.indexOf(pm.tier);
-  const tier = ti >= 0 ? d.tiers[ti] : null;
-  if (tier) {
-    const mi = tier.members.findIndex(m => m.model_id === pm.modelId);
-    tier.members.splice(mi >= 0 ? mi : pm.index, 1);
-  }
-  memberConfirming.value = false;
-  pendingMember.value = null;
-  toast.ok(`已从${tierName(ti + 1)}移除「${bindingLabel(pm.modelId)}」`);
-}
 </script>
 
 <!--
-  拖动排序的全局兜底：抓手在弹窗里，但指针会跑到 window 上。
+  拖动排序的全局兜底：抓手在「模型配置」子页里，但指针会跑到 window 上。
   拖住时锁住整页文本选区与光标（否则划过文字会选中一片、光标变成 I 形），
   user-select:none 对 WebView2 里的子元素同样生效，松手立刻恢复。
 -->
@@ -733,7 +394,7 @@ function confirmRemoveMember() {
         >
           <RefreshCw :size="13" :class="statsLoading ? 'animate-spin' : ''" />刷新数据
         </Btn>
-        <Btn variant="primary" size="sm" @click="openNew">
+        <Btn variant="primary" size="sm" data-test="group-add-btn" @click="createGroup">
           <Plus :size="13" />添加分组
         </Btn>
       </div>
@@ -746,7 +407,7 @@ function confirmRemoveMember() {
       hint="分组决定请求在哪些渠道/模型之间按 一级→二级→三级 故障转移"
     >
       <template #icon><Waypoints :size="28" /></template>
-      <Btn variant="primary" size="sm" @click="openNew">
+      <Btn variant="primary" size="sm" data-test="group-add-empty-btn" @click="createGroup">
         <Plus :size="13" />添加分组
       </Btn>
     </Empty>
@@ -761,6 +422,14 @@ function confirmRemoveMember() {
               <span class="truncate text-[14px] font-semibold text-ink">{{ g.name }}</span>
               <Badge tone="brand">密钥 {{ keysOf(g.id).length }} 个</Badge>
               <Badge tone="gray">暴露模型 {{ exposedOf(g).length }} 个</Badge>
+              <span
+                v-if="groupInflight(g.id) > 0"
+                data-test="group-active"
+                class="inline-flex items-center gap-1 rounded-md bg-teal-100 px-1.5 py-0.5 text-[11.5px] font-medium text-teal-700"
+                title="此刻正在使用本分组的并发请求数"
+              >
+                <span class="h-1.5 w-1.5 rounded-full bg-teal-500"></span>使用中 ×{{ groupInflight(g.id) }}
+              </span>
             </div>
             <div class="mt-0.5 truncate font-mono text-[11.5px] text-ink-3">{{ g.id }}</div>
           </div>
@@ -768,7 +437,9 @@ function confirmRemoveMember() {
             <IconBtn title="分组详情" data-test="group-detail-btn" @click="openGroupDetail(g.id)">
               <LayoutDashboard :size="15" />
             </IconBtn>
-            <IconBtn title="编辑分组" @click="openEdit(g)"><Pencil :size="15" /></IconBtn>
+            <IconBtn title="模型配置" data-test="group-models-btn" @click="openGroupModels(g.id)">
+              <Waypoints :size="15" />
+            </IconBtn>
             <IconBtn title="删除分组" danger @click="removeGroup(g)"><Trash2 :size="15" /></IconBtn>
           </div>
         </div>
@@ -837,8 +508,8 @@ function confirmRemoveMember() {
         <div class="mt-3.5 border-t border-line-soft pt-3.5">
           <div class="mb-2.5 flex items-center justify-between gap-2">
             <div class="text-[11.5px] font-medium uppercase tracking-wide text-ink-3">故障转移层级</div>
-            <Btn size="sm" variant="ghost" @click="openEdit(g)">
-              <Pencil :size="12" />编辑路由
+            <Btn size="sm" variant="ghost" data-test="group-models-inline-btn" @click="openGroupModels(g.id)">
+              <Waypoints :size="12" />模型配置
             </Btn>
           </div>
 
@@ -879,248 +550,24 @@ function confirmRemoveMember() {
                   </template>
                   <span v-else class="py-1 text-[12px] text-ink-3">该级无成员</span>
                   <span
-                    v-if="t.members.some(m => isMemberActive(g.id, t.level, m.model_id))"
+                    v-if="tierInflight(g, t) > 0"
                     data-test="member-active"
-                    class="ml-1 inline-flex shrink-0 items-center gap-1 text-[11.5px] font-medium text-teal-700"
-                    title="最近一次成功的请求落在本层"
+                    class="ml-1 inline-flex shrink-0 items-center gap-1 rounded-md bg-teal-100 px-1.5 py-0.5 text-[11.5px] font-medium text-teal-700"
+                    title="此刻正在使用本层的并发请求数"
                   >
-                    <span class="h-1.5 w-1.5 rounded-full bg-teal-500"></span>使用中
+                    <span class="h-1.5 w-1.5 rounded-full bg-teal-500"></span>使用中 ×{{ tierInflight(g, t) }}
                   </span>
                 </div>
               </div>
             </template>
             <div class="mt-2.5 pl-[60px] text-[11.5px] text-ink-3">
-              ↑ 全部失败 → 回到一级（最多 {{ maxCycles }} 轮）
+              ↑ 全部失败 → 回到一级（最多 {{ maxCyclesOf(g) }} 轮）
             </div>
           </div>
-          <p v-else class="text-[12px] text-ink-3">未配置层级，点击「编辑路由」添加一级。</p>
+          <p v-else class="text-[12px] text-ink-3">未配置层级，去「模型配置」加一层。</p>
         </div>
       </Card>
     </div>
-
-    <!-- ------------------------------ 编辑弹窗 ------------------------------ -->
-    <Modal
-      :open="!!draft"
-      :title="isNew ? '添加分组' : '编辑分组'"
-      width="720px"
-      @close="closeModal"
-    >
-      <div v-if="draft" class="space-y-4">
-        <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
-          <Field label="分组 ID" hint="新增时可修改；已保存的分组不建议再改 ID">
-            <TInput v-model="draft.id" mono :disabled="!isNew" />
-          </Field>
-          <Field label="分组名" required hint="例如：主力池 / 备用池">
-            <TInput v-model="draft.name" placeholder="主力池" :invalid="!!nameError" />
-          </Field>
-        </div>
-
-        <Field
-          label="暴露模型"
-          required
-          hint="客户端用这些模型名请求，会按本分组的路由表转发；逗号或换行分隔"
-        >
-          <TTextarea v-model="exposedText" :rows="2" placeholder="gpt-4o, claude-3-5-sonnet" />
-        </Field>
-
-        <!-- 路由层级编辑器 -->
-        <div>
-          <div class="mb-2.5 flex items-end justify-between gap-2">
-            <span class="text-[12.5px] font-medium text-ink-2">路由层级</span>
-            <span class="flex flex-col items-end gap-0.5 text-[11.5px] text-ink-3">
-              <span data-test="tier-hint">
-                <template v-if="autoWeight">按 一级 → 二级 → 三级 顺序尝试，同级内按权重降序分配</template>
-                <template v-else>按 一级 → 二级 → 三级 顺序尝试，同级内按列表顺序依次尝试（自动权重已关闭）</template>
-              </span>
-              <span data-test="weight-hint">
-                <template v-if="autoWeight">权重可直接改；并列时按列表顺序</template>
-                <template v-else>权重可先填好，开启「自动权重」后生效</template>
-              </span>
-              <span data-test="drag-hint">按住行首或层头的抓手可拖动排序</span>
-            </span>
-          </div>
-
-          <Alert v-if="!models.length" tone="warn" class="mb-2.5">
-            还没有模型绑定，请先到「渠道与模型」页在某个渠道下添加 exposed → upstream 映射，再回来配置层级。
-          </Alert>
-
-          <div class="relative space-y-2.5" data-test="tier-list">
-            <!-- 层级拖动的落点指示线：画在层与层之间 -->
-            <div
-              v-if="dragKind === 'tier' && dropIndex >= 0"
-              class="pointer-events-none absolute inset-x-0 z-30 h-[3px] rounded-full bg-brand-500"
-              :style="{ top: dragLineTop + 'px' }"
-              data-test="drop-line"
-            />
-            <div
-              v-for="(t, ti) in draft.tiers"
-              :key="ti"
-              class="rounded-[10px] border border-line bg-app/60 p-3"
-              :class="tierDragClass(t)"
-              :style="dragKind === 'tier' && dragTier === t ? dragStyle : undefined"
-              data-test="member-tier"
-            >
-              <!-- 成员拖动的落点指示线：画在行与行之间 -->
-              <div
-                v-if="dragKind === 'member' && dragTier === t && dropIndex >= 0"
-                class="pointer-events-none absolute inset-x-0 z-30 h-[3px] rounded-full bg-brand-500"
-                :style="{ top: dragLineTop + 'px' }"
-                data-test="drop-line"
-              />
-              <div class="mb-2.5 flex items-center justify-between gap-2">
-                <div class="flex items-center gap-2">
-                  <button
-                    type="button"
-                    class="flex h-7 w-4 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-ink-3 transition-colors hover:bg-app hover:text-ink active:cursor-grabbing disabled:pointer-events-none disabled:opacity-40"
-                    :disabled="draft.tiers.length < 2"
-                    data-test="tier-drag"
-                    :title="draft.tiers.length < 2
-                      ? '只有一个层级，无需排序'
-                      : '按住拖动可调整层级先后（也就是 一级 → 二级 的尝试顺序）'"
-                    @pointerdown="onTierDragStart($event, ti)"
-                  >
-                    <GripVertical :size="14" />
-                  </button>
-                  <Badge :tone="tierTone(ti + 1)">{{ tierName(ti + 1) }}</Badge>
-                  <span class="text-[11.5px] text-ink-3">{{ t.members.length }} 个成员</span>
-                </div>
-                <div class="flex shrink-0 items-center gap-0.5">
-                  <Btn size="sm" variant="ghost" :disabled="!models.length" @click="addMember(t)">
-                    <Plus :size="12" />添加成员
-                  </Btn>
-                  <IconBtn
-                    title="删除该级"
-                    danger
-                    :disabled="draft.tiers.length <= 1"
-                    @click="removeTier(ti)"
-                  >
-                    <Trash2 :size="15" />
-                  </IconBtn>
-                </div>
-              </div>
-
-              <div v-if="t.members.length" class="space-y-2">
-                <div
-                  v-for="(m, mi) in t.members"
-                  :key="mi"
-                  class="flex items-center gap-2 rounded-[10px] border border-line bg-surface px-2.5 py-1.5"
-                  :class="dragMember === m
-                    ? 'relative z-20 border-brand-200 bg-brand-50 shadow-lg'
-                    : 'relative'"
-                  :style="dragMember === m ? dragStyle : undefined"
-                  data-test="member-row"
-                  :data-model="m.model_id"
-                >
-                  <button
-                    type="button"
-                    class="flex h-7 w-4 shrink-0 cursor-grab touch-none items-center justify-center rounded-md text-ink-3 transition-colors hover:bg-app hover:text-ink active:cursor-grabbing disabled:pointer-events-none disabled:opacity-40"
-                    :disabled="t.members.length < 2"
-                    data-test="member-drag"
-                    :title="t.members.length < 2
-                      ? '同级只有一个成员，无需排序'
-                      : '按住拖动可调整同级顺序'"
-                    @pointerdown="onMemberDragStart($event, t, mi)"
-                  >
-                    <GripVertical :size="14" />
-                  </button>
-                  <div class="min-w-0 flex-1" data-test="member-row-select">
-                    <TSelect
-                      v-model="m.model_id"
-                      size="sm"
-                      searchable
-                      :options="modelOptions"
-                      :placeholder="models.length ? '搜索并选择渠道-模型' : '请先到「渠道与模型」页添加绑定'"
-                    />
-                    <!-- 同名模型跨渠道时最容易被误选，这里就地提示 -->
-                    <p
-                      v-if="m.model_id && t.members.filter(x => x.model_id === m.model_id).length > 1"
-                      class="mt-1 text-[11px] leading-4 text-warn-700"
-                    >
-                      该模型在本层被选了多次，请换一个。
-                    </p>
-                  </div>
-                  <!-- 顺序号：自动权重关闭时它就是真实尝试次序；开启时仅作权重并列的兜底次序 -->
-                  <span
-                    v-if="!autoWeight"
-                    class="shrink-0 rounded-md border border-line bg-app px-1.5 py-0.5 font-mono text-[11.5px] text-ink-2"
-                    data-test="member-order"
-                    :title="`同级第 ${mi + 1} 个尝试`"
-                  >{{ mi + 1 }}</span>
-                  <!-- 权重：两种模式都可手动改；关闭时该值不参与调度，开启后立即按它降序 -->
-                  <span class="shrink-0 text-[11.5px] text-ink-3">权重</span>
-                  <div class="w-20 shrink-0" data-test="member-weight">
-                    <TInput
-                      v-model.number="m.weight"
-                      type="number"
-                      min="0"
-                      step="1"
-                      size="sm"
-                      :title="autoWeight
-                        ? `同级内按权重降序尝试，权重相同按列表顺序（当前第 ${mi + 1} 位）`
-                        : `自动权重已关闭：权重暂不参与调度，开启后立即按它降序；现在的次序由拖动（或上移 / 下移）决定，当前第 ${mi + 1} 位`"
-                    />
-                  </div>
-                  <div class="flex shrink-0 items-center gap-0.5">
-                    <IconBtn
-                      title="上移（也可以直接拖动左侧抓手）"
-                      data-test="member-up"
-                      :disabled="mi === 0"
-                      @click="moveMember(t, mi, -1)"
-                    >
-                      <ArrowUp :size="14" />
-                    </IconBtn>
-                    <IconBtn
-                      title="下移（也可以直接拖动左侧抓手）"
-                      data-test="member-down"
-                      :disabled="mi === t.members.length - 1"
-                      @click="moveMember(t, mi, 1)"
-                    >
-                      <ArrowDown :size="14" />
-                    </IconBtn>
-                  </div>
-                  <IconBtn title="删除成员" danger @click="removeMemberAt(t, mi)">
-                    <Trash2 :size="15" />
-                  </IconBtn>
-                </div>
-              </div>
-
-              <p v-else class="py-1 text-[12px] text-ink-3">
-                该级还没有成员，点右上「添加成员」。
-              </p>
-            </div>
-          </div>
-
-          <div class="mt-2.5">
-            <Btn size="sm" variant="ghost" :disabled="!models.length" @click="addTier">
-              <Plus :size="12" />添加{{ tierName(draft.tiers.length + 1) }}
-            </Btn>
-          </div>
-        </div>
-
-        <!-- 校验结果 -->
-        <Alert v-if="nameError" tone="err">{{ nameError }}</Alert>
-        <Alert v-else-if="exposedError" tone="err">{{ exposedError }}</Alert>
-        <Alert v-else-if="emptyTierError" tone="err">{{ emptyTierError }}</Alert>
-        <Alert v-else-if="dupErrors.length" tone="err">
-          <div>
-            <p>同一层级内不允许重复选择同一个模型：</p>
-            <ul class="mt-0.5 list-disc pl-4">
-              <li v-for="(e, i) in dupErrors" :key="i">{{ e }}</li>
-            </ul>
-          </div>
-        </Alert>
-        <Alert v-else tone="ok">
-          校验通过：{{ draft.tiers.length }} 个层级 / 共 {{ totalMembers }} 个成员。
-        </Alert>
-      </div>
-
-      <template #footer>
-        <Btn variant="ghost" @click="closeModal">取消</Btn>
-        <Btn variant="primary" :disabled="!valid" @click="save">
-          {{ isNew ? "添加分组" : "保存修改" }}
-        </Btn>
-      </template>
-    </Modal>
 
     <!-- 删除确认：WebView2 里 window.confirm 不可用，改用页面内 Modal -->
     <Modal
@@ -1149,44 +596,6 @@ function confirmRemoveMember() {
       <template #footer>
         <Btn data-test="cancel" @click="confirming = false">取消</Btn>
         <Btn data-test="confirm" variant="danger" @click="confirmRemoveGroup"><Trash2 :size="13" /> 删除</Btn>
-      </template>
-    </Modal>
-
-    <!-- 删除层级成员确认：同样用页面内 Modal（window.confirm 在打包版会冻结） -->
-    <Modal
-      :open="memberConfirming"
-      title="移除层级成员"
-      width="460px"
-      @close="memberConfirming = false"
-    >
-      <p class="text-[12.5px] leading-5 text-ink-2">
-        确定把
-        <span class="font-mono font-medium text-ink">{{ pendingMember ? bindingLabel(pendingMember.modelId) : "" }}</span>
-        从当前层级移除？
-      </p>
-      <dl class="mt-2.5 space-y-1 text-[11.5px] leading-4 text-ink-3">
-        <div class="flex gap-1.5">
-          <dt class="shrink-0">所属渠道</dt>
-          <dd class="text-ink-2">{{ pendingMemberChannel }}</dd>
-        </div>
-        <div class="flex gap-1.5">
-          <dt class="shrink-0">同分组其它层</dt>
-          <dd class="text-ink-2">{{ pendingMemberOtherTiers ? `还有 ${pendingMemberOtherTiers} 层也在用它` : "没有其它层使用" }}</dd>
-        </div>
-        <div class="flex gap-1.5">
-          <dt class="shrink-0">其它分组引用</dt>
-          <dd class="text-ink-2">{{ pendingMemberGroups ? `${pendingMemberGroups} 个分组引用了这个绑定` : "没有其它分组引用" }}</dd>
-        </div>
-      </dl>
-      <p class="mt-2.5 rounded-lg border border-line bg-app/60 px-2.5 py-2 text-[11.5px] leading-4 text-ink-3">
-        只是把这个模型从这个层级的候选里拿掉；模型绑定本身、以及其它分组的使用都不受影响。改动要等顶栏「保存」后才生效。
-      </p>
-
-      <template #footer>
-        <Btn data-test="member-cancel" @click="memberConfirming = false">取消</Btn>
-        <Btn data-test="member-confirm" variant="danger" @click="confirmRemoveMember">
-          <Trash2 :size="13" /> 移除
-        </Btn>
       </template>
     </Modal>
 

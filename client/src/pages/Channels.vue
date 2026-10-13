@@ -2,14 +2,14 @@
 // 渠道 + 模型合并页：每个渠道一张卡片，展开后是该渠道下挂的可用模型。
 // 模型绑定（暴露名 / 上游名 / 4 档价格 / 启用）的增删改都在本页完成，
 // 原「模型」独立页的能力已并入这里。
-import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import { Check, CircleAlert, Download, Eye, EyeOff, Layers, ListChecks, LoaderCircle, Plug, Plus, Square, Trash2 } from "@lucide/vue";
 import {
   Alert, Btn, Card, Empty, Field, IconBtn, Modal,
   TInput, TSelect, TTextarea, TToggle,
 } from "../components/ui";
 import ChannelCard from "../components/channels/ChannelCard.vue";
-import { api, type Channel, type ModelBinding } from "../api";
+import { api, type Channel, type InflightSnapshot, type ModelBinding } from "../api";
 import { channels, groupsUsingModel, markDirty, models, modelsOfChannel, state, uid } from "../store";
 import { toast } from "../toast";
 
@@ -24,14 +24,42 @@ const protocolOptions = [
 ];
 
 /**
- * 「使用中」标注口径：列表里第一个 enabled === true 的渠道。
- * 渠道的 weight 在服务端不参与路由（同级候选由分组层级里的顺序/权重决定），
- * 所以这里用「按顺序的第一个可用渠道」来标注，避免权重造成误导。仅用于高亮，不参与调度决策。
+ * 「使用中」标注口径（2026-10-13 改）：**真实 in-flight 并发**，唯一数据来源是
+ * GET /admin/api/inflight。只有此刻真的在用这个账号（并发数 > 0）才算「使用中」——
+ * 旧的「列表里第一个 enabled 渠道 / 被一级层级引用」与真实流量无关，是假状态，已废弃。
+ * 该接口同时给出 channels（渠道并发之和）与 members（"<渠道>::<上游模型>" → 并发数）。
  */
-const activeId = computed(() => channels.value.find(c => c.enabled)?.id ?? "");
+const inflight = ref<InflightSnapshot | null>(null);
+/** 空映射常量：引用稳定，避免轮询时给子组件塞新对象。 */
+const EMPTY_MEMBERS: Record<string, number> = {};
+
+async function refreshInflight() {
+  try {
+    inflight.value = await api.inflight();
+  } catch {
+    // 静默保留上一次快照：服务端重启 / 瞬时抖动不该把徽章抖没，也不该弹错。
+  }
+}
+let inflightTimer: ReturnType<typeof setInterval> | undefined;
+onMounted(() => {
+  void refreshInflight();
+  inflightTimer = setInterval(() => void refreshInflight(), 5000);
+});
+onBeforeUnmount(() => {
+  if (inflightTimer !== undefined) clearInterval(inflightTimer);
+});
+
+/** 该渠道此刻的并发请求数；缺键即 0。 */
+function inflightOfChannel(id: string): number {
+  return inflight.value?.channels?.[id] ?? 0;
+}
+/** 全站此刻处理中的请求数，仅用于页头提示。 */
+const inflightTotal = computed(() => inflight.value?.total ?? 0);
+/** 传给卡片/模型行的并发映射（"<渠道>::<上游模型>" → N）。 */
+const inflightMembers = computed<Record<string, number>>(() => inflight.value?.members ?? EMPTY_MEMBERS);
 
 /**
- * 「使用中」标注口径（模型）：被任意分组一级（level === 1）引用；
+ * 「一级引用」标注口径（静态声明，**不再是「使用中」**）：被任意分组一级（level === 1）引用；
  * 若没有任何分组定义，则退化为「enabled 的绑定」。仅用于高亮，不参与调度决策。
  */
 const activeIds = computed<Set<string>>(() => {
@@ -498,6 +526,7 @@ function confirmRemoveModel() {
     <div class="mb-3 flex flex-wrap items-center gap-2">
       <div v-if="channels.length" class="text-[12px] text-ink-3">
         共 {{ channels.length }} 个渠道 · 已启用 {{ enabledCount }} 个 · 模型绑定 {{ models.length }} 个
+        <span v-if="inflightTotal" class="ml-1 font-medium text-teal-700" title="此刻网关正在处理中的请求总数">· 处理中 {{ inflightTotal }}</span>
       </div>
       <div class="ml-auto flex items-center gap-2">
         <Btn v-if="channels.length" variant="subtle" size="sm" data-test="toggle-all" @click="toggleAll">
@@ -522,7 +551,8 @@ function confirmRemoveModel() {
         :channel="ch"
         :models="modelsOfChannel(ch.id)"
         :active-ids="activeIds"
-        :active="ch.id === activeId"
+        :inflight="inflightOfChannel(ch.id)"
+        :inflight-members="inflightMembers"
         :testing="testingId === ch.id"
         :expanded="!!expanded[ch.id]"
         :epoch="epoch"
