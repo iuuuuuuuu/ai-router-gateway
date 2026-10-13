@@ -6,7 +6,7 @@
 
 - `server/` — Rust 网关（axum + reqwest + rusqlite），产出单文件 `gw-server.exe`（约 5MB）
 - `client/` — Tauri 2 + Vue 3 桌面控制台，托管网关进程（sidecar）、开机自启（默认关）
-- `方案.md` — 架构设计与实施进度
+- `docs/` — 设计与审查文档：[`方案.md`](docs/方案.md)（架构设计与实施进度）· [`loopguard-spec.md`](docs/loopguard-spec.md)（死循环拦截规格）· [`review/`](docs/review/)（技术选型 / 工程落地 / 事故复盘 三篇审查）
 
 ## 分组名即模型名
 
@@ -97,6 +97,7 @@ pnpm tauri build  # NSIS 安装包 + sidecar 打包
 - 上游返回的模型列表带 `latency_ms`；清单过长会截断（响应里有 `truncated`）
 - 失败一律可见地报在弹窗状态区（例如密钥错就是 `HTTP 401`），**不会**假装成功返回空列表
 - 整段请求（连响应体）共用一个 20 秒超时，上游先回响应头再挂住 body 也不会让弹窗一直转圈
+
 ## 下载与安装
 
 最新版本见 [Releases](https://github.com/iuuuuuuuu/ai-router-gateway/releases)。
