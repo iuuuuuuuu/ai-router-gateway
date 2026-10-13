@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { Eraser, Layers, RefreshCw, ScrollText, ShieldAlert } from "@lucide/vue";
+import { Eraser, Layers, RefreshCw, Repeat, ScrollText, ShieldAlert } from "@lucide/vue";
 import { api, type CooldownRow as ApiCooldownRow, type GroupStatRow, type StatsPayload } from "../api";
 import { channelName, groups } from "../store";
 import { toast } from "../toast";
@@ -118,6 +118,9 @@ const rateTone = computed<Tone>(() => {
   if (r >= 90) return "warn";
   return "err";
 });
+// 死循环拦截（输出退化）累计次数：老服务端 / 老库还没这一列时返回 null，概览里整块不渲染，
+// 避免在没有该能力的实例上显示一个永远为 0 的指标。
+const loopRetries = computed(() => pick(["loop_retries", "loop_guard_retries"]));
 
 /* ------------------------------ 按模型成本 ------------------------------ */
 function firstNum(row: Row, keys: string[]): number | null {
@@ -313,10 +316,20 @@ onUnmounted(() => {
       <div class="text-[12px] text-ink-3">
         统计范围：<span class="font-medium text-ink-2">{{ scopedId ? groupLabel(scopedId) : "全部分组" }}</span>
         · 共 {{ byModel.length }} 个模型 · 合计 {{ fmtCost(costTotal) }}
+        <Badge
+          v-if="loopRetries !== null && loopRetries > 0"
+          tone="warn"
+          class="ml-1 align-[1px]"
+          data-test="loop-retries"
+          title="网关内部因输出退化（死循环）丢弃并重试的次数，客户端看不到这些被丢弃的尝试"
+        >
+          <Repeat :size="11" />死循环拦截 {{ fmtInt(loopRetries) }} 次
+        </Badge>
         <span v-if="lastAt" class="ml-1 font-mono text-[11.5px]">· 最后更新 {{ fmtClock(lastAt) }}</span>
       </div>
       <div class="ml-auto flex flex-wrap items-center gap-2">
-        <div class="w-[150px]">
+        <!-- 同 Logs.vue：attrs 在 SelectRoot（inheritAttrs:false）处被丢弃，钩子必须挂在包裹 div 上。 -->
+        <div class="w-[150px]" data-test="stats-group-filter">
           <TSelect v-model="groupId" size="sm" :options="groupOptions" placeholder="全部分组" />
         </div>
         <Btn size="sm" title="立即刷新" @click="load()">

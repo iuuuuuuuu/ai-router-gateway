@@ -354,7 +354,7 @@ pub fn render_response(resp: &ChatResponse) -> Value {
 pub fn render_stream_event(model: &str, ev: &StreamEvent) -> Vec<Value> {
     match ev {
         StreamEvent::Start { .. } => vec![], // OpenAI has no start frame; first delta carries id
-        StreamEvent::TextDelta { text } => vec![json!({
+        StreamEvent::TextDelta { text, .. } => vec![json!({
             "id": format!("chatcmpl-gw{}", uuid::Uuid::new_v4().simple()),
             "object": "chat.completion.chunk",
             "created": chrono::Utc::now().timestamp(),

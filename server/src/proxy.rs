@@ -12,7 +12,7 @@
 //! repaired with finish_reason=error so the client never mistakes a broken
 //! stream for success.
 
-use crate::config::{ConfigSnapshot, Protocol};
+use crate::config::{effective_retry, ConfigSnapshot, Protocol};
 use crate::health::{Attribution, CooldownKey, HealthRegistry};
 use crate::protocol::{anthropic, gemini, ir, openai, ChatRequest, ChatResponse, StreamEvent};
 use crate::router::{
@@ -158,14 +158,18 @@ pub async fn run(ctx: &ProxyCtx<'_>) -> RunResult {
     let Some(group) = snap.config.groups.iter().find(|g| g.id == ctx.group_id) else {
         return empty_run(Terminal::NoCandidate, started);
     };
-    let budget = build_budget(&snap.config.retry, started);
+    // Per-group settings: a group with its own overrides.retry drives the whole
+    // walk (budget + cooldown_wait) from that copy; every other group borrows the
+    // global config, so its behaviour is bit-identical to before this existed.
+    let rc = effective_retry(&snap.config, group);
+    let budget = build_budget(rc, started);
 
     let mut walk = WalkState { idx: 0, cycle: 0, attempts: 0 };
     let mut plan = build_plan(&snap.config, group, &ctx.exposed_model, &ctx.state.health);
 
     loop {
         let now = Instant::now();
-        match next_step(&mut walk, &plan, &budget, now, &ctx.state.health, snap.config.retry.cooldown_wait) {
+        match next_step(&mut walk, &plan, &budget, now, &ctx.state.health, rc.cooldown_wait) {
             Step::Try(idx) => {
                 let candidate = plan.runnable[idx].clone();
                 walk.idx += 1;
@@ -302,6 +306,11 @@ pub fn proxy_err_message(e: &ProxyError) -> String {
         ProxyError::ErrorBody(m) => format!("error body: {m}"),
         ProxyError::NotSse(m) => format!("not sse: {m}"),
         ProxyError::EmptyResponse => "empty response".into(),
+        ProxyError::DegenerateOutput { unit, repeats } => format!(
+            "degenerate output: repeated {}-char unit {} times",
+            unit.chars().count(),
+            repeats
+        ),
         ProxyError::ClientGone => "client gone".into(),
     }
 }
@@ -474,6 +483,16 @@ async fn attempt_stream(
     let mut es = resp.bytes_stream().eventsource();
     let mut usage_acc = ir::Usage::default();
 
+    // Degenerate-output detection plus the holdback buffer it needs. Both live
+    // entirely inside the PRE-COMMIT window, so a hit costs the client zero
+    // bytes. `hold == 0` (guard disabled, or a config that clamped it away)
+    // commits the very first text frame, i.e. exactly the old behaviour.
+    let mut guard = crate::loopguard::LoopGuard::new(&budget.loop_guard);
+    let mut pending = String::new();
+    let hold = budget.loop_guard.min_chars;
+    // The finish reason the commit itself carried, when the frame that flushed
+    // the holdback buffer was also the frame that ended the answer.
+    let mut commit_finish: Option<ir::FinishReason> = None;
 
     let mut frame_deadline = Instant::now() + budget.first_event_timeout;
 
@@ -494,7 +513,11 @@ async fn attempt_stream(
     }
 
     // PRE-COMMIT loop: zero client bytes written in this loop.
-    let committed = loop {
+    // The commit value is a LIST: flushing the holdback buffer and the frame
+    // that ended the holdback are one and the same commit, so a tool call
+    // arriving after buffered text must carry that text with it instead of
+    // discarding it.
+    let committed: Vec<StreamEvent> = loop {
         let next = tokio::select! {
             ev = es.next() => ev,
             _ = sleep_until_std(frame_deadline) => {
@@ -507,6 +530,14 @@ async fn attempt_stream(
         frame_deadline = Instant::now() + budget.chunk_idle_timeout;
 
         let Some(ev) = next else {
+            // The stream ended: buffered text is real content and must not be
+            // dropped, so it becomes the committed event.
+            if !pending.is_empty() {
+                break vec![StreamEvent::TextDelta {
+                    text: std::mem::take(&mut pending),
+                    finish: commit_finish,
+                }];
+            }
             return Err((ProxyError::NotSse("stream ended before any content".into()), usage_acc));
         };
         let Ok(ev) = ev else { continue }; // malformed SSE chunk: skip
@@ -551,36 +582,81 @@ async fn attempt_stream(
             }
             FrameClass::Error(m) => return Err((ProxyError::ErrorBody(m), usage_acc)),
             FrameClass::Done => {
+                // The upstream declared the stream finished: buffered text is
+                // real content and must not be dropped.
+                if !pending.is_empty() {
+                    // No Finish frame was seen (a Finish always breaks this
+                    // loop), so [DONE] itself is the end of a complete answer.
+                    commit_finish = Some(ir::FinishReason::Stop);
+                    break vec![StreamEvent::TextDelta {
+                        text: std::mem::take(&mut pending),
+                        finish: commit_finish,
+                    }];
+                }
                 return Err((ProxyError::EmptyResponse, usage_acc));
             }
-            FrameClass::Text(t) => break Some(StreamEvent::TextDelta { text: t }),
+            FrameClass::Text(t) => {
+                // Only text is judged. A repetition is a property of prose, not
+                // of tool arguments, and delaying the latter would break the
+                // tool stream semantics (see docs/loopguard-spec.md §2).
+                if let Some(hit) = guard.push(&t) {
+                    return Err((
+                        ProxyError::DegenerateOutput { unit: hit.unit, repeats: hit.repeats },
+                        usage_acc,
+                    ));
+                }
+                pending.push_str(&t);
+                if pending.chars().count() >= hold {
+                    break vec![StreamEvent::TextDelta {
+                        text: std::mem::take(&mut pending),
+                        finish: None,
+                    }];
+                }
+                continue;
+            }
             FrameClass::ToolUseStart { index, id, name, args } => {
                 // A whole call delivered in one frame (some OpenAI-compatible
                 // providers do this) commits with its args already in hand;
                 // otherwise the arguments stream in afterwards.
+                let mut out = flush_pending(&mut pending);
                 if args.is_empty() {
-                    break Some(StreamEvent::ToolUseStart { index, id, name, args: None });
+                    out.push(StreamEvent::ToolUseStart { index, id, name, args: None });
+                } else {
+                    let parsed = serde_json::from_str::<serde_json::Value>(&args)
+                        .unwrap_or(serde_json::Value::String(args));
+                    out.push(StreamEvent::ToolUseStart { index, id, name, args: Some(parsed) });
                 }
-                let parsed = serde_json::from_str::<serde_json::Value>(&args)
-                    .unwrap_or(serde_json::Value::String(args));
-                break Some(StreamEvent::ToolUseStart { index, id, name, args: Some(parsed) });
+                break out;
             }
             FrameClass::ToolInput { index, delta } => {
-                break Some(StreamEvent::ToolInputDelta { index, partial_json: delta })
+                let mut out = flush_pending(&mut pending);
+                out.push(StreamEvent::ToolInputDelta { index, partial_json: delta });
+                break out;
             }
             FrameClass::ToolCallFull { name, args } => {
                 // Gemini sends the whole call — name AND complete args — in one
                 // frame. Carry the args through instead of discarding them.
                 let index = 0usize;
                 let id = format!("call_{name}");
-                break Some(StreamEvent::ToolUseStart { index, id, name, args: Some(args) });
+                let mut out = flush_pending(&mut pending);
+                out.push(StreamEvent::ToolUseStart { index, id, name, args: Some(args) });
+                break out;
             }
             FrameClass::Finish { reason, usage } => {
                 if let Some(u) = usage {
                     usage_acc = merge_usage_max(usage_acc, u);
                 }
-                // A Finish without content is still a valid (empty) completion.
-                break None;
+                // A Finish carrying buffered text commits that text together
+                // with its own finish reason; a Finish without any is still a
+                // valid (empty) completion.
+                if !pending.is_empty() {
+                    commit_finish = Some(reason);
+                    break vec![StreamEvent::TextDelta {
+                        text: std::mem::take(&mut pending),
+                        finish: commit_finish,
+                    }];
+                }
+                break Vec::new();
             }
         }
     };
@@ -599,7 +675,7 @@ async fn attempt_stream(
         let feed = feed_tx.clone();
 
         // POST-COMMIT pump: convert frames to IR events, render in client protocol.
-        let mut finished = committed.is_none();
+        let mut finished = committed.is_empty();
         if finished {
             feed_close_clean(&feed, entry).await;
             if let Some(tx) = tx.take() { let _ = tx.send(final_usage); }
@@ -618,23 +694,24 @@ async fn attempt_stream(
         // the SAME assembly as pump frames: when the commit event IS the tool
         // call (a whole-package Gemini frame, or an incremental start), emitting
         // it directly would render a call with no arguments at all.
-        match committed {
-            Some(StreamEvent::ToolUseStart { index, id, name, args }) => match args {
-                // Whole call already (Gemini upstream): pass straight through.
-                Some(a) => {
-                    let ev = StreamEvent::ToolUseStart { index, id, name, args: Some(a) };
-                    feed_emit(&feed, entry, &ev, &exposed_name).await;
+        for ev in committed {
+            match ev {
+                StreamEvent::ToolUseStart { index, id, name, args } => match args {
+                    // Whole call already (Gemini upstream): pass straight through.
+                    Some(a) => {
+                        let ev = StreamEvent::ToolUseStart { index, id, name, args: Some(a) };
+                        feed_emit(&feed, entry, &ev, &exposed_name).await;
+                    }
+                    // Incremental start: hold it back until its args arrive.
+                    None => pending_tool = Some((index, id, name, String::new())),
+                },
+                StreamEvent::ToolInputDelta { index, partial_json } => {
+                    // Upstream opened with arguments directly (no start frame seen
+                    // pre-commit): buffer them so the call is still emitted whole.
+                    pending_tool = Some((index, String::new(), String::new(), partial_json));
                 }
-                // Incremental start: hold it back until its args arrive.
-                None => pending_tool = Some((index, id, name, String::new())),
-            },
-            Some(StreamEvent::ToolInputDelta { index, partial_json }) => {
-                // Upstream opened with arguments directly (no start frame seen
-                // pre-commit): buffer them so the call is still emitted whole.
-                pending_tool = Some((index, String::new(), String::new(), partial_json));
+                other => feed_emit(&feed, entry, &other, &exposed_name).await,
             }
-            Some(ev) => feed_emit(&feed, entry, &ev, &exposed_name).await,
-            None => {}
         }
 
         loop {
@@ -657,6 +734,15 @@ async fn attempt_stream(
                 }
             };
             let Some(ev) = next else {
+                // Same rule as the [DONE] branch below: a commit that already
+                // carried its own finish reason is a clean completion, even when
+                // the upstream closes without a separate Finish frame.
+                if !finished {
+                    if let Some(reason) = commit_finish {
+                        finished = true;
+                        feed_emit(&feed, entry, &StreamEvent::Finish { reason, usage: final_usage.clone() }, &exposed_name).await;
+                    }
+                }
                 if !finished {
                     feed_repair(&feed, entry, "upstream stream ended prematurely").await;
                 } else {
@@ -709,7 +795,7 @@ async fn attempt_stream(
                     if let Some(tx) = tx.take() { let _ = tx.send(final_usage); }
                     return;
                 }
-                FrameClass::Text(t) => feed_emit(&feed, entry, &StreamEvent::TextDelta { text: t }, &exposed_name).await,
+                FrameClass::Text(t) => feed_emit(&feed, entry, &StreamEvent::TextDelta { text: t, finish: None }, &exposed_name).await,
                 FrameClass::ToolUseStart { index, id, name, args } => {
                     // Incremental upstream call: hold it back until the args
                     // are complete so the client sees ONE well-formed call.
@@ -729,6 +815,10 @@ async fn attempt_stream(
                 }
                 FrameClass::Finish { reason, usage } => {
                     if let Some(u) = usage { final_usage = merge_usage_max(final_usage, u); }
+                    // A commit that already reported this completion (the
+                    // holdback buffer was flushed by a Finish frame) must not
+                    // complete the same answer twice.
+                    if finished { continue; }
                     // The call is complete once the upstream stops: release it
                     // before the finish frame so it cannot be stranded.
                     flush_tool(&feed, entry, &exposed_name, &mut pending_tool).await;
@@ -736,10 +826,21 @@ async fn attempt_stream(
                     feed_emit(&feed, entry, &StreamEvent::Finish { reason, usage: final_usage.clone() }, &exposed_name).await;
                 }
                 FrameClass::Done => {
+                    // A commit that already carried its finish reason is a clean
+                    // completion even when the upstream never sent a Finish
+                    // frame of its own (the holdback buffer was flushed by
+                    // [DONE]). Repairing here would tell the client of a
+                    // perfectly normal answer that the upstream had broken.
                     if !finished {
-                        feed_repair(&feed, entry, "upstream closed without finish").await;
-                    } else {
+                        if let Some(reason) = commit_finish {
+                            finished = true;
+                            feed_emit(&feed, entry, &StreamEvent::Finish { reason, usage: final_usage.clone() }, &exposed_name).await;
+                        }
+                    }
+                    if finished {
                         feed_close_clean(&feed, entry).await;
+                    } else {
+                        feed_repair(&feed, entry, "upstream closed without finish").await;
                     }
                     if let Some(tx) = tx.take() { let _ = tx.send(final_usage); }
                     return;
@@ -783,6 +884,16 @@ pub enum ClientFrame {
 
 pub fn new_client_channel() -> (mpsc::Sender<ClientFrame>, mpsc::Receiver<ClientFrame>) {
     mpsc::channel(256)
+}
+
+/// Drain the holdback buffer into a commit list. The text is NOT a completion
+/// here: the frame that flushed it (a tool call) continues the answer, so the
+/// text carries `finish: None` and the answer ends the way it otherwise would.
+fn flush_pending(pending: &mut String) -> Vec<StreamEvent> {
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    vec![StreamEvent::TextDelta { text: std::mem::take(pending), finish: None }]
 }
 
 /// Emit an assembled incremental tool call as ONE whole-package IR event.
@@ -860,3 +971,27 @@ pub async fn feed_repair(tx: &mpsc::Sender<ClientFrame>, entry: EntryProtocol, m
 // NOTE: feed channels are per-request (created in routes.rs), never global —
 // a process-global slot would cross-talk frames between concurrent streams.
 
+#[cfg(test)]
+mod loop_guard_commit_tests {
+    use super::*;
+
+    /// B1 regression: text buffered by the loop guard's holdback must not be
+    /// dropped when a tool call arrives before the buffer is full.
+    #[test]
+    fn flush_pending_returns_the_buffer_and_empties_it() {
+        let mut pending = String::from("好的，我来调用工具");
+        let evs = flush_pending(&mut pending);
+        assert_eq!(evs.len(), 1);
+        match &evs[0] {
+            StreamEvent::TextDelta { text, finish } => {
+                assert_eq!(text, "好的，我来调用工具");
+                assert!(finish.is_none(), "a tool frame does not end the answer");
+            }
+            other => panic!("expected TextDelta, got {other:?}"),
+        }
+        assert!(pending.is_empty(), "the buffer must be drained, not copied");
+
+        // Empty buffer contributes nothing at all.
+        assert!(flush_pending(&mut pending).is_empty());
+    }
+}

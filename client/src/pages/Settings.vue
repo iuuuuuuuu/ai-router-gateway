@@ -1,13 +1,13 @@
 <script setup lang="ts">
-// 设置：重试与超时 / 数据面监听 / 管理面 / 开机自启。
+// 设置：重试与超时 / 死循环拦截 / 分组配置 / 数据面监听 / 管理面 / 开机自启。
 // 本页没有独立保存按钮，所有改动只写 state.cfg 并 markDirty()，由顶栏统一保存。
-import { computed, onMounted, ref } from "vue";
-import { Eye, EyeOff, Power, Rocket, Server, Timer } from "@lucide/vue";
+import { computed, onMounted, ref, watch } from "vue";
+import { Copy, Eye, EyeOff, Info, Power, RefreshCw, Repeat, Rocket, Server, Timer } from "@lucide/vue";
 import {
-  Alert, Btn, Card, Field, IconBtn, TInput, TSelect, TToggle,
+  Alert, Badge, Btn, Card, Empty, Field, IconBtn, TInput, TSelect, TToggle,
 } from "../components/ui";
-import { getBase, getKey, setBase, setKey, type RetryConfig } from "../api";
-import { markDirty, state } from "../store";
+import { api, getBase, getKey, setBase, setKey, type Group, type GroupMembersPayload, type RetryConfig } from "../api";
+import { groups, markDirty, modelLabel, state } from "../store";
 import { toast } from "../toast";
 
 const cfg = computed(() => state.cfg!);
@@ -32,6 +32,9 @@ const budgetLine = computed(
   () => `${budgetFormula.value} = ${worstMs.value} ms`,
 );
 
+/** 死循环拦截的首字节推迟量 ≈ 检测阈值；老配置还没这个字段时按服务端默认 64 显示。 */
+const loopHold = computed(() => Number(retry.value.loop_guard_min_chars) || 64);
+
 /* --------------------------- 重试档位（快捷预设） --------------------------- */
 // 9 个数字字段互相约束（预算公式一旦不成立服务端会拒保存），手改很容易打架，
 // 所以给几个常用档位一键套用；套用后仍可逐项微调，只要有一项对不上就显示「自定义」。
@@ -41,6 +44,10 @@ type RetryNumbers = Pick<
   | "max_attempts" | "max_cycles" | "total_deadline_ms" | "attempt_deadline_ms"
   | "connect_timeout_ms" | "ttfb_timeout_ms" | "first_event_timeout_ms"
   | "chunk_idle_timeout_ms" | "reserve_ms" | "cooldown_wait"
+  // 死循环拦截的 5 个数字字段：档位一并套用（开关 loop_guard_enabled 故意不在这里，
+  // 它不参与预算公式，也不该被「档位」这种纯超时/重试预设顺手改掉）。
+  | "loop_guard_min_chars" | "loop_guard_repeat_min_chars" | "loop_guard_repeat_ratio"
+  | "loop_guard_max_repeats" | "loop_guard_window_chars"
 >;
 
 const RETRY_PRESETS: { value: string; label: string; hint: string; patch: RetryNumbers }[] = [
@@ -50,6 +57,8 @@ const RETRY_PRESETS: { value: string; label: string; hint: string; patch: RetryN
       max_attempts: 6, max_cycles: 2, total_deadline_ms: 180000, attempt_deadline_ms: 25000,
       connect_timeout_ms: 5000, ttfb_timeout_ms: 15000, first_event_timeout_ms: 8000,
       chunk_idle_timeout_ms: 15000, reserve_ms: 3000, cooldown_wait: true,
+      loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
+      loop_guard_max_repeats: 4, loop_guard_window_chars: 4000,
     },
   },
   {
@@ -58,6 +67,8 @@ const RETRY_PRESETS: { value: string; label: string; hint: string; patch: RetryN
       max_attempts: 4, max_cycles: 1, total_deadline_ms: 60000, attempt_deadline_ms: 12000,
       connect_timeout_ms: 5000, ttfb_timeout_ms: 8000, first_event_timeout_ms: 8000,
       chunk_idle_timeout_ms: 10000, reserve_ms: 5000, cooldown_wait: false,
+      loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
+      loop_guard_max_repeats: 4, loop_guard_window_chars: 4000,
     },
   },
   {
@@ -66,6 +77,8 @@ const RETRY_PRESETS: { value: string; label: string; hint: string; patch: RetryN
       max_attempts: 6, max_cycles: 2, total_deadline_ms: 900000, attempt_deadline_ms: 120000,
       connect_timeout_ms: 10000, ttfb_timeout_ms: 60000, first_event_timeout_ms: 60000,
       chunk_idle_timeout_ms: 120000, reserve_ms: 10000, cooldown_wait: true,
+      loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
+      loop_guard_max_repeats: 4, loop_guard_window_chars: 4000,
     },
   },
   {
@@ -74,6 +87,8 @@ const RETRY_PRESETS: { value: string; label: string; hint: string; patch: RetryN
       max_attempts: 16, max_cycles: 3, total_deadline_ms: 900000, attempt_deadline_ms: 45000,
       connect_timeout_ms: 10000, ttfb_timeout_ms: 30000, first_event_timeout_ms: 10000,
       chunk_idle_timeout_ms: 20000, reserve_ms: 10000, cooldown_wait: true,
+      loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
+      loop_guard_max_repeats: 4, loop_guard_window_chars: 4000,
     },
   },
 ];
@@ -101,6 +116,139 @@ const presetChoice = computed({
   get: () => activePreset.value,
   set: (v: string) => applyPreset(v),
 });
+
+/* ---------------------------- 分组级重试配置 ---------------------------- */
+// 每个分组都能「跟随全局配置」或「使用自己的配置」。本地只改 state.cfg 里的
+// group.overrides.retry，由顶栏统一保存（保存后服务端才会把它当作该分组的生效配置）。
+//
+// 判定「跟随/自有」的唯一依据是 g.overrides?.retry 是否存在：
+//   · null / undefined → 跟随全局（服务端把全局配置套给它）
+//   · 有对象           → 使用自己的配置
+// 切回「跟随全局」写的是 { retry: null }，绝不去复制一份全局值 —— 复制值会让服务端认为
+// 该分组「有自己的配置」，从此不再跟随全局，之后改全局它也不会跟着变了。
+//
+// 面板里的「当前生效值」取自 group-members 接口：它按服务端真实计算逻辑回报该分组实际
+// 生效的 retry。服务端没这个能力时静默降级为只读展示「编辑区当前值」，不影响编辑。
+
+const grMap = ref<Record<string, GroupMembersPayload>>({});
+const grLoading = ref(false);
+const grErr = ref("");
+let grRun = false;
+let grAgain = false;
+
+/** 该分组是否使用自己的配置（唯一判据，别在模板里另算一套）。 */
+function own(g: Group): boolean {
+  return g.overrides?.retry != null;
+}
+
+/** 该分组当前实际生效的配置：优先服务端回报，其次它自己的，最后退回全局。 */
+function effRetry(g: Group): RetryConfig {
+  const srv = grMap.value[g.id]?.retry;
+  if (srv) return srv;
+  return g.overrides?.retry ?? retry.value;
+}
+
+/** 该分组的配置来源：优先服务端回报，否则按本地是否自有判断。 */
+function retrySrc(g: Group): "global" | "group" {
+  const srv = grMap.value[g.id]?.retry_source;
+  if (srv === "group" || srv === "global") return srv;
+  return own(g) ? "group" : "global";
+}
+
+/** 「复制全局配置」的源：优先服务端回报的全局值，否则用本地全局值。 */
+function globalRetry(g: Group): RetryConfig {
+  const srv = grMap.value[g.id]?.global_retry;
+  return srv ?? retry.value;
+}
+
+/**
+ * 服务端不保证每个字段都回来（老服务端 / 以后的版本会加新字段），缺的用全局值补齐，
+ * 避免出现空数字框；已有的一律保留，不做类型转换。
+ */
+function normRetry(src: RetryConfig): RetryConfig {
+  const base = retry.value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const k of Object.keys(src)) out[k] = (src as Record<string, unknown>)[k];
+  for (const k of Object.keys(base)) {
+    if (out[k] === undefined || out[k] === null) out[k] = base[k];
+  }
+  return out as RetryConfig;
+}
+
+/** 切到「使用自己的配置」：从当前生效值克隆一份，之后改的就是这份独立副本。 */
+function useOwn(g: Group) {
+  if (own(g)) return;
+  g.overrides = { ...(g.overrides ?? {}), retry: normRetry(effRetry(g)) };
+  markDirty();
+  toast.ok(`「${g.name}」已切换为独立配置，记得在顶栏保存`);
+}
+
+/** 切回「跟随全局配置」：写 null，不复制全局值。 */
+function followGlobal(g: Group) {
+  if (!own(g)) return;
+  g.overrides = { ...(g.overrides ?? {}), retry: null };
+  markDirty();
+  toast.ok(`「${g.name}」已改回跟随全局，记得在顶栏保存`);
+}
+
+/** 把当前全局配置整份复制到这个分组，之后它就和全局解耦、可以单独改了。 */
+function copyGlobal(g: Group) {
+  g.overrides = { ...(g.overrides ?? {}), retry: normRetry(globalRetry(g)) };
+  markDirty();
+  toast.ok(`已把全局配置复制到「${g.name}」`);
+}
+
+/** 该分组自己的配置里只看得见的数字字段 —— 与上面「重试与超时」同一套预算公式。 */
+function gBudget(g: Group) {
+  const r = g.overrides?.retry;
+  if (!r) return { ok: true, line: "" };
+  const worst = Number(r.max_attempts) * Number(r.attempt_deadline_ms) + Number(r.reserve_ms);
+  const ok = worst <= Number(r.total_deadline_ms);
+  return {
+    ok,
+    line: `${r.max_attempts} × ${r.attempt_deadline_ms} ms + ${r.reserve_ms} ms = ${worst} ms`,
+  };
+}
+
+/** 跟随全局时的一句话摘要：用实际生效值，和生效的模型名一样能直接看。 */
+function followLine(g: Group): string {
+  const r = effRetry(g);
+  const sec = Math.max(1, Math.round(Number(r.total_deadline_ms) / 1000));
+  return `跟随全局（当前：max_attempts=${r.max_attempts} / 总超时 ${sec}s / 死循环拦截 ${r.loop_guard_enabled ? "开" : "关"}）`;
+}
+
+function groupModels(g: Group): string {
+  return g.exposed_models.map(modelLabel).join("、");
+}
+
+/** 拉取所有分组的生效重试配置；任意一个失败就整体标记为「仅供参考」。 */
+async function loadGroupRetries() {
+  if (grRun) { grAgain = true; return; }
+  grRun = true;
+  grLoading.value = true;
+  try {
+    const list = groups.value.slice();
+    const results = await Promise.all(list.map(g => api.groupMembers(g.id).catch(() => null)));
+    const next: Record<string, GroupMembersPayload> = {};
+    let bad = 0;
+    results.forEach((r, i) => {
+      if (r) next[list[i].id] = r;
+      else bad++;
+    });
+    grMap.value = next;
+    grErr.value = bad > 0 ? "部分分组的生效配置读取失败，下面显示的是编辑器里的当前值。" : "";
+  } finally {
+    grLoading.value = false;
+    grRun = false;
+    if (grAgain) { grAgain = false; void loadGroupRetries(); }
+  }
+}
+
+// 分组增删后重新拉一次（只认 id 列表，改名字不触发）。
+watch(
+  () => groups.value.map(g => g.id).join(","),
+  () => { void loadGroupRetries(); },
+);
 
 /* --------------------------- 管理面密钥显示 --------------------------- */
 
@@ -162,7 +310,18 @@ onMounted(() => {
   // 老配置可能没有 reserve_ms，补一个默认值，避免预算公式算不出来。
   const r = retry.value;
   if (r && typeof r.reserve_ms !== "number") r.reserve_ms = 3000;
+  // 死循环拦截是后加的能力：服务端会回填默认值，但客户端直连老服务端时这些键可能是
+  // undefined（数字框会显示空白），这里补上服务端默认值（与 reserve_ms 一样不标脏）。
+  if (r) {
+    if (typeof r.loop_guard_enabled !== "boolean") r.loop_guard_enabled = true;
+    if (typeof r.loop_guard_min_chars !== "number") r.loop_guard_min_chars = 64;
+    if (typeof r.loop_guard_repeat_min_chars !== "number") r.loop_guard_repeat_min_chars = 24;
+    if (typeof r.loop_guard_repeat_ratio !== "number") r.loop_guard_repeat_ratio = 0.75;
+    if (typeof r.loop_guard_max_repeats !== "number") r.loop_guard_max_repeats = 4;
+    if (typeof r.loop_guard_window_chars !== "number") r.loop_guard_window_chars = 4000;
+  }
   void loadAutostart();
+  void loadGroupRetries();
 });
 </script>
 
@@ -290,6 +449,294 @@ onMounted(() => {
         </div>
       </Card>
 
+      <!-- ------------------------------ 死循环拦截 ------------------------------ -->
+      <!-- 服务端在「提交前窗口」里检测退化输出：命中就整次尝试丢弃并换下一个候选，
+           客户端只会拿到一次正常回答（提交前零字节，外部对话不会被中断）。 -->
+      <Card>
+        <div class="mb-3.5">
+          <h2 class="flex items-center gap-1.5 text-[13.5px] font-semibold text-ink">
+            <Repeat :size="14" class="text-ink-3" />
+            死循环拦截
+          </h2>
+          <p class="mt-0.5 text-[12.5px] text-ink-3">
+            检测模型是否在反复输出同一段内容；命中就丢弃这次尝试并自动换下一个候选，客户端只会拿到一次正常回答。
+          </p>
+        </div>
+
+        <div class="border-t border-line-soft pt-4">
+          <TToggle
+            v-model="retry.loop_guard_enabled"
+            label="开启死循环拦截"
+            data-test="loop-guard-enabled"
+            @update:model-value="markDirty()"
+          />
+          <p class="mt-1 text-[11.5px] leading-4 text-ink-3">
+            关闭后完全按原样透传上游输出，不做任何检测与缓冲。
+          </p>
+        </div>
+
+        <div class="mt-4 border-t border-line-soft pt-4">
+          <div class="mb-1.5 text-[11.5px] font-medium uppercase tracking-wide text-ink-3">检测参数</div>
+          <div class="grid grid-cols-1 gap-x-5 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
+            <Field label="检测起点 (字符)" hint="提交前先攒够这么多字符再开始判断：太小容易误判，太大则首字节推迟更久">
+              <div data-test="loop-guard-min-chars">
+                <TInput
+                  v-model.number="retry.loop_guard_min_chars" type="number" min="1"
+                  data-test="loop-guard-min-chars" @input="markDirty()"
+                />
+              </div>
+            </Field>
+            <Field label="重复单元下限 (字符)" hint="被重复的那一段至少多长才算「无意义重复」，太短会把正常的中文/标点重复算进去">
+              <div data-test="loop-guard-repeat-min-chars">
+                <TInput
+                  v-model.number="retry.loop_guard_repeat_min_chars" type="number" min="1"
+                  data-test="loop-guard-repeat-min-chars" @input="markDirty()"
+                />
+              </div>
+            </Field>
+            <Field label="重复占比阈值" hint="0~1 的小数，例如 0.75 表示重复部分要占到检测窗口的 75% 才判定为退化">
+              <div data-test="loop-guard-repeat-ratio">
+                <TInput
+                  v-model.number="retry.loop_guard_repeat_ratio" type="number" min="0" max="1" step="0.05"
+                  data-test="loop-guard-repeat-ratio" @input="markDirty()"
+                />
+              </div>
+            </Field>
+            <Field label="同一段重复次数" hint="同一段内容重复到第几次判定为退化，越小越敏感">
+              <div data-test="loop-guard-max-repeats">
+                <TInput
+                  v-model.number="retry.loop_guard_max_repeats" type="number" min="2"
+                  data-test="loop-guard-max-repeats" @input="markDirty()"
+                />
+              </div>
+            </Field>
+            <Field label="检测窗口 (字符)" hint="最多回看多少字符，超出只保留最近的；越大越吃内存，越小越容易漏判">
+              <div data-test="loop-guard-window-chars">
+                <TInput
+                  v-model.number="retry.loop_guard_window_chars" type="number" min="1"
+                  data-test="loop-guard-window-chars" @input="markDirty()"
+                />
+              </div>
+            </Field>
+          </div>
+          <p class="mt-2 text-[11.5px] leading-4 text-ink-3">
+            以上 5 项只影响退化判定，<span class="font-medium text-ink-2">不参与上面的预算校验</span>（预算公式只看重试次数与超时）。
+          </p>
+        </div>
+
+        <div class="mt-4 border-t border-line-soft pt-4">
+          <div class="mb-1.5 text-[11.5px] font-medium uppercase tracking-wide text-ink-3">代价与边界</div>
+          <ul class="space-y-1.5 text-[11.5px] leading-4 text-ink-3">
+            <li>
+              · <span class="font-medium text-ink-2">代价</span>：开启后首字节会被推迟约
+              {{ loopHold }} 个字符（等于「检测起点」）：上游要先攒够这么多字符，网关才会向客户端写出第一个字节。
+            </li>
+            <li>
+              · <span class="font-medium text-ink-2">只覆盖开头</span>：退化必须出现在回答的前
+              {{ loopHold }} 个字符内才能被内部拦截；如果模型先正常输出很长一段、之后才开始重复，则不会内部重试（否则客户端会看到重复内容），这类情况沿用原有语义：补一个错误帧后正常收尾。
+            </li>
+            <li>
+              · <span class="font-medium text-ink-2">只覆盖正文</span>：工具调用的参数不做检测与缓冲。
+            </li>
+            <li>
+              · <span class="font-medium text-ink-2">误判代价</span>：一次误判只会让网关内部多试一个候选，你仍然会拿到正常回答，但会浪费一次上游调用。
+            </li>
+          </ul>
+        </div>
+      </Card>
+
+      <!-- ------------------------------ 分组配置 ------------------------------ -->
+      <Card data-test="group-retry-card">
+        <div class="mb-3.5 flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+          <div class="min-w-0">
+            <h2 class="text-[13.5px] font-semibold text-ink">分组配置</h2>
+            <p class="mt-0.5 text-[12.5px] text-ink-3">
+              每个分组可以跟随上面的全局配置，也可以拥有自己的一份；有自己的配置时以它为准，全局改动不再影响它。
+            </p>
+          </div>
+          <Btn :disabled="grLoading" title="重新读取各分组当前生效的配置" data-test="group-retry-refresh" @click="loadGroupRetries()">
+            <RefreshCw :size="13" :class="grLoading ? 'animate-spin' : ''" />
+            {{ grLoading ? "读取中…" : "刷新" }}
+          </Btn>
+        </div>
+
+        <Alert v-if="grErr" tone="warn" data-test="group-retry-load-error">
+          <span>{{ grErr }}</span>
+        </Alert>
+
+        <Empty
+          v-if="groups.length === 0"
+          data-test="group-retry-empty"
+          title="还没有分组"
+          hint="先在「分组路由」页建一个分组，这里就能给它单独配重试与超时了。"
+        />
+
+        <div v-if="groups.length > 0" class="space-y-3">
+          <div
+            v-for="g in groups" :key="g.id"
+            class="rounded-lg border border-line-soft bg-app/40 p-3"
+          >
+            <div class="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+              <div class="min-w-0">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="text-[13px] font-medium text-ink">{{ g.name }}</span>
+                  <span class="font-mono text-[11.5px] text-ink-3">{{ g.id }}</span>
+                  <Badge :tone="retrySrc(g) === 'group' ? 'brand' : 'gray'">
+                    {{ retrySrc(g) === "group" ? "自己的配置" : "跟随全局" }}
+                  </Badge>
+                </div>
+                <p class="mt-1 text-[11.5px] leading-4 text-ink-3">
+                  {{ groupModels(g) || "未挂载模型" }}
+                </p>
+              </div>
+
+              <div class="flex shrink-0 flex-wrap items-center gap-2" :data-test="`group-retry-source-${g.id}`">
+                <Btn
+                  size="sm" :variant="own(g) ? 'ghost' : 'primary'"
+                  :data-test="`group-retry-follow-${g.id}`"
+                  @click="followGlobal(g)"
+                >跟随全局配置</Btn>
+                <Btn
+                  size="sm" :variant="own(g) ? 'primary' : 'ghost'"
+                  :data-test="`group-retry-own-${g.id}`"
+                  @click="useOwn(g)"
+                >使用自己的配置</Btn>
+              </div>
+            </div>
+
+            <p v-if="!own(g)" class="mt-2 text-[12px] leading-5 text-ink-2" :data-test="`group-retry-following-${g.id}`">
+              {{ followLine(g) }}
+            </p>
+
+            <div v-else class="mt-3 border-t border-line-soft pt-3">
+              <div class="mb-2.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+                <span class="text-[11.5px] font-medium uppercase tracking-wide text-ink-3">独立配置</span>
+                <Btn
+                  size="sm" variant="subtle"
+                  :data-test="`group-retry-copy-global-${g.id}`"
+                  @click="copyGlobal(g)"
+                >
+                  <Copy :size="12" />
+                  复制当前全局配置
+                </Btn>
+              </div>
+
+              <div :data-test="`group-retry-fields-${g.id}`" class="grid grid-cols-1 gap-x-5 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
+                <Field label="最大尝试次数" hint="单个请求最多尝试多少次（含降级后的重试）">
+                  <div :data-test="`group-retry-${g.id}-max-attempts`">
+                    <TInput v-model.number="g.overrides!.retry!.max_attempts" type="number" :data-test="`group-retry-${g.id}-max-attempts`" @input="markDirty()" />
+                  </div>
+                </Field>
+                <Field label="最大循环轮数" hint="走完全部层级算 1 轮，最多循环几轮">
+                  <div :data-test="`group-retry-${g.id}-max-cycles`">
+                    <TInput v-model.number="g.overrides!.retry!.max_cycles" type="number" :data-test="`group-retry-${g.id}-max-cycles`" @input="markDirty()" />
+                  </div>
+                </Field>
+                <Field label="总预算 (ms)" hint="整个请求的总时间上限，超过即直接失败">
+                  <div :data-test="`group-retry-${g.id}-total-deadline-ms`">
+                    <TInput v-model.number="g.overrides!.retry!.total_deadline_ms" type="number" :data-test="`group-retry-${g.id}-total-deadline-ms`" @input="markDirty()" />
+                  </div>
+                </Field>
+                <Field label="单次尝试上限 (ms)" hint="一次尝试的最长耗时，超时即判定失败并降级">
+                  <div :data-test="`group-retry-${g.id}-attempt-deadline-ms`">
+                    <TInput v-model.number="g.overrides!.retry!.attempt_deadline_ms" type="number" :data-test="`group-retry-${g.id}-attempt-deadline-ms`" @input="markDirty()" />
+                  </div>
+                </Field>
+                <Field label="连接超时 (ms)" hint="与上游建立 TCP / TLS 连接的超时">
+                  <div :data-test="`group-retry-${g.id}-connect-timeout-ms`">
+                    <TInput v-model.number="g.overrides!.retry!.connect_timeout_ms" type="number" :data-test="`group-retry-${g.id}-connect-timeout-ms`" @input="markDirty()" />
+                  </div>
+                </Field>
+                <Field label="首字节超时 (ms)" hint="发出请求到收到响应首字节的超时">
+                  <div :data-test="`group-retry-${g.id}-ttfb-timeout-ms`">
+                    <TInput v-model.number="g.overrides!.retry!.ttfb_timeout_ms" type="number" :data-test="`group-retry-${g.id}-ttfb-timeout-ms`" @input="markDirty()" />
+                  </div>
+                </Field>
+                <Field label="首个事件超时 (ms)" hint="流式响应中第一个事件到达的超时">
+                  <div :data-test="`group-retry-${g.id}-first-event-timeout-ms`">
+                    <TInput v-model.number="g.overrides!.retry!.first_event_timeout_ms" type="number" :data-test="`group-retry-${g.id}-first-event-timeout-ms`" @input="markDirty()" />
+                  </div>
+                </Field>
+                <Field label="流空闲超时 (ms)" hint="流式响应里两个数据块之间的最大空闲时间">
+                  <div :data-test="`group-retry-${g.id}-chunk-idle-timeout-ms`">
+                    <TInput v-model.number="g.overrides!.retry!.chunk_idle_timeout_ms" type="number" :data-test="`group-retry-${g.id}-chunk-idle-timeout-ms`" @input="markDirty()" />
+                  </div>
+                </Field>
+                <Field label="预留余量 (ms)" hint="给收尾/补帧留的时间">
+                  <div :data-test="`group-retry-${g.id}-reserve-ms`">
+                    <TInput v-model.number="g.overrides!.retry!.reserve_ms" type="number" :data-test="`group-retry-${g.id}-reserve-ms`" @input="markDirty()" />
+                  </div>
+                </Field>
+              </div>
+
+              <div class="mt-3 border-t border-line-soft pt-3">
+                <div :data-test="`group-retry-${g.id}-cooldown-wait`">
+                  <TToggle
+                    v-model="g.overrides!.retry!.cooldown_wait"
+                    label="全部冷却时等待而非直接失败"
+                    :data-test="`group-retry-${g.id}-cooldown-wait`"
+                    @update:model-value="markDirty()"
+                  />
+                </div>
+                <p class="mt-1 text-[11.5px] leading-4 text-ink-3">
+                  开启后，若该分组所有候选渠道都在冷却中，请求会等待最早解除冷却的渠道，而不是立刻返回失败。
+                </p>
+              </div>
+
+              <div class="mt-3 border-t border-line-soft pt-3">
+                <div :data-test="`group-retry-${g.id}-loop-guard-enabled`">
+                  <TToggle
+                    v-model="g.overrides!.retry!.loop_guard_enabled"
+                    label="拦截退化输出（死循环拦截）"
+                    :data-test="`group-retry-${g.id}-loop-guard-enabled`"
+                    @update:model-value="markDirty()"
+                  />
+                </div>
+                <div class="mt-3 grid grid-cols-1 gap-x-5 gap-y-4 sm:grid-cols-2 lg:grid-cols-3">
+                  <Field label="检测起点 (字符)" hint="提交前先攒够这么多字符再开始判断：太小容易误判，太大则首字节推迟更久">
+                    <div :data-test="`group-retry-${g.id}-loop-guard-min-chars`">
+                      <TInput v-model.number="g.overrides!.retry!.loop_guard_min_chars" type="number" min="1" :data-test="`group-retry-${g.id}-loop-guard-min-chars`" @input="markDirty()" />
+                    </div>
+                  </Field>
+                  <Field label="重复单元下限 (字符)" hint="被重复的那一段至少多长才算「无意义重复」，太短会把正常的中文/标点重复算进去">
+                    <div :data-test="`group-retry-${g.id}-loop-guard-repeat-min-chars`">
+                      <TInput v-model.number="g.overrides!.retry!.loop_guard_repeat_min_chars" type="number" min="1" :data-test="`group-retry-${g.id}-loop-guard-repeat-min-chars`" @input="markDirty()" />
+                    </div>
+                  </Field>
+                  <Field label="重复占比阈值" hint="0~1 的小数，例如 0.75 表示重复部分要占到检测窗口的 75% 才判定为退化">
+                    <div :data-test="`group-retry-${g.id}-loop-guard-repeat-ratio`">
+                      <TInput v-model.number="g.overrides!.retry!.loop_guard_repeat_ratio" type="number" min="0" max="1" step="0.05" :data-test="`group-retry-${g.id}-loop-guard-repeat-ratio`" @input="markDirty()" />
+                    </div>
+                  </Field>
+                  <Field label="同一段重复次数" hint="同一段内容重复到第几次判定为退化，越小越敏感">
+                    <div :data-test="`group-retry-${g.id}-loop-guard-max-repeats`">
+                      <TInput v-model.number="g.overrides!.retry!.loop_guard_max_repeats" type="number" min="2" :data-test="`group-retry-${g.id}-loop-guard-max-repeats`" @input="markDirty()" />
+                    </div>
+                  </Field>
+                  <Field label="检测窗口 (字符)" hint="最多回看多少字符，超出只保留最近的；越大越吃内存，越小越容易漏判">
+                    <div :data-test="`group-retry-${g.id}-loop-guard-window-chars`">
+                      <TInput v-model.number="g.overrides!.retry!.loop_guard_window_chars" type="number" min="1" :data-test="`group-retry-${g.id}-loop-guard-window-chars`" @input="markDirty()" />
+                    </div>
+                  </Field>
+                </div>
+              </div>
+
+              <Alert v-if="!gBudget(g).ok" tone="err" class="mt-3" :data-test="`group-retry-invalid-${g.id}`">
+                <Info :size="13" class="mt-0.5 shrink-0" />
+                <span>
+                  预算不成立：{{ gBudget(g).line }} &gt; 总预算 {{ g.overrides?.retry?.total_deadline_ms }} ms，
+                  服务端会拒绝保存，请调小尝试次数或单次上限。
+                </span>
+              </Alert>
+            </div>
+          </div>
+        </div>
+
+        <p class="mt-3 text-[11.5px] leading-4 text-ink-3">
+          「自己的配置」只在保存后生效（保存按钮在顶栏）；改回「跟随全局配置」不会复制全局值，
+          之后调整上面的全局配置，它仍然会跟着变。
+        </p>
+      </Card>
       <!-- ------------------------------ 数据面监听 ------------------------------ -->
       <Card>
         <div class="mb-3.5">

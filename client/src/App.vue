@@ -18,6 +18,7 @@ import GroupDetail from "./pages/GroupDetail.vue";
 import SettingsPage from "./pages/Settings.vue";
 import Logs from "./pages/Logs.vue";
 import Stats from "./pages/Stats.vue";
+import ModelDetail from "./pages/ModelDetail.vue";
 
 const navItems: { key: PageKey; label: string; icon: any; hint: string }[] = [
   { key: "channels", label: "渠道与模型", icon: Plug, hint: "上游供应商、密钥，以及渠道下挂的可用模型" },
@@ -31,7 +32,7 @@ const scroller = ref<HTMLElement | null>(null);
 
 // Each view owns its own scroll position; without this the next one opens
 // scrolled to wherever the previous was left, which feels broken.
-watch([() => nav.page, () => nav.groupId], async () => {
+watch([() => nav.page, () => nav.groupId, () => nav.modelKey], async () => {
   await nextTick();
   scroller.value?.scrollTo({ top: 0 });
 });
@@ -47,13 +48,22 @@ const current = computed(() => navItems.find(n => n.key === nav.page)!);
 const detailGroup = computed(() =>
   nav.groupId ? groups.value.find(g => g.id === nav.groupId) ?? null : null);
 
-const pageComp = computed(() => ({
-  channels: Channels, groups: Groups,
-  settings: SettingsPage, logs: Logs, stats: Stats,
-}[nav.page]));
+// Model detail wins over the group detail: opening a member from the group page
+// keeps nav.groupId set, so the modelKey branch has to be checked first.
+const pageComp = computed(() =>
+  nav.modelKey ? ModelDetail : {
+    channels: Channels, groups: Groups,
+    settings: SettingsPage, logs: Logs, stats: Stats,
+  }[nav.page]);
 
-/** Transition key: entering/leaving a group detail is a page change too. */
-const viewKey = computed(() => (nav.groupId ? "group:" + nav.groupId : nav.page));
+/** Transition key: entering/leaving a detail page (or switching member) is a page change too. */
+const viewKey = computed(() => nav.modelKey
+  ? "model:" + nav.groupId + ":" + nav.modelKey
+  : nav.groupId ? "group:" + nav.groupId : nav.page);
+
+/** A detail view of either kind owns the title bar; the model detail renders its own
+ *  in-page back button, so only the group detail gets one up here. */
+const detailOpen = computed(() => Boolean(nav.modelKey || detailGroup.value));
 
 /* ---------------------------- health polling ---------------------------- */
 let timer: number | undefined;
@@ -72,10 +82,10 @@ onMounted(async () => {
 });
 onUnmounted(() => { if (timer) window.clearInterval(timer); });
 
-const heading = computed(() => (detailGroup.value ? "分组详情" : current.value.label));
+const heading = computed(() => (nav.modelKey ? "模型详情" : detailGroup.value ? "分组详情" : current.value.label));
 const headingHint = computed(() => (detailGroup.value
   ? `${detailGroup.value.name || detailGroup.value.id} · ${detailGroup.value.id}`
-  : current.value.hint));
+  : detailOpen.value ? "" : current.value.hint));
 </script>
 
 <template>
@@ -130,7 +140,7 @@ const headingHint = computed(() => (detailGroup.value
       <header class="flex h-[52px] shrink-0 items-center justify-between gap-3 border-b border-line bg-surface px-5">
         <div class="flex min-w-0 items-center gap-2">
           <Btn
-            v-if="detailGroup" variant="ghost" size="sm"
+            v-if="detailGroup && !nav.modelKey" variant="ghost" size="sm"
             data-test="group-detail-back" title="返回分组路由"
             @click="closeGroupDetail"
           >
@@ -176,7 +186,8 @@ const headingHint = computed(() => (detailGroup.value
         </div>
 
         <Transition v-else name="page" mode="out-in" appear>
-          <GroupDetail v-if="detailGroup" :key="viewKey" :group="detailGroup" />
+          <ModelDetail v-if="nav.modelKey" :key="viewKey" />
+          <GroupDetail v-else-if="detailGroup" :key="viewKey" :group="detailGroup" />
           <div v-else :key="viewKey" class="px-5 py-5">
             <component :is="pageComp" />
           </div>

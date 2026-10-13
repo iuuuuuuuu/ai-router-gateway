@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod config;
 pub mod health;
+pub mod loopguard;
 pub mod protocol;
 pub mod proxy;
 pub mod router;

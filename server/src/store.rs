@@ -43,6 +43,10 @@ pub struct RequestLog {
     pub final_channel: Option<String>,
     pub final_upstream_model: Option<String>,
     pub attempts: u32,
+    /// How many attempts were discarded by the loop guard before one produced
+    /// a committed answer (i.e. attempts whose `error_class` was
+    /// `degenerate_output`). 0 means no degenerate output was ever detected.
+    pub loop_retries: u32,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
@@ -116,7 +120,8 @@ impl Store {
                 input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_usd REAL NOT NULL DEFAULT 0, wasted_cost_usd REAL NOT NULL DEFAULT 0,
-                duration_ms INTEGER NOT NULL DEFAULT 0, ttft_ms INTEGER NOT NULL DEFAULT 0);
+                duration_ms INTEGER NOT NULL DEFAULT 0, ttft_ms INTEGER NOT NULL DEFAULT 0,
+                loop_retries INTEGER NOT NULL DEFAULT 0);
              CREATE INDEX IF NOT EXISTS idx_rl_ts ON request_logs(ts);
              CREATE INDEX IF NOT EXISTS idx_rl_model ON request_logs(exposed_model);
              CREATE INDEX IF NOT EXISTS idx_rl_status ON request_logs(status);
@@ -157,6 +162,19 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS idx_sl_group ON switch_logs(group_id);
              CREATE INDEX IF NOT EXISTS idx_rl_group ON request_logs(group_id);",
         )?;
+        // Same reasoning as the group_id backfill above: a database created
+        // before loop_retries existed keeps its old request_logs table, so the
+        // column is added explicitly when it is missing. The default of 0 is
+        // what makes every historical row read as "no loop retries".
+        let has_loop_retries: bool = conn
+            .prepare("PRAGMA table_info(request_logs)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|c| c == "loop_retries");
+        if !has_loop_retries {
+            conn.execute_batch("ALTER TABLE request_logs ADD COLUMN loop_retries INTEGER NOT NULL DEFAULT 0;")?;
+        }
         Ok(())
     }
 
@@ -193,9 +211,9 @@ impl Store {
     pub fn insert_request_log(&self, l: &RequestLog) -> anyhow::Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO request_logs (ts, request_id, group_id, exposed_model, entry_protocol, status, final_channel, final_upstream_model, attempts, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, wasted_cost_usd, duration_ms, ttft_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-            params![l.ts, l.request_id, l.group_id, l.exposed_model, l.entry_protocol, l.status, l.final_channel, l.final_upstream_model, l.attempts, l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens, l.cost_usd, l.wasted_cost_usd, l.duration_ms, l.ttft_ms],
+            "INSERT INTO request_logs (ts, request_id, group_id, exposed_model, entry_protocol, status, final_channel, final_upstream_model, attempts, loop_retries, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, wasted_cost_usd, duration_ms, ttft_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            params![l.ts, l.request_id, l.group_id, l.exposed_model, l.entry_protocol, l.status, l.final_channel, l.final_upstream_model, l.attempts, l.loop_retries, l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens, l.cost_usd, l.wasted_cost_usd, l.duration_ms, l.ttft_ms],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -217,7 +235,7 @@ impl Store {
 
     pub fn list_request_logs(&self, limit: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
-        let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'exposed_model',exposed_model,'entry_protocol',entry_protocol,'status',status,'final_channel',final_channel,'final_upstream_model',final_upstream_model,'attempts',attempts,'input_tokens',input_tokens,'output_tokens',output_tokens,'cache_read_tokens',cache_read_tokens,'cache_creation_tokens',cache_creation_tokens,'cost_usd',cost_usd,'wasted_cost_usd',wasted_cost_usd,'duration_ms',duration_ms,'ttft_ms',ttft_ms)";
+        let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'exposed_model',exposed_model,'entry_protocol',entry_protocol,'status',status,'final_channel',final_channel,'final_upstream_model',final_upstream_model,'attempts',attempts,'loop_retries',loop_retries,'input_tokens',input_tokens,'output_tokens',output_tokens,'cache_read_tokens',cache_read_tokens,'cache_creation_tokens',cache_creation_tokens,'cost_usd',cost_usd,'wasted_cost_usd',wasted_cost_usd,'duration_ms',duration_ms,'ttft_ms',ttft_ms)";
         let (where_sql, binds) = build_filters(request_id, group_id, limit);
         // bind the SQL to a local so the borrow outlives the prepared statement
         let sql = format!("SELECT {cols} FROM request_logs{where_sql} ORDER BY id DESC LIMIT ?{}", binds.len());
@@ -226,6 +244,135 @@ impl Store {
             .query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows.into_iter().map(|s| serde_json::from_str(&s).unwrap()).collect())
+    }
+
+    /// Per-member aggregates for ONE group, keyed by
+    /// `"<channel_id>::<upstream_model>"` — the same key the console uses as a
+    /// member row id (task-27 deliverable 2).
+    ///
+    /// Two independent passes, both filtered by `group_id` BEFORE aggregating:
+    ///   * successes come from `request_logs` (status='success' with a landed
+    ///     final_channel + final_upstream_model): requests / tokens / cost /
+    ///     avg_duration_ms / avg_ttft_ms / last_success_ts;
+    ///   * failures come from `switch_logs` (outcome='failed'): failed_attempts /
+    ///     loop_retries / per-class error_classes / last_fail_ts /
+    ///     last_error_class.
+    /// A member with no rows at all simply does not appear in the map; the caller
+    /// renders its missing counts as a real 0 and its missing averages as null.
+    ///
+    /// The two averages are deliberately NOT coalesced to 0: with no successful
+    /// request they stay SQL NULL, because "no data" and "0 ms" are different
+    /// facts and the console prints null as "—".
+    ///
+    /// `last_outcome` / `last_error_class` are derived from the two timestamps
+    /// (both written by routes.rs::iso_now — local +08:00 with fixed millisecond
+    /// precision — so a plain string compare is chronological): the newer side
+    /// wins, and the error class is reported only when the newer side is a
+    /// failure, so a member whose last landed request succeeded reports
+    /// `last_outcome: "success", last_error_class: null`.
+    pub fn group_member_stats(&self, group_id: &str) -> anyhow::Result<std::collections::HashMap<String, serde_json::Value>> {
+        let conn = self.conn.lock().unwrap();
+        let key = "final_channel || '::' || final_upstream_model";
+        let mut out: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {key}, json_object('requests',COUNT(*),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'avg_duration_ms',ROUND(AVG(duration_ms)),'avg_ttft_ms',ROUND(AVG(ttft_ms)),'last_success_ts',MAX(ts)) \
+             FROM request_logs WHERE group_id = ?1 AND status = 'success' AND final_channel IS NOT NULL AND final_upstream_model IS NOT NULL \
+             GROUP BY {key}"
+        ))?;
+        let rows = stmt
+            .query_map(params![group_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (k, js) in rows {
+            out.insert(k, serde_json::from_str(&js).unwrap_or(serde_json::Value::Null));
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT s.channel_id || '::' || s.upstream_model, json_object(\
+                'failed_attempts',SUM(s.n),\
+                'loop_retries',SUM(s.lr),\
+                'error_classes',json_group_array(json_object('error_class',s.error_class,'n',s.n)),\
+                'last_fail_ts',MAX(s.ts),\
+                'last_error_class',(SELECT s2.error_class FROM switch_logs s2 WHERE s2.group_id = ?1 AND s2.outcome = 'failed' AND s2.channel_id = s.channel_id AND s2.upstream_model = s.upstream_model ORDER BY s2.ts DESC, s2.id DESC LIMIT 1)) \
+             FROM (SELECT channel_id, upstream_model, error_class, COUNT(*) AS n, MAX(ts) AS ts, SUM(CASE WHEN error_class = 'degenerate_output' THEN 1 ELSE 0 END) AS lr \
+                   FROM switch_logs WHERE group_id = ?1 AND outcome = 'failed' GROUP BY channel_id, upstream_model, error_class) AS s \
+             GROUP BY s.channel_id, s.upstream_model"
+        )?;
+        let rows = stmt
+            .query_map(params![group_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for (k, js) in rows {
+            let v: serde_json::Value = serde_json::from_str(&js).unwrap_or(serde_json::Value::Null);
+            match out.entry(k) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    if let (Some(dst), Some(src)) = (e.get_mut().as_object_mut(), v.as_object()) {
+                        for (f, val) in src {
+                            dst.insert(f.clone(), val.clone());
+                        }
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(v);
+                }
+            }
+        }
+
+        for v in out.values_mut() {
+            let Some(obj) = v.as_object_mut() else { continue };
+            let succ = obj.get("last_success_ts").and_then(|x| x.as_str()).map(|s| s.to_string());
+            let fail = obj.get("last_fail_ts").and_then(|x| x.as_str()).map(|s| s.to_string());
+            let last_failed = match (&succ, &fail) {
+                (Some(s), Some(f)) => f > s,
+                (None, Some(_)) => true,
+                _ => false,
+            };
+            let last_used = match (&succ, &fail) {
+                (Some(s), Some(f)) => Some(if s > f { s.clone() } else { f.clone() }),
+                (Some(s), None) => Some(s.clone()),
+                (None, Some(f)) => Some(f.clone()),
+                (None, None) => None,
+            };
+            let outcome = if last_failed {
+                Some("failed")
+            } else if succ.is_some() {
+                Some("success")
+            } else {
+                None
+            };
+            let last_err = if last_failed {
+                obj.get("last_error_class").cloned().unwrap_or(serde_json::Value::Null)
+            } else {
+                serde_json::Value::Null
+            };
+            obj.insert("last_used_ts".into(), last_used.map(|s| serde_json::json!(s)).unwrap_or(serde_json::Value::Null));
+            obj.insert("last_outcome".into(), outcome.map(|s| serde_json::json!(s)).unwrap_or(serde_json::Value::Null));
+            obj.insert("last_error_class".into(), last_err);
+            obj.remove("last_success_ts");
+            obj.remove("last_fail_ts");
+            for f in ["requests", "failed_attempts", "loop_retries", "input_tokens", "output_tokens", "cost_usd"] {
+                obj.entry(f.to_string()).or_insert(serde_json::json!(0));
+            }
+            for f in ["avg_duration_ms", "avg_ttft_ms", "last_used_ts", "last_outcome", "last_error_class"] {
+                obj.entry(f.to_string()).or_insert(serde_json::Value::Null);
+            }
+            obj.entry("error_classes".to_string()).or_insert(serde_json::json!([]));
+        }
+
+        Ok(out)
+    }
+
+    /// The member that served this group's most recent successful request
+    /// (`"<channel_id>::<upstream_model>"`), or None when the group has never had
+    /// a success. NOTE: "active" is last-success-based, NOT in-flight — a
+    /// long-running stream does not change it until it lands.
+    pub fn active_member_key(&self, group_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT final_channel || '::' || final_upstream_model FROM request_logs \
+             WHERE group_id = ?1 AND status = 'success' AND final_channel IS NOT NULL AND final_upstream_model IS NOT NULL \
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        Ok(stmt.query_row(params![group_id], |r| r.get::<_, String>(0)).optional()?)
     }
 
     /// `group_id` narrows every figure to one routing group; `None` = global.
@@ -238,7 +385,7 @@ impl Store {
             // requests (a failed attempt's duration is dominated by timeouts and
             // would misrepresent latency), and with no successes at all they stay
             // NULL so the console shows "—" instead of a bogus 0ms.
-            "SELECT json_object('requests',COUNT(*),'success',SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),'exhausted',SUM(CASE WHEN status='exhausted' THEN 1 ELSE 0 END),'aborted',SUM(CASE WHEN status='aborted' THEN 1 ELSE 0 END),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cache_read_tokens',COALESCE(SUM(cache_read_tokens),0),'cache_creation_tokens',COALESCE(SUM(cache_creation_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'avg_ttft_ms',ROUND(AVG(CASE WHEN status='success' THEN ttft_ms END))) FROM request_logs{scope}"
+            "SELECT json_object('requests',COUNT(*),'success',SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),'exhausted',SUM(CASE WHEN status='exhausted' THEN 1 ELSE 0 END),'aborted',SUM(CASE WHEN status='aborted' THEN 1 ELSE 0 END),'loop_retries',COALESCE(SUM(loop_retries),0),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cache_read_tokens',COALESCE(SUM(cache_read_tokens),0),'cache_creation_tokens',COALESCE(SUM(cache_creation_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'avg_ttft_ms',ROUND(AVG(CASE WHEN status='success' THEN ttft_ms END))) FROM request_logs{scope}"
         ))?;
         let v: String = match group_id {
             Some(g) if !g.is_empty() => stmt.query_row(params![g], |r| r.get(0))?,

@@ -61,6 +61,11 @@
 /tools/accept-task19.mjs
 /tools/verify-weight-edit.mjs
 /tools/verify-drag-sort.mjs
+/tools/fake-loop-upstream.mjs
+/tools/verify-loop-guard.mjs
+/tools/verify-loop-guard.result.json
+/tools/verify-group-routing.mjs
+/tools/verify-group-routing.result.json
 
 # ── 根目录截图证据（开发期产物）─────────────────────────────
 /*.png
@@ -70,3 +75,12 @@
 .idea/
 Thumbs.db
 Desktop.ini
+
+# ── 分组级配置 UI 验收探针与截图（本机证据，不入库）────────
+/tools/verify-group-overrides-ui.mjs
+/tools/verify-group-overrides-ui.result.json
+/tools/_ui-baseline.json
+/tools/ui-settings-own.png
+/tools/ui-settings-saved-own.png
+/tools/ui-group-detail.png
+/tools/ui-model-detail.png

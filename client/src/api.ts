@@ -13,6 +13,18 @@ export interface RetryConfig {
   /** 预留余量：max_attempts × attempt_deadline_ms + reserve_ms ≤ total_deadline_ms */
   reserve_ms: number;
   cooldown_wait: boolean;
+  /** 死循环拦截总开关。默认 true。 */
+  loop_guard_enabled: boolean;
+  /** 提交前至少累积多少字符才开始做退化检测；同时就是首字节推迟量（默认 64）。 */
+  loop_guard_min_chars: number;
+  /** 被重复的单元至少多长才算退化（默认 24）。 */
+  loop_guard_repeat_min_chars: number;
+  /** 重复部分占检测窗口的比例阈值，0~1（默认 0.75）。 */
+  loop_guard_repeat_ratio: number;
+  /** 同一单元重复达到多少次判定为退化（默认 4）。 */
+  loop_guard_max_repeats: number;
+  /** 检测窗口字符数上限，超出只保留尾部（默认 4000）。 */
+  loop_guard_window_chars: number;
 }
 export interface AdminConfig {
   listen: ListenConfig;
@@ -39,8 +51,32 @@ export interface ModelBinding {
 }
 export interface TierMember { model_id: string; weight: number }
 export interface Tier { level: number; members: TierMember[] }
-export interface Group { id: string; name: string; exposed_models: string[]; tiers: Tier[] }
+export interface Group { id: string; name: string; exposed_models: string[]; tiers: Tier[]; overrides?: GroupOverrides }
 export interface ApiKey { key: string; group_id: string; name: string; enabled: boolean }
+
+export interface GroupOverrides { retry?: RetryConfig | null }
+export interface GroupMember {
+  /** "<channel_id>::<upstream_model>" — stable row id used by nav.modelKey. */
+  key: string; model_id: string; tier: number; slot: number; weight: number;
+  channel_id: string; channel_name: string; upstream_model: string; exposed_model: string;
+  enabled: boolean; cooling: boolean; cooling_until_ms: number | null; cooldown_kind: string | null;
+  requests: number; failed_attempts: number; loop_retries: number;
+  error_classes: { error_class: string; n: number }[];
+  avg_duration_ms: number | null; avg_ttft_ms: number | null;
+  input_tokens: number; output_tokens: number; cost_usd: number;
+  last_used_ts: string | null; last_outcome: string | null; last_error_class: string | null;
+  active: boolean;
+}
+export interface GroupMembersPayload {
+  group_id: string; group_name: string; active_key: string | null;
+  /** 该分组的有效重试配置（跟随全局或分组自己的覆盖）。 */
+  retry: RetryConfig;
+  /** "group" = 用了分组自己的配置；"global" = 跟随全局。 */
+  retry_source: "group" | "global";
+  /** 全局那份，便于「跟随全局」时预览。 */
+  global_retry: RetryConfig;
+  members: GroupMember[];
+}
 
 export interface SwitchLog {
   ts: string; request_id: string; group_id: string; attempt_no: number; tier: number;
@@ -54,6 +90,8 @@ export interface RequestLog {
   attempts: number; input_tokens: number; output_tokens: number;
   cache_read_tokens: number; cache_creation_tokens: number;
   cost_usd: number; wasted_cost_usd: number; duration_ms: number; ttft_ms: number;
+  /** 本次请求因输出退化被内部丢弃并重试的次数。 */
+  loop_retries: number;
 }
 export interface CooldownRow {
   channel_id: string; upstream_model: string; kind: string; cooling_until_ms: number;
@@ -65,7 +103,8 @@ export interface GroupStatRow {
   avg_duration_ms: number | null; models: number;
 }
 export interface StatsPayload {
-  summary: Record<string, number | string | null>;
+  /** 汇总计数；loop_retries 为死循环拦截（输出退化）累计次数。 */
+  summary: Record<string, number | string | null> & { loop_retries?: number };
   by_model: Record<string, number | string | null>[];
   /** Always the full cross-group overview, independent of group_id. */
   by_group: GroupStatRow[];
@@ -130,6 +169,10 @@ export const api = {
   // here — otherwise the URL becomes "/admin/api/stats&group_id=..." → 404.
   stats: (groupId?: string): Promise<StatsPayload> =>
     req("GET", "/admin/api/stats" + (groupId ? "?group_id=" + encodeURIComponent(groupId) : "")),
+  // Same trap as /stats above: this endpoint has no other parameter, so the
+  // "?" is explicit here — qs() returns a leading "&".
+  groupMembers: (groupId: string): Promise<GroupMembersPayload> =>
+    req("GET", "/admin/api/group-members?group_id=" + encodeURIComponent(groupId)),
   health: (): Promise<{ cooldowns: CooldownRow[] }> => req("GET", "/admin/api/health"),
   testChannel: (channelId: string, upstreamModel?: string): Promise<TestChannelResult> =>
     req("POST", "/admin/api/test-channel", { channel_id: channelId, upstream_model: upstreamModel }),

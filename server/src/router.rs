@@ -39,6 +39,9 @@ pub struct Budget {
     pub first_event_timeout: Duration,
     pub chunk_idle_timeout: Duration,
     pub reserve: Duration,
+    /// Degenerate-output detection for the PRE-COMMIT window (never applied
+    /// after the first frame is committed).
+    pub loop_guard: crate::loopguard::LoopCfg,
 }
 
 /// I4: does the configured attempt budget actually fit inside the total
@@ -91,12 +94,51 @@ pub fn build_budget(rc: &RetryConfig, started: Instant) -> Budget {
         first_event_timeout: Duration::from_millis(rc.first_event_timeout_ms),
         chunk_idle_timeout: Duration::from_millis(rc.chunk_idle_timeout_ms),
         reserve,
+        loop_guard: crate::loopguard::LoopCfg::from_retry(rc),
     }
+}
+
+/// Is `requested` routed through the WILDCARD path for this group?
+///
+/// Task-27 deliverable 1: a client may name the group itself (its `name` or its
+/// `id`) instead of one of the group's exposed models, and then every enabled
+/// member of every tier is a candidate.
+///
+/// EXACT WINS: when the requested string is one of the group's `exposed_models`
+/// this is false, even if a group happens to be named like its own model. That
+/// keeps the pre-existing narrow semantics byte-identical for every name that
+/// used to work.
+pub fn is_wildcard(group: &Group, requested: &str) -> bool {
+    if group.exposed_models.iter().any(|m| m == requested) {
+        return false;
+    }
+    requested == group.name || requested == group.id
 }
 
 /// Build the ordered candidate plan for (group, exposed_model). Snapshot at
 /// request start: cooldown state consulted HERE, never re-read mid-request.
+///
+/// Two modes, decided here so every caller (proxy.rs has four call sites) gets
+/// the right one without knowing about wildcards:
+///   * `exposed_model` is one of the group's exposed models  -> narrow plan
+///     (only that model's members), the pre-task-27 behaviour;
+///   * otherwise, when the name is the group's `name`/`id` -> wildcard plan
+///     (every enabled member of every tier);
+///   * anything else -> an empty plan, i.e. Terminal::NoCandidate. routes.rs
+///     already answers 404 for that case before the walk starts.
+///
+/// Order and cooldown semantics are shared by both modes (see `plan_with`).
 pub fn build_plan(cfg: &Config, group: &Group, exposed_model: &str, health: &HealthRegistry) -> Plan {
+    if is_wildcard(group, exposed_model) {
+        return plan_with(cfg, group, &|_m: &ModelBinding| true, health);
+    }
+    plan_with(cfg, group, &|m: &ModelBinding| m.exposed == exposed_model, health)
+}
+
+/// The shared plan builder. `keep` is the ONLY difference between the narrow
+/// and the wildcard plan: the tier walk, the declared/weighted member order, the
+/// (channel, upstream) dedupe and the runnable/cooling split are identical.
+fn plan_with(cfg: &Config, group: &Group, keep: &dyn Fn(&ModelBinding) -> bool, health: &HealthRegistry) -> Plan {
     let mut seen = std::collections::HashSet::new();
     let mut out = vec![];
     let mut tiers: Vec<&crate::config::Tier> = group.tiers.iter().collect();
@@ -113,7 +155,7 @@ pub fn build_plan(cfg: &Config, group: &Group, exposed_model: &str, health: &Hea
         // tiers[].members untouched: no weight sort, no model_id sort.
         for member in members {
             let Some(m): Option<&ModelBinding> = cfg.find_model(&member.model_id) else { continue };
-            if !m.enabled || m.exposed != exposed_model { continue }
+            if !m.enabled || !keep(m) { continue }
             let Some(ch) = cfg.find_channel(&m.channel_id) else { continue };
             if !ch.enabled { continue }
             let key = (m.channel_id.clone(), m.upstream.clone());
@@ -285,6 +327,10 @@ pub enum ProxyError {
     ErrorBody(String),
     NotSse(String),
     EmptyResponse,
+    /// The stream repeated the same short unit so many times that the output is
+    /// useless. Raised only before the first frame is committed, so the client
+    /// has seen nothing and another candidate can answer instead.
+    DegenerateOutput { unit: String, repeats: u32 },
     ClientGone,
 }
 
@@ -361,6 +407,10 @@ pub fn classify_failure(err: &ProxyError, candidate: &Candidate) -> (Attribution
         ProxyError::ErrorBody(_) => transient(CooldownKey::scoped(&candidate.channel_id, &candidate.upstream_model), Duration::from_secs(15), "upstream_error_body"),
         ProxyError::NotSse(_) => transient(CooldownKey::scoped(&candidate.channel_id, &candidate.upstream_model), Duration::from_secs(15), "not_sse_garbage"),
         ProxyError::EmptyResponse => transient(CooldownKey::scoped(&candidate.channel_id, &candidate.upstream_model), Duration::from_secs(15), "empty_response"),
+        // Same treatment as an empty response: the attempt produced nothing
+        // usable, so the candidate is put on a short scoped cooldown and the
+        // walk moves on to another one.
+        ProxyError::DegenerateOutput { .. } => transient(CooldownKey::scoped(&candidate.channel_id, &candidate.upstream_model), Duration::from_secs(15), "degenerate_output"),
         ProxyError::ClientGone => (Attribution::None, "client_aborted"),
     }
 }

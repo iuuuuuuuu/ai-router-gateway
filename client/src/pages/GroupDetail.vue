@@ -8,10 +8,11 @@ import {
   Activity, Coins, KeyRound, RefreshCw, ScrollText, ShieldAlert, Waypoints,
 } from "@lucide/vue";
 import {
-  api, type CooldownRow as ApiCooldownRow, type Group, type RequestLog, type StatsPayload, type SwitchLog,
+  api, type CooldownRow as ApiCooldownRow, type Group, type GroupMember, type GroupMembersPayload,
+  type RequestLog, type StatsPayload, type SwitchLog,
 } from "../api";
 import { apiKeys, bindingLabel, channelName, models, state } from "../store";
-import { closeGroupDetail } from "../nav";
+import { closeGroupDetail, openModelDetail } from "../nav";
 import { Alert, Badge, Btn, Card, Empty, PageHeader, Spinner, TToggle } from "../components/ui";
 
 type Tone = "gray" | "teal" | "ok" | "warn" | "err" | "brand";
@@ -35,6 +36,50 @@ const TIER_NAMES = ["一级", "二级", "三级", "四级", "五级", "六级"];
  * 开启时按权重降序，显示「权重 N」。权重两种模式下都能在「分组路由」页手改。
  */
 const autoWeight = computed(() => state.cfg?.auto_weight ?? false);
+
+/* --------------------- 成员级真实数据（在用 / 请求数 / 失败） --------------------- */
+// 来自 GET /admin/api/group-members：member.active = 该分组最近一次成功请求的落点，
+// requests / failed_attempts 是服务端按该成员聚合的真实计数。端点缺失或请求失败时
+// memberPayload 保持 null，chip 退化成「0 次」且不显示「使用中」，整页其余部分照常。
+const memberPayload = ref<GroupMembersPayload | null>(null);
+// 同一 model_id 可跨层出现，成员一律用 (tier, model_id) 复合定位。
+function memberOf(tierLevel: number, modelId: string): GroupMember | null {
+  return memberPayload.value?.members.find(m => m.model_id === modelId && m.tier === tierLevel) ?? null;
+}
+function isMemberActive(tierLevel: number, modelId: string): boolean {
+  const p = memberPayload.value;
+  const m = memberOf(tierLevel, modelId);
+  if (!p || !m) return false;
+  return m.active || (!!p.active_key && p.active_key === m.key);
+}
+function memberRequests(tierLevel: number, modelId: string): number {
+  return memberOf(tierLevel, modelId)?.requests ?? 0;
+}
+function memberFailed(tierLevel: number, modelId: string): number {
+  return memberOf(tierLevel, modelId)?.failed_attempts ?? 0;
+}
+/** 数字徽章的 title：把「成员数据不可用」和「真的是 0 次」分开说。 */
+function memberRequestsTitle(tierLevel: number, modelId: string): string {
+  if (!memberPayload.value) return "成员数据不可用";
+  const n = memberRequests(tierLevel, modelId);
+  return n > 0 ? `本分组内该成员成功请求 ${n} 次` : "本分组内该成员成功请求 0 次";
+}
+/** 最近一次成功请求落在哪个成员（active_key 指向的那个）。 */
+const activeMember = computed<GroupMember | null>(() => {
+  const p = memberPayload.value;
+  if (!p?.active_key) return null;
+  return p.members.find(m => m.key === p.active_key) ?? null;
+});
+/** 「最多 N 轮」：优先用该分组实际生效的重试配置（task-28 起 group-members 会带），否则回落全局。 */
+const maxCycles = computed(() => memberPayload.value?.retry?.max_cycles ?? state.cfg?.retry.max_cycles ?? 2);
+/** chip 点击进模型详情：优先用服务端 key；端点缺失时用本地绑定推一个等价 key。 */
+function openMember(tierLevel: number, modelId: string) {
+  const fromServer = memberOf(tierLevel, modelId)?.key;
+  const b = models.value.find(x => x.id === modelId);
+  const key = fromServer || (b ? `${b.channel_id}::${b.upstream}` : "");
+  if (!key) return;
+  openModelDetail({ groupId: props.group.id, key, modelId });
+}
 
 /* ------------------------------ 格式化兜底 ------------------------------ */
 // 与 Logs.vue / Stats.vue 保持同一份实现（两页各自复制了一份，这里照此复制）。
@@ -96,6 +141,10 @@ function errorClass(v: unknown): { text: string; tone: Tone } {
   if (!s || low === "none" || low === "null") return { text: "", tone: "warn" };
   // "committed" 是后端成功行的占位值（server/src/proxy.rs）→ 成功语义用 ok 色调。
   if (low === "committed") return { text: s, tone: "ok" };
+  // 死循环拦截（server/src/proxy.rs 写 error_class: "degenerate_output"）：网关在提交前
+  // 判定这次尝试是退化输出，直接丢弃并换下一个候选 —— 是「这次尝试失败」而非整体失败，
+  // 所以用 warn 色调 + 中文标签，和上面的 committed 一样走显式映射。
+  if (low === "degenerate_output") return { text: "输出退化", tone: "warn" };
   return { text: s, tone: "warn" };
 }
 function statusInfo(status: unknown): { label: string; tone: Tone } {
@@ -206,17 +255,19 @@ async function load(silent = false) {
   if (!silent) loading.value = true;
   err.value = "";
   try {
-    const [s, sw, rq, hl] = await Promise.all([
+    const [s, sw, rq, hl, gm] = await Promise.all([
       api.stats(g.id),
       api.switchLogs(LIMIT, undefined, g.id),
       api.requestLogs(LIMIT, undefined, g.id),
       api.health(),
+      // 成员数据失败不拖垮整页：单独吞掉错误，退化成「0 次 + 无使用中」。
+      api.groupMembers(g.id).catch(() => null),
     ]);
     stats.value = (s ?? null) as StatsPayload | null;
     switchRows.value = Array.isArray(sw) ? sw : [];
     requestRows.value = Array.isArray(rq) ? rq : [];
     cooldowns.value = Array.isArray(hl?.cooldowns) ? hl.cooldowns : [];
-    lastAt.value = Date.now();
+    memberPayload.value = (gm ?? null) as GroupMembersPayload | null;
   } catch (e: any) {
     err.value = String(e?.message || e);
   } finally {
@@ -227,6 +278,7 @@ async function load(silent = false) {
 
 function reset() {
   stats.value = null;
+  memberPayload.value = null;
   switchRows.value = [];
   requestRows.value = [];
   cooldowns.value = [];
@@ -406,6 +458,17 @@ function shareText(row: Row): string {
       </template>
     </PageHeader>
 
+    <!-- 当前实际在用的成员（服务端最近一次成功请求的落点） -->
+    <div class="flex flex-wrap items-center gap-2 text-[12px]" data-test="gd-active-model">
+      <span class="text-ink-3">当前使用</span>
+      <Badge v-if="activeMember" tone="teal">
+        {{ activeMember.channel_name }} · {{ activeMember.upstream_model }}
+      </Badge>
+      <span v-else class="text-ink-3">—（本分组还没有成功请求）</span>
+      <span v-if="activeMember?.last_used_ts" class="ml-auto font-mono text-[11.5px] text-ink-3">
+        最近成功 {{ fmtTs(activeMember.last_used_ts) }}
+      </span>
+    </div>
     <!-- ------------------------------ 吸顶页签条 ------------------------------ -->
     <div class="sticky top-0 z-10 -mx-5 mb-3.5 flex flex-wrap items-center gap-2 border-b border-line bg-app px-5">
       <button
@@ -493,11 +556,27 @@ function shareText(row: Row): string {
               <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
                 <template v-if="t.members?.length">
                   <div
-                    v-for="(m, mi) in t.members" :key="m.model_id"
-                    class="flex items-center gap-2 rounded-[10px] border border-line bg-app px-2.5 py-1"
+                    v-for="(m, mi) in t.members" :key="t.level + '-' + m.model_id"
+                    data-test="gd-member-chip"
+                    class="flex cursor-pointer items-center gap-2 rounded-[10px] border border-line bg-app px-2.5 py-1 transition-colors hover:border-teal-300"
+                    :title="'查看 ' + bindingLabel(m.model_id) + ' 的详情'"
+                    @click="openMember(t.level, m.model_id)"
                   >
                     <span class="font-mono text-[12px] text-ink">{{ bindingLabel(m.model_id) }}</span>
                     <Badge tone="gray">{{ autoWeight ? `权重 ${m.weight}` : `顺序 ${mi + 1} · 权重 ${m.weight}` }}</Badge>
+                    <Badge
+                      tone="gray"
+                      data-test="gd-member-requests"
+                      :title="memberRequestsTitle(t.level, m.model_id)"
+                    >{{ memberRequests(t.level, m.model_id) }} 次</Badge>
+                    <Badge v-if="memberFailed(t.level, m.model_id) > 0" tone="err" data-test="gd-member-failed">
+                      失败 {{ memberFailed(t.level, m.model_id) }}
+                    </Badge>
+                    <span
+                      v-if="isMemberActive(t.level, m.model_id)"
+                      data-test="gd-member-active"
+                      class="inline-flex items-center gap-1 text-[11.5px] font-medium text-teal-700"
+                    ><span class="h-1.5 w-1.5 rounded-full bg-teal-500"></span>使用中</span>
                   </div>
                 </template>
                 <span v-else class="py-1 text-[12px] text-ink-3">该级无成员</span>
@@ -505,6 +584,11 @@ function shareText(row: Row): string {
             </div>
           </div>
           <p v-else class="px-4 py-3.5 text-[12px] text-ink-3">未配置层级。</p>
+          <p
+            v-if="sortedTiers.length"
+            class="border-t border-line-soft px-4 py-2.5 text-[11.5px] leading-4 text-ink-3"
+            data-test="gd-tier-note"
+          >↑ 全部失败 → 回到一级（最多 {{ maxCycles }} 轮）</p>
         </Card>
 
         <!-- 密钥列表（脱敏） -->
@@ -585,7 +669,7 @@ function shareText(row: Row): string {
           <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
             <Coins :size="15" class="text-ink-3" />
             <h2 class="text-[13.5px] font-semibold text-ink">按模型用量</h2>
-            <span class="ml-auto text-[12px] text-ink-3">{{ byModel.length }} 个模型 · 按成本降序</span>
+            <span class="ml-auto text-[12px] text-ink-3">{{ byModel.length }} 个模型 · 按成本降序 · 按 暴露模型 × 上游 × 渠道 聚合</span>
           </div>
 
           <Empty v-if="!byModel.length" title="暂无用量数据" hint="本分组产生请求并成功计费后，这里会按模型列出 token 与花费">

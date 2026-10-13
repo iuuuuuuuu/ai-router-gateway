@@ -38,6 +38,27 @@ pub struct RetryConfig {
     pub reserve_ms: u64,
     #[serde(default = "d_true")]
     pub cooldown_wait: bool,
+    /// Loop guard (degenerate output detection) master switch. Disabling it also
+    /// removes the holdback, so the first frame commits immediately.
+    #[serde(default = "d_true")]
+    pub loop_guard_enabled: bool,
+    /// Characters buffered before the first frame is committed (= holdback).
+    /// Larger catches longer repeats, but delays the first byte by that many
+    /// generated characters.
+    #[serde(default = "d_loop_guard_min_chars")]
+    pub loop_guard_min_chars: usize,
+    /// Minimum number of characters the repetition must cover.
+    #[serde(default = "d_loop_guard_repeat_min_chars")]
+    pub loop_guard_repeat_min_chars: usize,
+    /// Share of the window the repetition must cover (0, 1].
+    #[serde(default = "d_loop_guard_repeat_ratio")]
+    pub loop_guard_repeat_ratio: f64,
+    /// How many times the unit must repeat before it counts as degenerate.
+    #[serde(default = "d_loop_guard_max_repeats")]
+    pub loop_guard_max_repeats: u32,
+    /// Rolling character window the detector keeps.
+    #[serde(default = "d_loop_guard_window_chars")]
+    pub loop_guard_window_chars: usize,
 }
 
 fn d_max_attempts() -> u32 { 6 }
@@ -51,6 +72,11 @@ fn d_first_event_timeout_ms() -> u64 { 8_000 }
 fn d_chunk_idle_timeout_ms() -> u64 { 15_000 }
 fn d_reserve_ms() -> u64 { 3_000 }
 fn d_true() -> bool { true }
+fn d_loop_guard_min_chars() -> usize { 64 }
+fn d_loop_guard_repeat_min_chars() -> usize { 24 }
+fn d_loop_guard_repeat_ratio() -> f64 { 0.75 }
+fn d_loop_guard_max_repeats() -> u32 { 4 }
+fn d_loop_guard_window_chars() -> usize { 4000 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
@@ -65,6 +91,12 @@ impl Default for RetryConfig {
             chunk_idle_timeout_ms: d_chunk_idle_timeout_ms(),
             reserve_ms: d_reserve_ms(),
             cooldown_wait: true,
+            loop_guard_enabled: true,
+            loop_guard_min_chars: d_loop_guard_min_chars(),
+            loop_guard_repeat_min_chars: d_loop_guard_repeat_min_chars(),
+            loop_guard_repeat_ratio: d_loop_guard_repeat_ratio(),
+            loop_guard_max_repeats: d_loop_guard_max_repeats(),
+            loop_guard_window_chars: d_loop_guard_window_chars(),
         }
     }
 }
@@ -150,6 +182,21 @@ pub struct Tier {
     pub members: Vec<TierMember>,
 }
 
+/// Per-group overrides of the global settings.
+///
+/// A field left at its default (here: `None`) means "follow the global
+/// config"; only a group that actually sets one changes behaviour, so every
+/// other group keeps behaving exactly like before this field existed.
+///
+/// NOTE: `retry` is deliberately NOT skipped when serializing — `None` must
+/// come back out as `"retry": null`, because the console tells "has its own
+/// config" from "follows the global one" by looking at this very field.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GroupOverrides {
+    #[serde(default)]
+    pub retry: Option<RetryConfig>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Group {
     pub id: String,
@@ -157,6 +204,9 @@ pub struct Group {
     /// Exposed model names this group answers for.
     pub exposed_models: Vec<String>,
     pub tiers: Vec<Tier>,
+    /// Optional per-group settings; everything absent follows `Config::retry`.
+    #[serde(default)]
+    pub overrides: GroupOverrides,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +264,17 @@ impl Config {
     pub fn find_model(&self, id: &str) -> Option<&ModelBinding> {
         self.models.iter().find(|m| m.id == id)
     }
+}
+
+/// The retry settings that are in force for ONE group.
+///
+/// A group that carries its own `overrides.retry` uses it verbatim; every other
+/// group borrows the global `cfg.retry` — the same reference, so nothing can
+/// drift between the two paths. Callers must pass overrides through
+/// `crate::router::validate_budget` before saving (a group budget that violates
+/// the deadline invariants would otherwise be accepted here and only fail later).
+pub fn effective_retry<'a>(cfg: &'a Config, group: &'a Group) -> &'a RetryConfig {
+    group.overrides.retry.as_ref().unwrap_or(&cfg.retry)
 }
 
 /// Monotonic config version, bumped on every published swap.

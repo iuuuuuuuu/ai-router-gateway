@@ -72,6 +72,10 @@ function errorClass(v: unknown): { text: string; tone: Tone } {
   // "committed" 是后端成功行的占位值（server/src/proxy.rs:148,169 写 error_class: "committed"），
   // 属成功语义 → 与 outcome 一致用 ok 色调，避免成功行被渲染成 warn 徽章。
   if (low === "committed") return { text: s, tone: "ok" };
+  // 死循环拦截（server/src/proxy.rs 写 error_class: "degenerate_output"）：网关在提交前
+  // 判定这次尝试是退化输出，直接丢弃并换下一个候选 —— 是「这次尝试失败」而非整体失败，
+  // 所以用 warn 色调 + 中文标签，和上面的 committed 一样走显式映射。
+  if (low === "degenerate_output") return { text: "输出退化", tone: "warn" };
   return { text: s, tone: "warn" };
 }
 function statusInfo(status: unknown): { label: string; tone: Tone } {
@@ -241,7 +245,10 @@ onUnmounted(() => {
         共 {{ count }} 条记录<template v-if="filterLabel"> · {{ filterLabel }}</template>
         <span v-if="lastAt" class="ml-1 font-mono text-[11.5px]">· 最后更新 {{ fmtClock(lastAt) }}</span>
       </div>
-      <div class="w-[150px]">
+      <!-- data-test 必须挂在包裹 div 上：reka-ui 的 SelectRoot 是 inheritAttrs:false 且未 v-bind="$attrs"，
+           挂在 <TSelect> 上的 attrs 会在 SelectRoot 处被丢掉，不会到达 button[role=combobox]。
+           包裹 div 是稳定的真实 DOM 节点，探针用 [data-test=log-group-filter] button[role=combobox] 定位。 -->
+      <div class="w-[150px]" data-test="log-group-filter">
         <TSelect v-model="groupId" size="sm" :options="groupOptions" placeholder="全部分组" />
       </div>
       <div class="w-[220px]">
@@ -328,7 +335,7 @@ onUnmounted(() => {
                 <Badge :tone="outcomeInfo(row.outcome).tone">{{ outcomeInfo(row.outcome).label }}</Badge>
               </td>
               <td class="whitespace-nowrap px-3 py-2">
-                <Badge v-if="errorClass(row.error_class).text" :tone="errorClass(row.error_class).tone">
+                <Badge v-if="errorClass(row.error_class).text" :tone="errorClass(row.error_class).tone" data-test="switch-error-class">
                   <span class="font-mono text-[10.5px]">{{ errorClass(row.error_class).text }}</span>
                 </Badge>
                 <span v-else class="text-ink-3">—</span>

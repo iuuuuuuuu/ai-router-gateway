@@ -70,7 +70,18 @@ pub async fn list_models(State(state): State<crate::proxy::AppState>, headers: H
         return error_response(EntryProtocol::Openai, StatusCode::UNAUTHORIZED, "invalid_api_key", "key group missing");
     };
     let now_ms = crate::store::now_ms() as u64;
-    let data: Vec<Value> = group.exposed_models.iter().map(|m| json!({
+    // Task-27 deliverable 1b: the group itself is routable as a "model" (the
+    // wildcard path — see router::is_wildcard), so a client must be able to
+    // DISCOVER that name. The group's own exposed models come first, then the
+    // group name and the group id, de-duplicated (a group whose name equals one
+    // of its own models, or whose id equals its name, lists it once).
+    let mut ids: Vec<&str> = group.exposed_models.iter().map(|m| m.as_str()).collect();
+    for extra in [group.name.as_str(), group.id.as_str()] {
+        if !ids.contains(&extra) {
+            ids.push(extra);
+        }
+    }
+    let data: Vec<Value> = ids.iter().map(|m| json!({
         "id": m, "object": "model", "created": now_ms / 1000, "owned_by": "gateway",
     })).collect();
     axum::Json(json!({ "object": "list", "data": data })).into_response()
@@ -126,7 +137,13 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
         })
         .unwrap_or_default();
 
-    if !group.exposed_models.iter().any(|m| m == &exposed_model) {
+    // Task-27 deliverable 1: the group's own name/id is routable too (wildcard).
+    // EXACT WINS: an exposed model of this group always keeps the narrow
+    // semantics, even when it happens to equal the group name — that decision
+    // lives in ONE place, router::is_wildcard, which build_plan consults again
+    // below; this guard only decides "404 or not".
+    let wildcard = crate::router::is_wildcard(group, &exposed_model);
+    if !wildcard && !group.exposed_models.iter().any(|m| m == &exposed_model) {
         return error_response(entry, StatusCode::NOT_FOUND, "model_not_found", &format!("model '{exposed_model}' is not exposed to your group"));
     }
 
@@ -155,6 +172,10 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
         state: &state,
         request_id: request_id.clone(),
         group_id: group_id.clone(),
+        // The RAW requested name (exposed model, or the group's name/id on the
+        // wildcard path). proxy.rs uses it for two things only: build_plan's
+        // candidate filter and the echoed `model` field of every client frame —
+        // so a wildcard request keeps echoing the group name the caller sent.
         exposed_model: exposed_model.clone(),
         entry,
         ir: ir_req,
@@ -203,6 +224,11 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
     let final_channel_for_log = result.final_channel.clone();
     let final_model_for_log = result.final_upstream_model.clone();
     let attempts_for_log = result.records.len() as u32;
+    // How many attempts the loop guard threw away before one produced an
+    // answer. Counted here, outside the streaming `tokio::spawn` below, so the
+    // detached task never has to borrow `result`. This is the same predicate
+    // the /admin/api/logs/switch endpoint shows, so the two agree by construction.
+    let loop_retries_for_log = result.records.iter().filter(|r| r.error_class == "degenerate_output").count() as u32;
     let wasted_cost = wasted_of(&snap, &result.records);
 
     match result.success {
@@ -219,6 +245,7 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                 final_channel: final_channel_for_log.clone(),
                 final_upstream_model: final_model_for_log.clone(),
                 attempts: attempts_for_log,
+                loop_retries: loop_retries_for_log,
                 input_tokens: usage.input_tokens as i64,
                 output_tokens: usage.output_tokens as i64,
                 cache_read_tokens: usage.cache_read_tokens as i64,
@@ -254,6 +281,7 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
             let fc = result.final_channel.clone();
             let fum = result.final_upstream_model.clone();
             let recs = result.records.len() as u32;
+            let lr = loop_retries_for_log;
             let dur = duration_ms as i64;
             let ttft = result.ttft_ms.map(|t| t as i64);
             tokio::spawn(async move {
@@ -263,6 +291,7 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                     exposed_model: em, entry_protocol: format!("{entry:?}").to_lowercase(),
                     status: "success".into(), final_channel: fc, final_upstream_model: fum,
                     attempts: recs,
+                    loop_retries: lr,
                     input_tokens: usage.input_tokens as i64, output_tokens: usage.output_tokens as i64,
                     cache_read_tokens: usage.cache_read_tokens as i64, cache_creation_tokens: usage.cache_creation_tokens as i64,
                     cost_usd: 0.0, wasted_cost_usd: 0.0, duration_ms: dur, ttft_ms: ttft.unwrap_or(0),
@@ -277,6 +306,7 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                 exposed_model: exposed_model.clone(), entry_protocol: format!("{entry:?}").to_lowercase(),
                 status: status.into(), final_channel: None, final_upstream_model: None,
                 attempts: result.records.len() as u32,
+                loop_retries: loop_retries_for_log,
                 input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0,
                 cost_usd: 0.0, wasted_cost_usd: wasted_cost,
                 duration_ms: duration_ms as i64, ttft_ms: result.ttft_ms.unwrap_or(0) as i64,

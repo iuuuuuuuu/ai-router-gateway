@@ -234,7 +234,7 @@ pub fn render_stream_event(model: &str, ev: &StreamEvent) -> Vec<(String, Value)
             "type": "message_start",
             "message": {"id": format!("msg_gw{}", uuid::Uuid::new_v4().simple()), "type": "message", "role": "assistant", "model": m, "content": [], "stop_reason": null, "usage": {"input_tokens": 0, "output_tokens": 0}}
         }))],
-        StreamEvent::TextDelta { text } => vec![("content_block_delta".into(), json!({
+        StreamEvent::TextDelta { text, .. } => vec![("content_block_delta".into(), json!({
             "type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}
         }))],
         StreamEvent::ToolUseStart { index, id, name, args } => {

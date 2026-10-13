@@ -35,7 +35,11 @@ pub struct ChatResponse {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Start { model: String },
-    TextDelta { text: String },
+    /// Text destined for the client. `finish` is Some when this same event also
+    /// completes the answer: the loop guard's holdback buffer is flushed by the
+    /// frame that ended the stream, so the completion travels with the text
+    /// instead of being invented later (or lost).
+    TextDelta { text: String, finish: Option<ir::FinishReason> },
     /// A tool call begins. args is Some when the upstream delivered the WHOLE
     /// call (name + complete arguments) in one frame — Gemini's native shape —
     /// and None when the arguments follow as ToolInputDelta events

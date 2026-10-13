@@ -195,7 +195,7 @@ pub fn render_stream_event(_model: &str, ev: &StreamEvent) -> Vec<Value> {
     // Gemini SSE frames each carry a candidates array; we emit one frame per event
     match ev {
         StreamEvent::Start { .. } => vec![],
-        StreamEvent::TextDelta { text } => vec![json!({
+        StreamEvent::TextDelta { text, .. } => vec![json!({
             "candidates": [{"content": {"parts": [{"text": text}], "role": "model"}}]
         })],
         // Gemini's functionCall is whole-package: name + COMPLETE args in ONE

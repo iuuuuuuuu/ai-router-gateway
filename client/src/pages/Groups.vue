@@ -10,13 +10,14 @@ import {
   Alert, Badge, Btn, Card, Empty, Field, IconBtn, Modal,
   TInput, TSelect, TTextarea,
 } from "../components/ui";
-import { openGroupDetail } from "../nav";
+import { openGroupDetail, openModelDetail } from "../nav";
 import {
   apiKeys, bindingLabel, channelName, groups, groupsUsingModel, markDirty, models, state, uid,
 } from "../store";
 import { toast } from "../toast";
 import {
-  api, type Group, type GroupStatRow, type StatsPayload, type Tier, type TierMember,
+  api, type Group, type GroupMember, type GroupMembersPayload, type GroupStatRow,
+  type StatsPayload, type Tier, type TierMember,
 } from "../api";
 
 /* ------------------------------- 展示辅助 ------------------------------- */
@@ -29,12 +30,10 @@ function tierName(level: number): string {
 function tierTone(level: number): "brand" | "gray" {
   return level === 1 ? "brand" : "gray";
 }
-// 「使用中」高亮口径：一级 = 静态优先级最高层（level===1）；
-// 服务端暂无「运行时当前生效层级」数据源（/admin 只有 config / logs / stats / health / test-channel / cooldown/clear，
-// health 是渠道级冷却），故不做动态高亮。
-function isActiveTier(level: number): boolean {
-  return level === 1;
-}
+// 两种「在用」口径并存，别混：
+//  · 成员 chip 的背景色是**静态**口径 —— level===1 表示声明上优先级最高的一层（模板里内联成 t.level === 1）；
+//  · 「使用中」徽章是**真实**口径 —— 来自 /admin/api/group-members 的 member.active（该分组最近一次成功请求的落点），
+//    例如一级全在冷却、请求实际落在二级时，只高亮二级。两者不一致时以真实口径为准。
 function sortedTiers(g: Group): Tier[] {
   return [...(g.tiers ?? [])].sort((a, b) => a.level - b.level);
 }
@@ -45,8 +44,40 @@ function exposedOf(g: Group): string[] {
   return g.exposed_models ?? [];
 }
 
-/** 回环提示里的轮数来自全局重试配置。 */
-const maxCycles = computed(() => state.cfg?.retry.max_cycles ?? 2);
+/* --------------------------- 成员定位与真实在用口径 --------------------------- */
+// 同一 model_id 可以同时出现在多个层级里，所以成员一律用 (tier, model_id) 复合定位，
+// 不能只用 model_id（否则 chip 会取到别层的数字）。
+function memberOf(groupId: string, tierLevel: number, modelId: string): GroupMember | null {
+  const p = membersByGroup.value[groupId];
+  if (!p) return null;
+  return p.members.find(m => m.model_id === modelId && m.tier === tierLevel) ?? null;
+}
+/** 真实在用：以服务端算好的 member.active 为准；缺失时退回 active_key 比对（双保险）。 */
+function isMemberActive(groupId: string, tierLevel: number, modelId: string): boolean {
+  const p = membersByGroup.value[groupId];
+  const m = memberOf(groupId, tierLevel, modelId);
+  if (!p || !m) return false;
+  return m.active || (!!p.active_key && p.active_key === m.key);
+}
+/** 该成员在本分组内的成功请求数；成员数据不可用时是 0，配合 title 说明原因。 */
+function memberRequests(groupId: string, tierLevel: number, modelId: string): number {
+  return memberOf(groupId, tierLevel, modelId)?.requests ?? 0;
+}
+/** 数字徽章的 title：把「没有数据」和「真的是 0 次」分开说，避免误导成「从来没请求过」。 */
+function memberRequestsTitle(groupId: string, tierLevel: number, modelId: string): string {
+  const p = membersByGroup.value[groupId];
+  if (!p) return "成员数据不可用";
+  const n = memberOf(groupId, tierLevel, modelId)?.requests ?? 0;
+  return n > 0 ? `本分组内该成员成功请求 ${n} 次` : "本分组内该成员成功请求 0 次";
+}
+/** chip 点击进模型详情：优先用服务端 key；端点缺失时用本地绑定推一个等价 key。 */
+function openMember(groupId: string, tierLevel: number, modelId: string) {
+  const fromServer = memberOf(groupId, tierLevel, modelId)?.key;
+  const b = models.value.find(x => x.id === modelId);
+  const key = fromServer || (b ? `${b.channel_id}::${b.upstream}` : "");
+  if (!key) return;
+  openModelDetail({ groupId, key, modelId });
+}
 
 /**
  * 自动权重开关（AdminConfig.auto_weight，默认关）：
@@ -58,6 +89,10 @@ const maxCycles = computed(() => state.cfg?.retry.max_cycles ?? 2);
  */
 const autoWeight = computed(() => state.cfg?.auto_weight ?? false);
 
+// 「最多 N 轮」里的 N 是全局 retry 的值。分组有自己 overrides.retry 时（task-28）应以
+// groupMembers 响应里的 retry.max_cycles 为准 —— 等该端点带 retry 字段后再切换。
+const maxCycles = computed(() => state.cfg?.retry.max_cycles ?? 2);
+
 /* ------------------------------ 分组统计 ------------------------------ */
 // 数据来自 GET /admin/api/stats（不传 group_id = 全量：summary 是全局汇总，
 // by_group 恒为跨分组概览，字段见 server/src/store.rs:275）。
@@ -66,6 +101,35 @@ const stats = ref<StatsPayload | null>(null);
 const statsErr = ref("");
 const statsLoading = ref(false);
 const statsAt = ref(0);
+
+/* --------------------------- 成员级数据（真实在用 / 请求数） --------------------------- */
+// 数据来自 GET /admin/api/group-members（每个分组一份，进页面并发拉一次）。
+// 服务端还没这个端点（老版本 / 404）或单个分组失败时整块静默降级：chip 显示「0 次」且不显示
+// 「使用中」徽章，不弹错、不写 statsErr，页面其余部分照常。
+const membersByGroup = ref<Record<string, GroupMembersPayload>>({});
+// 防重入 + 「跑完再补一次」：配置在页面停留期间被换掉（顶栏「重新加载配置」）时，
+// 键集合会变，必须在当前这轮结束后再拉一次，否则会漏掉一次刷新。
+let membersRun: Promise<void> | null = null;
+let membersAgain = false;
+async function loadGroupMembers() {
+  if (!groups.value.length) { membersByGroup.value = {}; return; }
+  if (membersRun) { membersAgain = true; return membersRun; }
+  membersRun = (async () => {
+    const pairs = await Promise.all(groups.value.map(async (g) => {
+      try { return [g.id, await api.groupMembers(g.id)] as const; }
+      catch { return null; } // 单组失败不拖累其它组，也不冒泡成未捕获异常
+    }));
+    const out: Record<string, GroupMembersPayload> = {};
+    for (const p of pairs) if (p) out[p[0]] = p[1];
+    membersByGroup.value = out;
+  })();
+  try { await membersRun; } finally {
+    membersRun = null;
+    if (membersAgain) { membersAgain = false; void loadGroupMembers(); }
+  }
+}
+// 分组集合变了（例如点过「重新加载配置」）就重新拉，避免旧 group_id 的陈旧数字。
+watch(() => groups.value.map(g => g.id).join(","), () => { void loadGroupMembers(); });
 
 function statNum(v: unknown): number | null {
   if (v === null || v === undefined || v === "") return null;
@@ -172,7 +236,11 @@ async function loadStats() {
 
 // App.vue 切页是 <Transition> + <component :is>，没有 keep-alive，
 // 每次切回本页都会重新挂载，onMounted 拉一次就够（因此不额外监听路由）。
-onMounted(() => { void loadStats(); });
+// 成员数据（真实在用 / 请求数）与统计并列，各自独立降级。
+onMounted(() => { void loadStats(); void loadGroupMembers(); });
+
+/** 工具条的刷新按钮：统计与成员数据一起重拉（两者都做了防重入）。 */
+function refreshAll() { void loadStats(); void loadGroupMembers(); }
 
 /* ------------------------------- 编辑草稿 ------------------------------- */
 
@@ -660,10 +728,10 @@ function confirmRemoveMember() {
           size="sm"
           variant="ghost"
           data-test="group-stats-refresh"
-          title="重新拉取全量统计"
-          @click="loadStats"
+          title="重新拉取统计与成员数据"
+          @click="refreshAll"
         >
-          <RefreshCw :size="13" :class="statsLoading ? 'animate-spin' : ''" />刷新统计
+          <RefreshCw :size="13" :class="statsLoading ? 'animate-spin' : ''" />刷新数据
         </Btn>
         <Btn variant="primary" size="sm" @click="openNew">
           <Plus :size="13" />添加分组
@@ -760,6 +828,9 @@ function confirmRemoveMember() {
             </Badge>
           </div>
           <p v-else class="text-[12px] text-ink-3">未设置暴露模型</p>
+          <p class="mt-2 text-[11.5px] leading-4 text-ink-3" data-test="group-exposed-hint">
+            分组名「{{ g.name }}」与 id「{{ g.id }}」也可以直接当模型名用：客户端用它们请求时，组内成员按上面的层级自动轮换。
+          </p>
         </div>
 
         <!-- 故障转移层级 -->
@@ -784,25 +855,34 @@ function confirmRemoveMember() {
                   <template v-if="t.members.length">
                     <div
                       v-for="(m, mi) in t.members"
-                      :key="m.model_id"
-                      class="flex items-center gap-2 rounded-[10px] border px-2.5 py-1"
-                      :class="isActiveTier(t.level)
+                      :key="t.level + '-' + m.model_id"
+                      data-test="member-chip"
+                      class="flex cursor-pointer items-center gap-2 rounded-[10px] border px-2.5 py-1 transition-colors hover:border-teal-300"
+                      :class="t.level === 1
                         ? 'border-teal-200 bg-teal-50/60'
                         : 'border-line bg-app'"
+                      :title="'查看 ' + bindingLabel(m.model_id) + ' 的详情'"
+                      @click="openMember(g.id, t.level, m.model_id)"
                     >
                       <span
                         class="font-mono text-[12.5px] text-ink"
-                        :title="optionOf(m.model_id)?.hint ? '上游 ' + optionOf(m.model_id)?.hint : undefined"
                       >{{ bindingLabel(m.model_id) }}</span>
                       <Badge tone="gray" :data-test="autoWeight ? 'badge-weight' : 'badge-order'">
                         {{ autoWeight ? `权重 ${m.weight}` : `顺序 ${mi + 1} · 权重 ${m.weight}` }}
                       </Badge>
+                      <Badge
+                        tone="gray"
+                        :data-test="'member-requests-' + t.level + '-' + m.model_id"
+                        :title="memberRequestsTitle(g.id, t.level, m.model_id)"
+                      >{{ memberRequests(g.id, t.level, m.model_id) }} 次</Badge>
                     </div>
                   </template>
                   <span v-else class="py-1 text-[12px] text-ink-3">该级无成员</span>
                   <span
-                    v-if="isActiveTier(t.level)"
+                    v-if="t.members.some(m => isMemberActive(g.id, t.level, m.model_id))"
+                    data-test="member-active"
                     class="ml-1 inline-flex shrink-0 items-center gap-1 text-[11.5px] font-medium text-teal-700"
+                    title="最近一次成功的请求落在本层"
                   >
                     <span class="h-1.5 w-1.5 rounded-full bg-teal-500"></span>使用中
                   </span>

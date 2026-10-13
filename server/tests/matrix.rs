@@ -323,7 +323,10 @@ async fn t15_bad_client_key() {
     assert_eq!(resp.status().as_u16(), 401);
 }
 
-// ---- 16. /v1/models lists group-exposed models ----
+// ---- 16. /v1/models lists group-exposed models AND the group's own routable name ----
+// Task-27 changed the list on purpose: the group name/id became routable names
+// (wildcard routing), so a client must be able to discover them. The group's own
+// exposed models stay FIRST and in declared order.
 #[tokio::test]
 async fn t16_models_list() {
     let (base, prefixes) = spawn_fake_upstreams(&[Behavior::GoodJson]).await;
@@ -341,7 +344,8 @@ async fn t16_models_list() {
     let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     let ids: Vec<&str> = v.pointer("/data").and_then(|d| d.as_array()).map(|a| a.iter().filter_map(|m| m.get("id").and_then(|i| i.as_str())).collect()).unwrap_or_default();
-    assert_eq!(ids, vec![EXPOSED]);
+    // test_config's group is id "g1" / name "test-group".
+    assert_eq!(ids, vec![EXPOSED, "test-group", "g1"]);
 }
 // ---- 17. REGRESSION: shipped defaults must satisfy I4 and serve requests ----
 // A fresh install has an empty DB, so every request runs on RetryConfig::default().
@@ -399,6 +403,7 @@ async fn t20_group_scoped_logs_and_stats() {
             level: 1,
             members: vec![gw_server::config::TierMember { model_id: "m0".into(), weight: 1 }],
         }],
+        overrides: gw_server::config::GroupOverrides::default(),
     });
     cfg.api_keys.push(gw_server::config::ApiKey { key: "gw-quiet-key".into(), group_id: "g2".into(), name: "quiet".into(), enabled: true });
     let (st, router) = gateway(cfg).await;
@@ -539,7 +544,7 @@ async fn t24_no_candidate_at_all_is_still_404() {
 // Defect B: PUT /admin/api/config must reconcile the health registry.
 // =====================================================================
 use gw_server::health::{Attribution, CooldownKey, HealthRegistry};
-use gw_server::config::{Channel, Config, Group, ModelBinding, Protocol, Tier, TierMember};
+use gw_server::config::{Channel, Config, Group, GroupOverrides, ModelBinding, Protocol, Tier, TierMember};
 
 fn chan(id: &str, key: &str, base: &str) -> Channel {
     Channel {
@@ -571,6 +576,7 @@ fn group1(model_ids: &[&str]) -> Group {
         name: "test-group".into(),
         exposed_models: vec![EXPOSED.into()],
         tiers: vec![Tier { level: 1, members: model_ids.iter().map(|m| TierMember { model_id: (*m).into(), weight: 1 }).collect() }],
+        overrides: GroupOverrides::default(),
     }
 }
 

@@ -1,5 +1,5 @@
 //! Shared test scaffolding: fake upstreams + gateway harness.
-use gw_server::config::{ApiKey, Channel, Config, Group, ModelBinding, Protocol, RetryConfig, Tier, TierMember};
+use gw_server::config::{ApiKey, Channel, Config, Group, GroupOverrides, ModelBinding, Protocol, RetryConfig, Tier, TierMember};
 use gw_server::health::HealthRegistry;
 use gw_server::proxy::AppState;
 use gw_server::store::Store;
@@ -46,6 +46,20 @@ pub enum Behavior {
     GoodOpenAiToolOneFrame,
     /// Anthropic SSE: content_block_start (empty input) + input_json_delta.
     GoodAnthropicToolStream,
+    /// Degenerate: the same short sentence repeated across 40 text frames.
+    DegenerateShortCycle,
+    /// Degenerate: one single character repeated across 80 frames.
+    DegenerateSingleChar,
+    /// Control: ~2000 characters of normal prose that never repeats (a false
+    /// positive here would be worse than the bug this feature fixes).
+    NormalLongText,
+    /// Control: enough normal text to COMMIT, then a degenerate repetition —
+    /// detection is pre-commit only, so this repetition must reach the client
+    /// unchanged (the honest boundary).
+    NormalThenDegenerate,
+    /// B1 regression: text shorter than the holdback, then a tool call. The
+    /// buffered text must be committed WITH the tool call, never dropped.
+    ToolAfterShortText,
 }
 
 async fn handle_beh(beh: Behavior, body: String) -> axum::response::Response {
@@ -168,7 +182,88 @@ async fn handle_beh(beh: Behavior, body: String) -> axum::response::Response {
             let sse: String = frames.iter().map(|(ev, d)| format!("event: {ev}\ndata: {d}\n\n")).collect();
             ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
         }
+        // ---- loop-guard fixtures (Task B) ----
+        // Every fixture below is a VALID OpenAI SSE stream (frames separated by a
+        // blank line, terminated by [DONE]) because the gateway parses it with a
+        // real eventsource decoder, not by string splitting.
+        Behavior::DegenerateShortCycle => {
+            // 40 frames of the SAME short sentence. With min_chars = 64 the
+            // detector's first possible verdict is at exactly 64 buffered
+            // characters = 16 frames of 4 chars, so this is the realistic shape
+            // of a model stuck in a repetition loop.
+            let mut sse = String::new();
+            for _ in 0..40 { sse.push_str(&openai_text_chunk("好问题。")); }
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::DegenerateSingleChar => {
+            // One single character repeated 80 times: the repeated unit is one
+            // char, which the R2/R3/R4 rules must still reject.
+            let mut sse = String::new();
+            for _ in 0..80 { sse.push_str(&openai_text_chunk("哈")); }
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::NormalLongText => {
+            // ~2000 characters of prose that never repeats back-to-back: a false
+            // positive here would be worse than the bug this feature fixes, so
+            // this fixture is the control case for the detector.
+            let alphabet: Vec<char> = "abcdefghijklmnopqrstuvwxyz".chars().collect();
+            let chars: Vec<char> = (0..2000usize).map(|i| alphabet[(i * 7 + i / 26) % 26]).collect();
+            let mut sse = String::new();
+            for chunk in chars.chunks(100) {
+                let frame: String = chunk.iter().collect();
+                sse.push_str(&openai_text_chunk(&frame));
+            }
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::NormalThenDegenerate => {
+            // 120 characters of normal text (past the 64-char holdback, so the
+            // answer COMMITS) followed by a degenerate repetition. Detection is
+            // pre-commit only: this repetition must reach the client unchanged.
+            let mut sse = String::new();
+            for i in 0..10usize {
+                let frame: String = (0..12).map(|k| (b'a' + ((i * 12 + k) % 26) as u8) as char).collect();
+                sse.push_str(&openai_text_chunk(&frame));
+            }
+            for _ in 0..40 { sse.push_str(&openai_text_chunk("好问题。")); }
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::ToolAfterShortText => {
+            // B1 regression fixture: a text prefix SHORTER than the holdback,
+            // followed by a tool call. The buffered text is real content and must
+            // be committed together with the tool call, never dropped.
+            let mut sse = openai_text_chunk("thinking");
+            sse.push_str(&sse_frame(&serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]}}]}).to_string()));
+            sse.push_str(&sse_frame(&serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments": serde_json::json!({"city":"Paris"}).to_string()}}]}}]}).to_string()));
+            sse.push_str(&openai_tail_sse("tool_calls"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
     }
+}
+
+/// `data: <payload>\n\n` — the SSE framing every loop-guard fixture is built from.
+fn sse_frame(payload: &str) -> String {
+    let mut s = String::with_capacity(payload.len() + 8);
+    s.push_str("data: ");
+    s.push_str(payload);
+    s.push('\n');
+    s.push('\n');
+    s
+}
+
+/// One OpenAI-compatible SSE chunk carrying a text delta.
+fn openai_text_chunk(text: &str) -> String {
+    sse_frame(&serde_json::json!({"choices":[{"index":0,"delta":{"content":text}}]}).to_string())
+}
+
+/// Terminal OpenAI-compatible frames: finish_reason + usage, then [DONE].
+fn openai_tail_sse(reason: &str) -> String {
+    let mut s = sse_frame(&serde_json::json!({"choices":[{"index":0,"delta":{},"finish_reason":reason}],"usage":{"prompt_tokens":9,"completion_tokens":4}}).to_string());
+    s.push_str(&sse_frame("[DONE]"));
+    s
 }
 
 /// Mount several behaviors on ONE listener under distinct path prefixes
@@ -217,6 +312,7 @@ pub fn test_retry() -> RetryConfig {
         chunk_idle_timeout_ms: 2_000,
         reserve_ms: 500,
         cooldown_wait: true,
+        ..Default::default()
     }
 }
 
@@ -277,6 +373,8 @@ pub fn test_config(
             name: "test-group".into(),
             exposed_models: vec![exposed.to_string()],
             tiers,
+            // Task-28: no overrides here — this group follows the global retry.
+            overrides: GroupOverrides::default(),
         }],
         api_keys: vec![ApiKey { key: "gw-test-key".into(), group_id: "g1".into(), name: "tester".into(), enabled: true }],
         ..Default::default()
