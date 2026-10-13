@@ -2,8 +2,8 @@
 // 渠道 + 模型合并页：每个渠道一张卡片，展开后是该渠道下挂的可用模型。
 // 模型绑定（暴露名 / 上游名 / 4 档价格 / 启用）的增删改都在本页完成，
 // 原「模型」独立页的能力已并入这里。
-import { computed, reactive, ref } from "vue";
-import { Check, Eye, EyeOff, Layers, Plug, Plus, Trash2 } from "@lucide/vue";
+import { computed, onBeforeUnmount, reactive, ref, watch } from "vue";
+import { Check, CircleAlert, Download, Eye, EyeOff, Layers, ListChecks, LoaderCircle, Plug, Plus, Square, Trash2 } from "@lucide/vue";
 import {
   Alert, Btn, Card, Empty, Field, IconBtn, Modal,
   TInput, TSelect, TTextarea, TToggle,
@@ -208,6 +208,9 @@ function openCreateModel(channelId = "") {
   modelForm.cacheRead = "0";
   modelForm.cacheWrite = "0";
   modelForm.enabled = true;
+  modelMode.value = "manual";
+  resetFetch();
+  fetchChannelId.value = modelForm.channel_id;
   modelModalOpen.value = true;
 }
 
@@ -223,6 +226,8 @@ function openEditModel(m: ModelBinding) {
   modelForm.cacheRead = String(m.price_per_m[2] ?? 0);
   modelForm.cacheWrite = String(m.price_per_m[3] ?? 0);
   modelForm.enabled = m.enabled;
+  modelMode.value = "manual";
+  resetFetch();
   modelModalOpen.value = true;
 }
 
@@ -265,6 +270,147 @@ function saveModel() {
   modelModalOpen.value = false;
   toast.ok(modelEditingId.value ? "模型绑定「" + exposed + "」已更新" : "模型绑定「" + exposed + "」已添加");
 }
+
+/* ------------------------ 添加模型：两种方式 ------------------------ */
+
+/**
+ * 添加方式：
+ *   manual —— 手动填表（沿用既有表单，逐字段指定暴露名/上游名/价格）；
+ *   fetch  —— 从上游的 models 接口拉取真实模型名，勾选后批量导入。
+ * 默认 manual：手动方式字段更全（价格、启用），拉取方式适合一次挂很多模型。
+ */
+const modelMode = ref<"manual" | "fetch">("manual");
+
+/** fetch 方式的数据来源渠道：默认跟手动表单里的渠道保持一致，避免两次选择打架。 */
+const fetchChannelId = ref("");
+const fetching = ref(false);
+const fetchMsg = ref("");
+const fetchErr = ref(false);
+const fetchFilter = ref("");
+const fetchRows = ref<{ id: string; bound: boolean }[]>([]);
+/** 已勾选的上游模型名。用响应式 Set，勾选/取消都能正确触发重渲染。 */
+const selSet = reactive(new Set<string>());
+
+const filteredFetchRows = computed(() => {
+  const q = fetchFilter.value.trim().toLowerCase();
+  if (!q) return fetchRows.value;
+  return fetchRows.value.filter(r => r.id.toLowerCase().includes(q));
+});
+const selectedCount = computed(() => selSet.size);
+const allFetchedSelected = computed(() => {
+  const usable = filteredFetchRows.value.filter(r => !r.bound);
+  return usable.length > 0 && usable.every(r => selSet.has(r.id));
+});
+
+/** 打开弹窗时把上一次的拉取结果/勾选/错误全部清空，避免旧数据串台。 */
+function resetFetch() {
+  fetching.value = false;
+  fetchMsg.value = "";
+  fetchErr.value = false;
+  fetchFilter.value = "";
+  fetchRows.value = [];
+  selSet.clear();
+  fetchChannelId.value = channels.value[0]?.id || "";
+}
+
+function toggleFetched(id: string) {
+  if (selSet.has(id)) selSet.delete(id);
+  else selSet.add(id);
+}
+
+function toggleAllFetched() {
+  const usable = filteredFetchRows.value.filter(r => !r.bound);
+  if (allFetchedSelected.value) usable.forEach(r => selSet.delete(r.id));
+  else usable.forEach(r => selSet.add(r.id));
+}
+
+/**
+ * 拉取上游模型列表。
+ * 契约：接口永远回 HTTP 200，成败只能看 ok —— 失败时绝不能静默，也绝不能伪造出条目，
+ * 必须把 error / status 原样显示在 model-fetch-status 上（验收 G 段就查这个）。
+ */
+async function runFetch() {
+  const ch = fetchChannelId.value;
+  if (!ch) { fetchErr.value = true; fetchMsg.value = "请先选择要拉取模型的渠道。"; return; }
+  if (fetching.value) return;
+  fetching.value = true;
+  fetchErr.value = false;
+  fetchMsg.value = "";
+  fetchRows.value = [];
+  selSet.clear();
+  try {
+    const r = await api.channelModels(ch);
+    if (r.ok) {
+      const bound = new Set(models.value.filter(m => m.channel_id === ch).map(m => m.upstream));
+      fetchRows.value = (r.models || []).map(id => ({ id, bound: bound.has(id) }));
+      const nBound = fetchRows.value.filter(x => x.bound).length;
+      fetchMsg.value = "上游返回 " + r.count + " 个模型 · " + r.latency_ms + "ms" + (nBound ? " · 其中 " + nBound + " 个已在本渠道绑定" : "");
+      fetchErr.value = false;
+    } else {
+      fetchErr.value = true;
+      fetchMsg.value = "获取失败：" + (r.error || ("HTTP " + r.status));
+    }
+  } catch (e: any) {
+    fetchErr.value = true;
+    fetchMsg.value = "获取失败：" + String(e?.message || e);
+  } finally {
+    fetching.value = false;
+  }
+}
+
+/**
+ * 导入勾选的上游模型：每个模型名生成一条绑定（暴露名 = 上游名），默认启用、四档价格 0。
+ * 已在本渠道绑定过的上游名直接跳过，不产生重复绑定。整批改完只 markDirty() 一次，由顶栏统一保存。
+ */
+function importFetched() {
+  const cfg = state.cfg;
+  if (!cfg) return;
+  const ch = fetchChannelId.value;
+  if (!ch) { fetchErr.value = true; fetchMsg.value = "请先选择要导入到的渠道。"; return; }
+  const bound = new Set(cfg.models.filter(m => m.channel_id === ch).map(m => m.upstream));
+  let added = 0, skipped = 0;
+  for (const raw of Array.from(selSet)) {
+    const up = String(raw).trim();
+    if (!up) continue;
+    if (bound.has(up)) { skipped++; continue; }
+    bound.add(up);
+    cfg.models.push({
+      id: uid("mdl"),
+      channel_id: ch,
+      exposed: up,
+      upstream: up,
+      price_per_m: [0, 0, 0, 0],
+      enabled: true,
+    });
+    added++;
+  }
+  if (!added) {
+    fetchErr.value = true;
+    fetchMsg.value = skipped ? "勾选的模型都已在本渠道绑定过了。" : "请先勾选要导入的模型。";
+    return;
+  }
+  markDirty();
+  epoch.value++;
+  expanded[ch] = true;
+  modelModalOpen.value = false;
+  toast.ok("已添加 " + added + " 个模型" + (skipped ? "，跳过 " + skipped + " 个已存在" : ""));
+}
+
+/**
+ * 拉取方式下按 Escape 不关窗。
+ * 理由：列表/勾选/错误信息都是花过一次上游请求才拿到的，Escape 误触会把它们一起丢掉，
+ * 关窗应该走「取消」或右上角 ×（验收 G7 就是这个语义）。
+ * 实现：reka-ui 的 DismissableLayer 在 window 的【冒泡】阶段监听 Escape，
+ * 同一节点上 capture 阶段先于冒泡阶段，所以在 window 上用 capture 监听可以拦下它。
+ */
+function guardEscape(e: KeyboardEvent) {
+  if (e.key === "Escape" && modelMode.value === "fetch") e.stopPropagation();
+}
+watch(modelModalOpen, (open) => {
+  if (open) window.addEventListener("keydown", guardEscape, true);
+  else window.removeEventListener("keydown", guardEscape, true);
+});
+onBeforeUnmount(() => window.removeEventListener("keydown", guardEscape, true));
 
 /* ------------------------------- 连通测试 -------------------------------- */
 
@@ -356,6 +502,13 @@ function confirmRemoveModel() {
       <div class="ml-auto flex items-center gap-2">
         <Btn v-if="channels.length" variant="subtle" size="sm" data-test="toggle-all" @click="toggleAll">
           <Layers :size="13" /> {{ anyExpanded ? "收起全部" : "展开全部" }}
+        </Btn>
+        <Btn
+          variant="subtle" size="sm" data-test="add-model"
+          title="给渠道添加可用模型：手动填写，或从上游 models 接口拉取后勾选导入"
+          @click="openCreateModel()"
+        >
+          <Plus :size="13" />添加模型
         </Btn>
         <Btn variant="primary" size="sm" data-test="add-channel" @click="openCreate">
           <Plus :size="13" /> 添加渠道
@@ -462,19 +615,39 @@ function confirmRemoveModel() {
       @close="closeModelModal"
     >
       <div class="space-y-3.5">
+        <!-- 两种添加方式：手动填表 / 从上游 models 接口拉取后勾选导入（编辑既有绑定时只有手动表单） -->
+        <div v-if="!modelEditingId" class="grid grid-cols-2 gap-1 rounded-lg border border-line-soft bg-app p-1">
+          <button
+            type="button" data-test="model-mode-manual"
+            class="h-7 rounded-md text-[12px] font-medium transition-colors"
+            :class="modelMode === 'manual' ? 'bg-surface text-ink shadow-sm' : 'text-ink-3 hover:text-ink-2'"
+            @click="modelMode = 'manual'"
+          >手动添加</button>
+          <button
+            type="button" data-test="model-mode-fetch"
+            class="h-7 rounded-md text-[12px] font-medium transition-colors"
+            :class="modelMode === 'fetch' ? 'bg-surface text-ink shadow-sm' : 'text-ink-3 hover:text-ink-2'"
+            @click="modelMode = 'fetch'"
+          >从 models 接口获取</button>
+        </div>
+
+        <template v-if="modelMode === 'manual'">
         <Field label="所属渠道" required hint="模型挂在这个渠道下，路由标识为「渠道-模型」">
-          <TSelect
-            v-model="modelForm.channel_id"
-            :options="channelOptions"
-            placeholder="选择渠道"
-            empty-text="还没有渠道"
-          />
+          <div data-test="model-manual-channel">
+            <TSelect
+              v-model="modelForm.channel_id"
+              :options="channelOptions"
+              placeholder="选择渠道"
+              empty-text="还没有渠道"
+            />
+          </div>
         </Field>
 
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <Field label="暴露模型名" required hint="客户端请求时使用的名字">
             <TInput
               v-model="modelForm.exposed"
+              data-test="model-manual-exposed"
               mono
               :invalid="!!modelError && !modelForm.exposed.trim()"
               placeholder="gpt-4o"
@@ -483,6 +656,7 @@ function confirmRemoveModel() {
           <Field label="上游模型名" required hint="转发给上游时使用的名字">
             <TInput
               v-model="modelForm.upstream"
+              data-test="model-manual-upstream"
               mono
               :invalid="!!modelError && !modelForm.upstream.trim()"
               placeholder="gpt-4o-2024-08-06"
@@ -491,7 +665,7 @@ function confirmRemoveModel() {
         </div>
 
         <Field label="绑定 ID" :hint="modelEditingId ? '已有绑定的 ID 不可修改' : '新增时自动生成，可自行调整'">
-          <TInput v-model="modelForm.id" mono :disabled="!!modelEditingId" />
+          <TInput v-model="modelForm.id" mono :disabled="!!modelEditingId" data-test="model-manual-id" />
         </Field>
 
         <div>
@@ -521,11 +695,83 @@ function confirmRemoveModel() {
         </div>
 
         <Alert v-if="modelError" tone="err">{{ modelError }}</Alert>
+        </template>
+
+        <template v-else>
+          <Field label="数据来源渠道" required hint="用该渠道的 base_url / 密钥去请求上游的 models 接口">
+            <div data-test="model-fetch-channel">
+              <TSelect
+                v-model="fetchChannelId"
+                :options="channelOptions"
+                placeholder="选择渠道"
+                empty-text="还没有渠道"
+              />
+            </div>
+          </Field>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <Btn size="sm" data-test="model-fetch-run" :disabled="fetching" @click="runFetch">
+              <LoaderCircle v-if="fetching" :size="13" class="animate-spin" />
+              <Download v-else :size="13" />
+              {{ fetching ? "获取中…" : "获取模型列表" }}
+            </Btn>
+            <span class="text-[11.5px] leading-4 text-ink-3">只读取上游的模型名；导入时按「暴露名 = 上游名」生成绑定，可再逐个改价格</span>
+          </div>
+
+          <div
+            v-if="fetchMsg"
+            data-test="model-fetch-status"
+            class="flex items-start gap-2 rounded-lg border px-3 py-2 text-[12.5px] leading-5"
+            :class="fetchErr ? 'border-err-100 bg-err-50 text-err-700' : 'border-line bg-app text-ink-2'"
+          >
+            <CircleAlert :size="14" class="mt-0.5 shrink-0" />
+            <span class="min-w-0 break-all">{{ fetchMsg }}</span>
+          </div>
+
+          <template v-if="fetchRows.length">
+            <div class="flex flex-wrap items-center gap-2">
+              <TInput v-model="fetchFilter" size="sm" class="max-w-[220px]" data-test="model-fetch-filter" placeholder="过滤模型名…" />
+              <span data-test="model-fetch-count" class="text-[12px] text-ink-3">已选 {{ selectedCount }} / 共 {{ fetchRows.length }}</span>
+              <Btn size="sm" class="ml-auto" data-test="model-fetch-all" @click="toggleAllFetched">
+                <ListChecks :size="13" />{{ allFetchedSelected ? "取消全选" : "全选可导入" }}
+              </Btn>
+            </div>
+
+            <div data-test="model-fetch-list" class="max-h-[300px] overflow-y-auto rounded-lg border border-line-soft">
+              <button
+                v-for="row in filteredFetchRows" :key="row.id"
+                type="button"
+                data-test="model-fetch-item"
+                :disabled="row.bound"
+                class="flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12.5px] transition-colors"
+                :class="row.bound
+                  ? 'cursor-not-allowed text-ink-3'
+                  : (selSet.has(row.id) ? 'bg-brand-50 text-ink' : 'text-ink-2 hover:bg-app')"
+                @click="toggleFetched(row.id)"
+              >
+                <Check v-if="row.bound" :size="14" class="shrink-0 text-ok-700" />
+                <Check v-else-if="selSet.has(row.id)" :size="14" class="shrink-0 text-brand-700" />
+                <Square v-else :size="14" class="shrink-0 text-ink-3" />
+                <span class="min-w-0 truncate font-mono">{{ row.id }}</span>
+                <span v-if="row.bound" class="ml-auto shrink-0 text-[11px] text-ink-3">已存在</span>
+              </button>
+            </div>
+            <div v-if="!filteredFetchRows.length" class="py-1 text-center text-[11.5px] text-ink-3">没有匹配的模型名</div>
+          </template>
+        </template>
       </div>
 
       <template #footer>
         <Btn @click="closeModelModal">取消</Btn>
-        <Btn variant="primary" data-test="save-model" @click="saveModel"><Check :size="13" /> 保存</Btn>
+        <Btn
+          v-if="modelEditingId || modelMode === 'manual'"
+          variant="primary" data-test="save-model" @click="saveModel"
+        ><Check :size="13" /> 保存</Btn>
+        <Btn
+          v-else
+          variant="primary" data-test="model-fetch-import"
+          :disabled="!selectedCount || fetching" @click="importFetched"
+        ><Download :size="13" /> 导入所选（{{ selectedCount }}）</Btn>
       </template>
     </Modal>
 

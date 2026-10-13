@@ -123,7 +123,7 @@ watch(() => props.epoch, () => {
       <span class="inline-flex items-center gap-1.5 text-[12.5px] text-ink-3">
         <Layers :size="14" /> 该渠道下还没有可用模型
       </span>
-      <Btn variant="subtle" size="sm" class="ml-auto" @click="emit('add')">
+      <Btn variant="subtle" size="sm" class="ml-auto" data-test="add-model-empty" @click="emit('add')">
         <Plus :size="13" /> 添加模型
       </Btn>
     </div>
@@ -132,7 +132,7 @@ watch(() => props.epoch, () => {
       <p class="text-[11.5px] text-ink-3">
         价格单位 USD / 1M tokens（输入 · 输出 · 缓存读 · 缓存写），可直接在表格中修改。
       </p>
-      <Btn variant="subtle" size="sm" class="ml-auto" @click="emit('add')">
+      <Btn variant="subtle" size="sm" class="ml-auto" data-test="add-model-row" @click="emit('add')">
         <Plus :size="13" /> 添加模型
       </Btn>
     </div>

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 渠道卡片：头部是渠道本身，展开后是挂在该渠道下的可用模型（ModelRows）。
 import { computed, ref } from "vue";
-import { ChevronDown, Eye, EyeOff, FlaskConical, Layers, Pencil, Trash2 } from "@lucide/vue";
+import { ChevronDown, Eye, EyeOff, FlaskConical, Layers, Pencil, Plus, Trash2 } from "@lucide/vue";
 import { Badge, Btn, IconBtn, Spinner, TToggle } from "../ui";
 import ModelRows from "./ModelRows.vue";
 import type { Channel, ModelBinding } from "../../api";
@@ -84,6 +84,14 @@ const enabledModels = computed(() => props.models.filter(m => m.enabled).length)
       </span>
 
       <div class="flex shrink-0 items-center gap-0.5">
+        <!-- 卡片快捷入口：不展开渠道也能直接给该渠道添加模型。 -->
+        <IconBtn
+          :data-test="'add-model-' + channel.id"
+          title="添加模型"
+          @click="emit('addModel')"
+        >
+          <Plus :size="15" />
+        </IconBtn>
         <IconBtn title="连通测试" :disabled="testing" @click="emit('test')">
           <Spinner v-if="testing" :size="14" />
           <FlaskConical v-else :size="15" />

@@ -197,6 +197,203 @@ pub async fn test_channel(State(state): State<AppState>, headers: HeaderMap, Jso
     resp
 }
 
+/// POST /admin/api/channel-models — read the model list the provider itself
+/// publishes, so the console can offer "import the provider's models" next to
+/// "type one by hand" (board task-32; user m03395).
+///
+/// The caller names either a SAVED channel (channel_id) or hands over a draft
+/// that is not saved yet (base_url / api_key / protocol / headers). Draft
+/// fields win over the saved channel, and request headers MERGE over the
+/// channel's own headers with the same name.
+///
+/// The answer is ALWAYS HTTP 200: whether the provider answered is a business
+/// fact, reported in "ok", never a transport status. "status" is the upstream
+/// HTTP status (0 when nothing was reached) and "models" is a de-duplicated id
+/// list in the provider's own order.
+#[derive(Deserialize)]
+pub struct ChannelModelsReq {
+    pub channel_id: Option<String>,
+    pub base_url: Option<String>,
+    pub api_key: Option<String>,
+    pub protocol: Option<crate::config::Protocol>,
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
+}
+
+/// A provider that never answers must not hang the console dialog.
+const MODELS_TIMEOUT_SECS: u64 = 20;
+/// Guard against a provider that offers an endless catalogue.
+const MODELS_MAX: usize = 5000;
+/// How much of an upstream body is quoted back in an error.
+const MODELS_SNIPPET: usize = 200;
+
+/// Tolerant header insert, same rule as the data plane: an unusable name or
+/// value is skipped instead of failing the request. Inserting over an existing
+/// name REPLACES it, which is what gives the draft its override semantics.
+fn set_wire_header(map: &mut reqwest::header::HeaderMap, name: &str, value: &str) {
+    if let (Ok(n), Ok(v)) = (name.trim().parse::<reqwest::header::HeaderName>(), value.parse::<reqwest::header::HeaderValue>()) {
+        map.insert(n, v);
+    }
+}
+
+fn models_fail(status: u16, latency_ms: u64, error: String) -> Response {
+    Json(json!({
+        "ok": false, "status": status, "latency_ms": latency_ms,
+        "models": [], "count": 0, "error": error,
+    })).into_response()
+}
+
+fn push_model_id(out: &mut Vec<String>, raw: &str) {
+    let id = raw.trim();
+    if !id.is_empty() && !out.iter().any(|x| x == id) { out.push(id.to_string()) }
+}
+
+/// Pull the ids out of whichever shape the provider uses. The first shape that
+/// yields any id wins.
+///
+/// The distinction this returns is about SHAPE, not about count: Some(empty)
+/// means the body WAS a model list that happens to carry no models, which is a
+/// legitimate answer ("this provider offers nothing right now") and must not be
+/// dressed up as a parse error. None means the body was no model list at all
+/// (HTML, {}, a bare string, an empty body), which the caller reports as an
+/// error rather than as "this channel has no models".
+fn parse_model_ids(text: &str) -> Option<Vec<String>> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    let mut out: Vec<String> = Vec::new();
+    // Whether the body was recognisable as a model list, even an empty one.
+    let mut recognized = false;
+    // (1) OpenAI and friends: {"data": [{"id": "gpt-4o"}, ...]}
+    if let Some(arr) = v.get("data").and_then(|d| d.as_array()) {
+        recognized = true;
+        for row in arr {
+            if let Some(id) = row.get("id").and_then(|i| i.as_str()) { push_model_id(&mut out, id) }
+        }
+    }
+    // (2) Gemini / Anthropic style: {"models": [{"name": "models/gemini-1.5"}]}
+    if out.is_empty() {
+        if let Some(arr) = v.get("models").and_then(|d| d.as_array()) {
+            recognized = true;
+            for row in arr {
+                if let Some(id) = row.get("id").and_then(|i| i.as_str()) { push_model_id(&mut out, id) }
+                else if let Some(name) = row.get("name").and_then(|i| i.as_str()) {
+                    // "models/" is the provider's routing syntax, never part of a model name.
+                    push_model_id(&mut out, name.strip_prefix("models/").unwrap_or(name))
+                }
+            }
+        }
+    }
+    // (3) a bare array: [{"id": "x"}] or ["x", "y"]
+    if out.is_empty() {
+        if let Some(arr) = v.as_array() {
+            recognized = true;
+            for row in arr {
+                if let Some(id) = row.get("id").and_then(|i| i.as_str()) { push_model_id(&mut out, id) }
+                else if let Some(name) = row.as_str() { push_model_id(&mut out, name) }
+            }
+        }
+    }
+    if recognized { Some(out) } else { None }
+}
+
+pub async fn channel_models(State(state): State<AppState>, headers: HeaderMap, Json(req): Json<ChannelModelsReq>) -> Response {
+    if let Err(r) = authorize(&state, &headers) { return r }
+    let Some(snap) = state.config.get() else { return (StatusCode::SERVICE_UNAVAILABLE, "no config").into_response() };
+
+    // A saved channel supplies the defaults; every draft field replaces one.
+    let saved = req.channel_id.as_deref().and_then(|id| snap.config.find_channel(id));
+    let draft_base = req.base_url.as_deref().map(|b| b.trim()).filter(|b| !b.is_empty());
+    if saved.is_none() {
+        if let Some(id) = req.channel_id.as_deref() {
+            if draft_base.is_none() {
+                return (StatusCode::NOT_FOUND, Json(json!({ "error": format!("channel {id} not found") }))).into_response();
+            }
+        }
+    }
+    let base_url = match draft_base {
+        Some(b) => b.to_string(),
+        None => match saved {
+            Some(c) => c.base_url.trim().to_string(),
+            None => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "base_url required" }))).into_response(),
+        },
+    };
+    if base_url.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "base_url required" }))).into_response();
+    }
+    let protocol = match req.protocol {
+        Some(p) => p,
+        None => saved.map(|c| c.protocol).unwrap_or(crate::config::Protocol::Openai),
+    };
+    let api_key = match req.api_key.as_deref().filter(|k| !k.is_empty()) {
+        Some(k) => k.to_string(),
+        None => saved.map(|c| c.api_key.clone()).unwrap_or_default(),
+    };
+
+    let base = base_url.trim_end_matches('/');
+    let url = match protocol {
+        crate::config::Protocol::Openai => format!("{base}/v1/models"),
+        crate::config::Protocol::Anthropic => format!("{base}/v1/models"),
+        crate::config::Protocol::Gemini => format!("{base}/v1beta/models"),
+    };
+
+    // Protocol defaults first, then the channel's own headers, then the ones
+    // typed into the dialog: last writer wins, exactly like the data plane.
+    let mut wire = reqwest::header::HeaderMap::new();
+    match protocol {
+        crate::config::Protocol::Openai => set_wire_header(&mut wire, "authorization", &format!("Bearer {api_key}")),
+        crate::config::Protocol::Anthropic => {
+            set_wire_header(&mut wire, "x-api-key", &api_key);
+            set_wire_header(&mut wire, "anthropic-version", "2023-06-01");
+        }
+        crate::config::Protocol::Gemini => set_wire_header(&mut wire, "x-goog-api-key", &api_key),
+    }
+    if let Some(c) = saved {
+        for (k, v) in &c.headers { set_wire_header(&mut wire, k, v) }
+    }
+    for (k, v) in &req.headers { set_wire_header(&mut wire, k, v) }
+
+    let started = Instant::now();
+    let http = state.http.client_for(snap.config.retry.connect_timeout_ms)
+        .request(reqwest::Method::GET, &url)
+        .headers(wire);
+
+    // ONE window covers BOTH halves of the exchange: the response headers AND
+    // the body. An upstream that sends its header line and then stalls the body
+    // would otherwise hold the console dialog open forever — the very stalled
+    // -body case the data plane guards against with its chunk idle timeout.
+    let exchange = async move {
+        let r = http.send().await?;
+        let status = r.status().as_u16();
+        let text = r.text().await.unwrap_or_default();
+        Ok::<(u16, String), reqwest::Error>((status, text))
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(MODELS_TIMEOUT_SECS), exchange).await {
+        Err(_) => models_fail(0, started.elapsed().as_millis() as u64, format!("timeout after {MODELS_TIMEOUT_SECS}s")),
+        Ok(Err(e)) => models_fail(0, started.elapsed().as_millis() as u64, format!("connect: {e}")),
+        Ok(Ok((status, text))) => {
+            let latency_ms = started.elapsed().as_millis() as u64;
+            if !(200..300).contains(&status) {
+                let snippet: String = text.chars().take(MODELS_SNIPPET).collect();
+                return models_fail(status, latency_ms, format!("HTTP {status}: {snippet}"));
+            }
+            match parse_model_ids(&text) {
+                Some(mut ids) => {
+                    let truncated = ids.len() > MODELS_MAX;
+                    ids.truncate(MODELS_MAX);
+                    let count = ids.len();
+                    Json(json!({
+                        "ok": true, "status": status, "latency_ms": latency_ms,
+                        "models": ids, "count": count, "truncated": truncated,
+                    })).into_response()
+                }
+                None => {
+                    let snippet: String = text.chars().take(MODELS_SNIPPET).collect();
+                    models_fail(status, latency_ms, format!("unrecognized models payload: {snippet}"))
+                }
+            }
+        }
+    }
+}
+
 /// One cooling row, in the FROZEN console contract. Field names are part of
 /// the client API — renaming one silently breaks the UI.
 fn cooldown_json(r: crate::health::CooldownRow) -> Value {
@@ -396,6 +593,7 @@ pub fn admin_router(state: AppState) -> axum::Router {
         .route("/admin/api/group-members", get(group_members))
         .route("/admin/api/health", get(health_summary))
         .route("/admin/api/test-channel", post(test_channel))
+        .route("/admin/api/channel-models", post(channel_models))
         .route("/admin/api/cooldown/clear", post(clear_cooldown))
         .with_state(state).layer(cors)
 }

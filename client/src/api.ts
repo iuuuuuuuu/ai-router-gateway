@@ -115,6 +115,26 @@ export interface StatsPayload {
 export interface TestChannelResult {
   ok: boolean; status?: number; latency_ms: number; sample?: string; error?: string;
 }
+/** Draft overrides used when probing a channel that has not been saved yet. */
+export interface ChannelModelsDraft {
+  base_url?: string;
+  api_key?: string;
+  protocol?: string;
+  headers?: Record<string, string>;
+}
+/**
+ * Result of POST /admin/api/channel-models. The endpoint always answers HTTP
+ * 200, so success/failure has to be read from `ok` — never from the transport.
+ * On failure `models` is empty and `error` carries the upstream message.
+ */
+export interface ChannelModelsResult {
+  ok: boolean;
+  status: number;
+  latency_ms: number;
+  models: string[];
+  count: number;
+  error?: string;
+}
 
 const BASE = localStorage.getItem("admin_base") || "http://127.0.0.1:9090";
 
@@ -178,4 +198,9 @@ export const api = {
     req("POST", "/admin/api/test-channel", { channel_id: channelId, upstream_model: upstreamModel }),
   clearCooldown: (channelId: string): Promise<{ ok: boolean }> =>
     req("POST", "/admin/api/cooldown/clear", { channel_id: channelId }),
+  // Probe a channel's upstream /v1/models. `channelId` may be empty when the
+  // caller supplies a full draft (base_url + api_key); the server then uses the
+  // draft alone instead of looking the channel up in the config.
+  channelModels: (channelId: string, draft?: ChannelModelsDraft): Promise<ChannelModelsResult> =>
+    req("POST", "/admin/api/channel-models", { channel_id: channelId || undefined, ...(draft || {}) }),
 };

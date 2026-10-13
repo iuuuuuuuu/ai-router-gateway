@@ -60,11 +60,26 @@ pub enum Behavior {
     /// B1 regression: text shorter than the holdback, then a tool call. The
     /// buffered text must be committed WITH the tool call, never dropped.
     ToolAfterShortText,
+    /// 200 + OpenAI-shaped model list whose ids ARE the request headers this
+    /// GET really arrived with (`hdr <name>=<value>`), plus the serving path
+    /// as `hdr x-upstream-prefix=<prefix>`. Lets a test assert on the wire
+    /// request end-to-end instead of trusting the code under test.
+    RecordHeaders200Json,
+    /// 404 + a JSON error body (not-open-found, and a plain-text variant).
+    NotFoundJson,
+    /// 200 + a model list that repeats one id, in a deliberate order.
+    Duplicates200Json,
+    /// 200 + an EMPTY OpenAI-shaped model list: the provider answered
+    /// "no models", which is a legitimate answer and not a parse error.
+    EmptyDataJson,
+    /// 200 + a JSON object with no model list in it at all ({}).
+    NoListJson,
 }
 
-async fn handle_beh(beh: Behavior, body: String) -> axum::response::Response {
+async fn handle_beh(beh: Behavior, body: String, hdrs: axum::http::HeaderMap, prefix: &str) -> axum::response::Response {
     use axum::response::IntoResponse;
     let _ = body;
+    let _ = prefix;
     match beh {
         Behavior::GoodJson => (
             axum::http::StatusCode::OK,
@@ -93,7 +108,31 @@ async fn handle_beh(beh: Behavior, body: String) -> axum::response::Response {
         Behavior::Fail404 => (axum::http::StatusCode::NOT_FOUND, "{\"error\":{\"message\":\"model not found\"}}").into_response(),
         Behavior::Hang => { tokio::time::sleep(Duration::from_secs(120)).await; (axum::http::StatusCode::OK, "late").into_response() }
         Behavior::Garbage => (axum::http::StatusCode::OK, "<html>not json</html>").into_response(),
+        Behavior::NotFoundJson => (axum::http::StatusCode::NOT_FOUND, "{\"error\":{\"message\":\"no such route\"}}").into_response(),
+        Behavior::RecordHeaders200Json => {
+            // Every header this GET really arrived with becomes one model id,
+            // so a test can observe the request end-to-end instead of
+            // trusting the code under test. The synthetic x-upstream-prefix
+            // row names the path that served it (u0, u1, ...).
+            let mut rows: Vec<(String, String)> = hdrs
+                .iter()
+                .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("<binary>").to_string()))
+                .collect();
+            rows.push(("x-upstream-prefix".to_string(), prefix.to_string()));
+            rows.sort();
+            let data: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|(k, v)| serde_json::json!({ "id": format!("hdr {k}={v}") }))
+                .collect();
+            axum::Json(serde_json::json!({ "object": "list", "data": data })).into_response()
+        }
+        Behavior::Duplicates200Json => axum::Json(serde_json::json!({
+            "object": "list",
+            "data": [{ "id": "a" }, { "id": "b" }, { "id": "a" }, { "id": "b" }],
+        })).into_response(),
         Behavior::Empty => (axum::http::StatusCode::OK, "").into_response(),
+        Behavior::EmptyDataJson => axum::Json(serde_json::json!({ "object": "list", "data": [] })).into_response(),
+        Behavior::NoListJson => axum::Json(serde_json::json!({})).into_response(),
         Behavior::StreamBreakMid => {
             let sse = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n";
             ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
@@ -266,12 +305,39 @@ fn openai_tail_sse(reason: &str) -> String {
     s
 }
 
+/// Which behaviors answer the model-list probe with their OWN response
+/// instead of the default canned list. Listed explicitly so a normal chat
+/// behavior (GoodJson and friends) keeps serving the static model list the
+/// model-list tests rely on.
+fn models_override(b: Behavior) -> bool {
+    matches!(
+        b,
+        Behavior::Fail401
+            | Behavior::Fail404
+            | Behavior::Fail500
+            | Behavior::Fail429
+            | Behavior::Garbage
+            | Behavior::Empty
+            | Behavior::NotFoundJson
+            | Behavior::Duplicates200Json
+            | Behavior::RecordHeaders200Json
+            | Behavior::EmptyDataJson
+            | Behavior::NoListJson
+    )
+}
+
 /// Mount several behaviors on ONE listener under distinct path prefixes
 /// /u{i}/v1/chat/completions — channel i's base_url points at /u{i}.
+///
+/// The same prefix also answers the console model-list probe in BOTH provider
+/// shapes: GET /u{i}/v1/models (OpenAI) and GET /u{i}/v1beta/models (Gemini).
+/// Every id carries the prefix, so a handler that resolved the wrong base_url
+/// gets visibly wrong ids; an unknown prefix is 404, never somebody else's list.
+/// The POST behaviour above is untouched — every other test depends on it.
 /// Returns (base, Vec<prefix>).
 pub async fn spawn_fake_upstreams(behs: &[Behavior]) -> (String, Vec<String>) {
     use axum::extract::{Path, State};
-    use axum::routing::post;
+    use axum::routing::{get, post};
 
     let behs: Vec<Behavior> = behs.to_vec();
     let idx: std::collections::HashMap<String, usize> = behs
@@ -283,14 +349,59 @@ pub async fn spawn_fake_upstreams(behs: &[Behavior]) -> (String, Vec<String>) {
     async fn dispatch(
         State((behs, idx)): State<(Vec<Behavior>, std::collections::HashMap<String, usize>)>,
         Path((prefix, _rest)): Path<(String, String)>,
+        hdrs: axum::http::HeaderMap,
         req: String,
     ) -> axum::response::Response {
         let beh = idx.get(&prefix).copied().and_then(|i| behs.get(i).copied()).unwrap_or(Behavior::Fail500);
-        handle_beh(beh, req).await
+        handle_beh(beh, req, hdrs, &prefix).await
+    }
+
+    /// GET /{prefix}/v1/models — the OpenAI shape the real providers send.
+    async fn models_openai(
+        State((behs, idx)): State<(Vec<Behavior>, std::collections::HashMap<String, usize>)>,
+        Path(prefix): Path<String>,
+        hdrs: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let Some(i) = idx.get(&prefix).copied() else {
+            return (axum::http::StatusCode::NOT_FOUND, "unknown prefix").into_response();
+        };
+        let beh = behs.get(i).copied().unwrap_or(Behavior::Fail500);
+        if models_override(beh) {
+            return handle_beh(beh, String::new(), hdrs, &prefix).await;
+        }
+        let data: Vec<serde_json::Value> = ["a", "b", "c"]
+            .iter()
+            .map(|s| serde_json::json!({ "id": format!("{prefix}-model-{s}"), "object": "model" }))
+            .collect();
+        axum::Json(serde_json::json!({ "object": "list", "data": data })).into_response()
+    }
+
+    /// GET /{prefix}/v1beta/models — the Gemini shape: names carry the "models/" prefix.
+    async fn models_gemini(
+        State((behs, idx)): State<(Vec<Behavior>, std::collections::HashMap<String, usize>)>,
+        Path(prefix): Path<String>,
+        hdrs: axum::http::HeaderMap,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let Some(i) = idx.get(&prefix).copied() else {
+            return (axum::http::StatusCode::NOT_FOUND, "unknown prefix").into_response();
+        };
+        let beh = behs.get(i).copied().unwrap_or(Behavior::Fail500);
+        if models_override(beh) {
+            return handle_beh(beh, String::new(), hdrs, &prefix).await;
+        }
+        let models: Vec<serde_json::Value> = ["alpha", "beta"]
+            .iter()
+            .map(|s| serde_json::json!({ "name": format!("models/{prefix}-gemini-{s}") }))
+            .collect();
+        axum::Json(serde_json::json!({ "models": models })).into_response()
     }
 
     let state = (behs, idx);
     let app: axum::Router = axum::Router::new()
+        .route("/{prefix}/v1/models", get(models_openai))
+        .route("/{prefix}/v1beta/models", get(models_gemini))
         .route("/{prefix}/{*rest}", post(dispatch))
         .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
