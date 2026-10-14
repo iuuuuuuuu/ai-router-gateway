@@ -136,3 +136,10 @@ Desktop.ini
 /tools/_x4.mjs
 /tools/_x5.mjs
 /tools/_x6.mjs
+
+# ── v0.4.4 真机验收：时长改中文「秒」+ 秒输入框（本机证据，不入库）──
+/tools/_accept-v044-sec.mjs
+/tools/_accept-v044-sec.result.json
+/tools/_tauri-nobuild.json
+/tools/_rel043/
+/tools/_rel044/

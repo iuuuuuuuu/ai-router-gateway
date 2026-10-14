@@ -5,10 +5,11 @@
 import { computed, onMounted, ref } from "vue";
 import { Check, CircleAlert, Database, Eye, EyeOff, LoaderCircle, Power, Repeat, Rocket, Server, Timer, Trash2 } from "@lucide/vue";
 import {
-  Alert, Btn, Card, Field, IconBtn, Modal, TInput, TSelect, TToggle,
+  Alert, Btn, Card, Field, IconBtn, Modal, SecInput, TInput, TSelect, TToggle,
 } from "../components/ui";
 import { api, getBase, getKey, setBase, setKey, type RetryConfig } from "../api";
 import { markDirty, state } from "../store";
+import { fmtSec } from "../format";
 import { toast } from "../toast";
 
 const cfg = computed(() => state.cfg!);
@@ -18,7 +19,7 @@ const admin = computed(() => cfg.value.admin);
 
 /* --------------------------- 重试与超时 --------------------------- */
 
-/** 预算公式：max_attempts × attempt_deadline_ms + reserve_ms ≤ total_deadline_ms */
+/** 预算公式：max_attempts × attempt_deadline_ms + reserve_ms ≤ total_deadline_ms（算的是毫秒，展示时换成秒）。 */
 const worstMs = computed(
   () =>
     (Number(retry.value.max_attempts) || 0) * (Number(retry.value.attempt_deadline_ms) || 0) +
@@ -27,10 +28,10 @@ const worstMs = computed(
 const budgetOk = computed(() => worstMs.value <= (Number(retry.value.total_deadline_ms) || 0));
 const budgetFormula = computed(
   () =>
-    `${retry.value.max_attempts} × ${retry.value.attempt_deadline_ms} ms + ${retry.value.reserve_ms} ms`,
+    `${retry.value.max_attempts} × ${fmtSec(retry.value.attempt_deadline_ms)} + ${fmtSec(retry.value.reserve_ms)}`,
 );
 const budgetLine = computed(
-  () => `${budgetFormula.value} = ${worstMs.value} ms`,
+  () => `${budgetFormula.value} = ${fmtSec(worstMs.value)}`,
 );
 
 /** 死循环拦截的首字节推迟量 ≈ 检测阈值；老配置还没这个字段时按服务端默认 64 显示。 */
@@ -268,7 +269,7 @@ onMounted(() => {
           <div class="min-w-0">
             <h2 class="text-[13.5px] font-semibold text-ink">重试与超时（全局默认）</h2>
             <p class="mt-0.5 text-[12.5px] text-ink-3">
-              控制一次请求在层级之间降级重试的次数与各阶段超时时间，单位均为毫秒。这里是全局默认值，所有分组默认跟随它；某个分组想要不一样的，去「分组路由」页点它的「分组详情」，在「分组设置」卡里的「重试与超时」区单独设置。
+              控制一次请求在层级之间降级重试的次数与各阶段超时时间，时长一律按「秒」填写与显示（内部仍按毫秒存储）。这里是全局默认值，所有分组默认跟随它；某个分组想要不一样的，去「分组路由」页点它的「分组详情」，在「分组设置」卡里的「重试与超时」区单独设置。
             </p>
           </div>
           <!-- 档位快捷套用：省得 9 个数字字段一个个手改 -->
@@ -294,26 +295,26 @@ onMounted(() => {
           <Field label="最大循环轮数" hint="走完全部层级算 1 轮，最多循环几轮">
             <TInput v-model.number="retry.max_cycles" type="number" @input="markDirty()" />
           </Field>
-          <Field label="总预算 (ms)" hint="整个请求的总时间上限，超过即直接失败">
-            <TInput v-model.number="retry.total_deadline_ms" type="number" @input="markDirty()" />
+          <Field label="总预算 (秒)" hint="整个请求的总时间上限，超过即直接失败">
+            <SecInput v-model="retry.total_deadline_ms" data-test="retry-total-deadline-ms" @input="markDirty()" />
           </Field>
-          <Field label="单次尝试上限 (ms)" hint="一次尝试的最长耗时，超时即判定失败并降级">
-            <TInput v-model.number="retry.attempt_deadline_ms" type="number" @input="markDirty()" />
+          <Field label="单次尝试上限 (秒)" hint="一次尝试的最长耗时，超时即判定失败并降级">
+            <SecInput v-model="retry.attempt_deadline_ms" data-test="retry-attempt-deadline-ms" @input="markDirty()" />
           </Field>
-          <Field label="连接超时 (ms)" hint="与上游建立 TCP / TLS 连接的超时">
-            <TInput v-model.number="retry.connect_timeout_ms" type="number" @input="markDirty()" />
+          <Field label="连接超时 (秒)" hint="与上游建立 TCP / TLS 连接的超时">
+            <SecInput v-model="retry.connect_timeout_ms" data-test="retry-connect-timeout-ms" @input="markDirty()" />
           </Field>
-          <Field label="首字节超时 (ms)" hint="发出请求到收到响应首字节的超时">
-            <TInput v-model.number="retry.ttfb_timeout_ms" type="number" @input="markDirty()" />
+          <Field label="首字节超时 (秒)" hint="发出请求到收到响应首字节的超时">
+            <SecInput v-model="retry.ttfb_timeout_ms" data-test="retry-ttfb-timeout-ms" @input="markDirty()" />
           </Field>
-          <Field label="首个事件超时 (ms)" hint="流式响应中第一个事件到达的超时">
-            <TInput v-model.number="retry.first_event_timeout_ms" type="number" @input="markDirty()" />
+          <Field label="首个事件超时 (秒)" hint="流式响应中第一个事件到达的超时">
+            <SecInput v-model="retry.first_event_timeout_ms" data-test="retry-first-event-timeout-ms" @input="markDirty()" />
           </Field>
-          <Field label="流空闲超时 (ms)" hint="流式响应里两个数据块之间的最大空闲时间">
-            <TInput v-model.number="retry.chunk_idle_timeout_ms" type="number" @input="markDirty()" />
+          <Field label="流空闲超时 (秒)" hint="流式响应里两个数据块之间的最大空闲时间">
+            <SecInput v-model="retry.chunk_idle_timeout_ms" data-test="retry-chunk-idle-timeout-ms" @input="markDirty()" />
           </Field>
-          <Field label="预留余量 (ms)" hint="预留余量（ms）：给收尾/补帧留的时间">
-            <TInput v-model.number="retry.reserve_ms" type="number" @input="markDirty()" />
+          <Field label="预留余量 (秒)" hint="给收尾/补帧留的时间">
+            <SecInput v-model="retry.reserve_ms" data-test="retry-reserve-ms" @input="markDirty()" />
           </Field>
         </div>
 
@@ -354,7 +355,7 @@ onMounted(() => {
               </p>
               <p class="mt-0.5 font-mono text-[12px]">
                 {{ budgetLine }}
-                {{ budgetOk ? "≤" : ">" }} {{ retry.total_deadline_ms }} ms
+                {{ budgetOk ? "≤" : ">" }} {{ fmtSec(retry.total_deadline_ms) }}
               </p>
               <p class="mt-0.5 text-[11.5px] leading-4">
                 <template v-if="budgetOk">

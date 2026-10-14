@@ -19,10 +19,10 @@ import {
 import { apiKeys, bindingLabel, channelName, markDirty, models, state } from "../store";
 import { closeGroupDetail, openModelDetail } from "../nav";
 import { toast } from "../toast";
-import { fmtTps, tpsOf } from "../format";
+import { fmtSec, fmtTps, tpsOf } from "../format";
 import {
-  Alert, Badge, Btn, Card, Empty, Field, IconBtn, PageHeader, Spinner, TInput, TSelect, TTextarea,
-  TToggle,
+  Alert, Badge, Btn, Card, Empty, Field, IconBtn, PageHeader, SecInput, Spinner, TInput, TSelect,
+  TTextarea, TToggle,
 } from "../components/ui";
 
 type Tone = "gray" | "teal" | "ok" | "warn" | "err" | "brand";
@@ -118,10 +118,6 @@ function num(v: unknown): number | null {
 function fmtInt(v: unknown): string {
   const n = num(v);
   return n === null ? "—" : String(Math.round(n));
-}
-function fmtMs(v: unknown): string {
-  const n = num(v);
-  return n === null ? "—" : `${Math.round(n)}ms`;
 }
 function fmtCost(v: unknown): string {
   const n = num(v);
@@ -236,11 +232,11 @@ function fmtRemain(ms: number | null): string {
   if (ms === null) return "—";
   const s = Math.ceil(ms / 1000);
   if (s <= 0) return "已到期";
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m${s % 60}s`;
+  if (s < 60) return `${s}秒`;
+  if (s < 3600) return `${Math.floor(s / 60)}分${s % 60}秒`;
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
-  return `${h}h${m}m`;
+  return `${h}小时${m}分`;
 }
 function healthKey(row: CooldownRow, i: number): string {
   return `${row?.channel_id ?? "c"}|${row?.upstream_model ?? ""}|${row?.kind ?? ""}|${i}`;
@@ -564,15 +560,14 @@ const sBudget = computed(() => {
   const worst = Number(r.max_attempts) * Number(r.attempt_deadline_ms) + Number(r.reserve_ms);
   return {
     ok: worst <= Number(r.total_deadline_ms),
-    line: `${r.max_attempts} × ${r.attempt_deadline_ms} ms + ${r.reserve_ms} ms = ${worst} ms`,
+    line: `${r.max_attempts} × ${fmtSec(r.attempt_deadline_ms)} + ${fmtSec(r.reserve_ms)} = ${fmtSec(worst)}`,
   };
 });
 
 /** 跟随全局时的一句话摘要：用实际生效值，和生效的模型名一样能直接看。 */
 const followLine = computed(() => {
   const r = effRetry();
-  const sec = Math.max(1, Math.round(Number(r.total_deadline_ms) / 1000));
-  return `跟随全局（当前：max_attempts=${r.max_attempts} / 总超时 ${sec}s / 死循环拦截 ${r.loop_guard_enabled ? "开" : "关"}）`;
+  return `跟随全局（当前：max_attempts=${r.max_attempts} / 总超时 ${fmtSec(r.total_deadline_ms)} / 死循环拦截 ${r.loop_guard_enabled ? "开" : "关"}）`;
 });
 
 /** 有没有未保存的设置改动（顶栏之外的第二处脏标记，只描述本卡）。 */
@@ -1055,7 +1050,7 @@ function saveTiers() {
                 </Badge>
               </div>
               <p class="mt-1 text-[11.5px] leading-4 text-ink-3">
-                这个分组可以跟随全局配置，也可以拥有自己的一份；有自己的配置时以它为准，全局改动不再影响它。
+                这个分组可以跟随全局配置，也可以拥有自己的一份；有自己的配置时以它为准，全局改动不再影响它。时长一律按「秒」填写与显示。
               </p>
             </div>
 
@@ -1105,40 +1100,26 @@ function saveTiers() {
                     <TInput v-model.number="sRetry.max_cycles" type="number" data-test="group-retry-max-cycles" />
                   </div>
                 </Field>
-                <Field label="总预算 (ms)" hint="整个请求的总时间上限，超过即直接失败">
-                  <div data-test="group-retry-total-deadline-ms">
-                    <TInput v-model.number="sRetry.total_deadline_ms" type="number" data-test="group-retry-total-deadline-ms" />
-                  </div>
+                <Field label="总预算 (秒)" hint="整个请求的总时间上限，超过即直接失败">
+                  <SecInput v-model="sRetry.total_deadline_ms" data-test="group-retry-total-deadline-ms" @input="markDirty()" />
                 </Field>
-                <Field label="单次尝试上限 (ms)" hint="一次尝试的最长耗时，超时即判定失败并降级">
-                  <div data-test="group-retry-attempt-deadline-ms">
-                    <TInput v-model.number="sRetry.attempt_deadline_ms" type="number" data-test="group-retry-attempt-deadline-ms" />
-                  </div>
+                <Field label="单次尝试上限 (秒)" hint="一次尝试的最长耗时，超时即判定失败并降级">
+                  <SecInput v-model="sRetry.attempt_deadline_ms" data-test="group-retry-attempt-deadline-ms" @input="markDirty()" />
                 </Field>
-                <Field label="连接超时 (ms)" hint="与上游建立 TCP / TLS 连接的超时">
-                  <div data-test="group-retry-connect-timeout-ms">
-                    <TInput v-model.number="sRetry.connect_timeout_ms" type="number" data-test="group-retry-connect-timeout-ms" />
-                  </div>
+                <Field label="连接超时 (秒)" hint="与上游建立 TCP / TLS 连接的超时">
+                  <SecInput v-model="sRetry.connect_timeout_ms" data-test="group-retry-connect-timeout-ms" @input="markDirty()" />
                 </Field>
-                <Field label="首字节超时 (ms)" hint="发出请求到收到响应首字节的超时">
-                  <div data-test="group-retry-ttfb-timeout-ms">
-                    <TInput v-model.number="sRetry.ttfb_timeout_ms" type="number" data-test="group-retry-ttfb-timeout-ms" />
-                  </div>
+                <Field label="首字节超时 (秒)" hint="发出请求到收到响应首字节的超时">
+                  <SecInput v-model="sRetry.ttfb_timeout_ms" data-test="group-retry-ttfb-timeout-ms" @input="markDirty()" />
                 </Field>
-                <Field label="首个事件超时 (ms)" hint="流式响应中第一个事件到达的超时">
-                  <div data-test="group-retry-first-event-timeout-ms">
-                    <TInput v-model.number="sRetry.first_event_timeout_ms" type="number" data-test="group-retry-first-event-timeout-ms" />
-                  </div>
+                <Field label="首个事件超时 (秒)" hint="流式响应中第一个事件到达的超时">
+                  <SecInput v-model="sRetry.first_event_timeout_ms" data-test="group-retry-first-event-timeout-ms" @input="markDirty()" />
                 </Field>
-                <Field label="流空闲超时 (ms)" hint="流式响应里两个数据块之间的最大空闲时间">
-                  <div data-test="group-retry-chunk-idle-timeout-ms">
-                    <TInput v-model.number="sRetry.chunk_idle_timeout_ms" type="number" data-test="group-retry-chunk-idle-timeout-ms" />
-                  </div>
+                <Field label="流空闲超时 (秒)" hint="流式响应里两个数据块之间的最大空闲时间">
+                  <SecInput v-model="sRetry.chunk_idle_timeout_ms" data-test="group-retry-chunk-idle-timeout-ms" @input="markDirty()" />
                 </Field>
-                <Field label="预留余量 (ms)" hint="给收尾/补帧留的时间">
-                  <div data-test="group-retry-reserve-ms">
-                    <TInput v-model.number="sRetry.reserve_ms" type="number" data-test="group-retry-reserve-ms" />
-                  </div>
+                <Field label="预留余量 (秒)" hint="给收尾/补帧留的时间">
+                  <SecInput v-model="sRetry.reserve_ms" data-test="group-retry-reserve-ms" @input="markDirty()" />
                 </Field>
             </div>
 
@@ -1195,7 +1176,7 @@ function saveTiers() {
             <Alert v-if="!sBudget.ok" tone="err" class="mt-3" data-test="group-retry-invalid">
               <Info :size="13" class="mt-0.5 shrink-0" />
               <span>
-                预算不成立：{{ sBudget.line }} &gt; 总预算 {{ sRetry.total_deadline_ms }} ms，
+                预算不成立：{{ sBudget.line }} &gt; 总预算 {{ fmtSec(sRetry.total_deadline_ms) }}，
                 服务端会拒绝保存，请调小尝试次数或单次上限。
               </span>
             </Alert>
@@ -1543,7 +1524,7 @@ function saveTiers() {
           </Card>
           <Card>
             <div class="text-[11.5px] text-ink-3">平均耗时</div>
-            <div class="mt-1.5 font-mono text-[20px] font-semibold leading-7 tabular-nums text-ink">{{ fmtMs(avgDuration) }}</div>
+            <div class="mt-1.5 font-mono text-[20px] font-semibold leading-7 tabular-nums text-ink">{{ fmtSec(avgDuration) }}</div>
           </Card>
         </div>
 
@@ -1641,8 +1622,8 @@ function saveTiers() {
                     (浪费 {{ fmtCost(row.wasted_cost_usd) }})
                   </span>
                 </td>
-                <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtMs(row.duration_ms) }}</td>
-                <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtMs(row.ttft_ms) }}</td>
+                <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtSec(row.duration_ms) }}</td>
+                <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtSec(row.ttft_ms) }}</td>
                 <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums text-ink-2">
                   {{ fmtTps(tpsOf(row.duration_ms, row.ttft_ms, row.output_tokens)) }}
                 </td>
@@ -1696,7 +1677,7 @@ function saveTiers() {
                   <span v-else class="text-ink-3">—</span>
                 </td>
                 <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtInt(row.http_status) }}</td>
-                <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtMs(row.latency_ms) }}</td>
+                <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtSec(row.latency_ms) }}</td>
               </tr>
             </tbody>
           </table>

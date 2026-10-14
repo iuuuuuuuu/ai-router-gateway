@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { RefreshCw, ScrollText } from "@lucide/vue";
 import { api, type RequestLog, type SwitchLog } from "../api";
 import { channelName, groups } from "../store";
-import { fmtTps, tpsOf } from "../format";
+import { fmtSec, fmtTps, tpsOf } from "../format";
 import { toast } from "../toast";
 import {
   Alert, Badge, Btn, Card, Empty, Spinner, TInput, TSelect, TToggle,
@@ -23,10 +23,6 @@ function num(v: unknown): number | null {
 function fmtInt(v: unknown): string {
   const n = num(v);
   return n === null ? "—" : String(Math.round(n));
-}
-function fmtMs(v: unknown): string {
-  const n = num(v);
-  return n === null ? "—" : `${Math.round(n)}ms`;
 }
 function fmtCost(v: unknown): string {
   const n = num(v);
@@ -342,7 +338,7 @@ onUnmounted(() => {
                 <span v-else class="text-ink-3">—</span>
               </td>
               <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtInt(row.http_status) }}</td>
-              <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtMs(row.latency_ms) }}</td>
+              <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtSec(row.latency_ms) }}</td>
             </tr>
           </tbody>
         </table>
@@ -401,8 +397,8 @@ onUnmounted(() => {
                   (浪费 {{ fmtCost(row.wasted_cost_usd) }})
                 </span>
               </td>
-              <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtMs(row.duration_ms) }}</td>
-              <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtMs(row.ttft_ms) }}</td>
+              <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtSec(row.duration_ms) }}</td>
+              <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtSec(row.ttft_ms) }}</td>
               <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums text-ink-2">
                 {{ fmtTps(tpsOf(row.duration_ms, row.ttft_ms, row.output_tokens)) }}
               </td>

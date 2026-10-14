@@ -5,6 +5,7 @@ import type { EChartsCoreOption } from "echarts/core";
 import { api, type CooldownRow as ApiCooldownRow, type GroupStatRow, type StatsPayload } from "../api";
 import { channelName, groups } from "../store";
 import { toast } from "../toast";
+import { fmtSec } from "../format";
 import { chartPalette, chartTheme } from "../chart-theme";
 import EChart from "../components/EChart.vue";
 import {
@@ -28,10 +29,6 @@ function num(v: unknown): number | null {
 function fmtInt(v: unknown): string {
   const n = num(v);
   return n === null ? "—" : String(Math.round(n));
-}
-function fmtMs(v: unknown): string {
-  const n = num(v);
-  return n === null ? "—" : `${Math.round(n)}ms`;
 }
 function fmtCost(v: unknown): string {
   const n = num(v);
@@ -258,11 +255,11 @@ function fmtRemain(ms: number | null): string {
   if (ms === null) return "—";
   const s = Math.ceil(ms / 1000);
   if (s <= 0) return "已到期";
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m${s % 60}s`;
+  if (s < 60) return `${s}秒`;
+  if (s < 3600) return `${Math.floor(s / 60)}分${s % 60}秒`;
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
-  return `${h}h${m}m`;
+  return `${h}小时${m}分`;
 }
 function healthKey(row: CooldownRow, i: number): string {
   return `${row?.channel_id ?? "c"}|${row?.upstream_model ?? ""}|${row?.kind ?? ""}|${i}`;
@@ -462,7 +459,7 @@ onUnmounted(() => {
         <Card>
           <div class="text-[11.5px] text-ink-3">平均耗时 / 成功率</div>
           <div class="mt-1.5 flex items-center gap-2">
-            <span class="font-mono text-[20px] font-semibold leading-7 tabular-nums text-ink">{{ fmtMs(avgDuration) }}</span>
+            <span class="font-mono text-[20px] font-semibold leading-7 tabular-nums text-ink">{{ fmtSec(avgDuration) }}</span>
             <Badge :tone="rateTone">{{ successRate === null ? "—" : `${successRate.toFixed(1)}%` }}</Badge>
           </div>
         </Card>
@@ -605,7 +602,7 @@ onUnmounted(() => {
                 <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums text-ink-2">{{ fmtInt(row.input_tokens) }}</td>
                 <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums text-ink-2">{{ fmtInt(row.output_tokens) }}</td>
                 <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums text-ink">{{ fmtCost(row.cost_usd) }}</td>
-                <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums">{{ fmtMs(row.avg_duration_ms) }}</td>
+                <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums">{{ fmtSec(row.avg_duration_ms) }}</td>
                 <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums">{{ fmtInt(groupModels(row)) }}</td>
               </tr>
             </tbody>

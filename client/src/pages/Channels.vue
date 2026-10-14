@@ -372,7 +372,7 @@ async function runFetch() {
       const bound = new Set(models.value.filter(m => m.channel_id === ch).map(m => m.upstream));
       fetchRows.value = (r.models || []).map(id => ({ id, bound: bound.has(id) }));
       const nBound = fetchRows.value.filter(x => x.bound).length;
-      fetchMsg.value = "上游返回 " + r.count + " 个模型 · " + r.latency_ms + "ms" + (nBound ? " · 其中 " + nBound + " 个已在本渠道绑定" : "");
+      fetchMsg.value = "上游返回 " + r.count + " 个模型 · " + fmtSec(r.latency_ms) + (nBound ? " · 其中 " + nBound + " 个已在本渠道绑定" : "");
       fetchErr.value = false;
     } else {
       fetchErr.value = true;
@@ -449,7 +449,7 @@ async function test(ch: Channel) {
   try {
     const r = await api.testChannel(ch.id);
     if (r.ok) {
-      toast.ok("连通正常 · " + r.latency_ms + "ms");
+      toast.ok("连通正常 · " + fmtSec(r.latency_ms));
       const sample = (r.sample || "").trim();
       if (sample) toast.info(sample.length > 120 ? sample.slice(0, 120) + "…" : sample);
     } else {

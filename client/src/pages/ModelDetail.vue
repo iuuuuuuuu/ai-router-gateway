@@ -7,6 +7,7 @@ import { ArrowLeft, RefreshCw, Repeat, ScrollText, ShieldAlert, Waypoints } from
 import { api, type GroupMember, type GroupMembersPayload, type SwitchLog } from "../api";
 import { channelName, bindingLabel } from "../store";
 import { closeModelDetail, nav } from "../nav";
+import { fmtSec } from "../format";
 import Btn from "../components/ui/Btn.vue";
 import Badge from "../components/ui/Badge.vue";
 import Card from "../components/ui/Card.vue";
@@ -33,10 +34,6 @@ function fmtInt(v: unknown): string {
   const n = num(v);
   return n === null ? "—" : String(Math.round(n));
 }
-function fmtMs(v: unknown): string {
-  const n = num(v);
-  return n === null ? "—" : `${Math.round(n)}ms`;
-}
 function fmtCost(v: unknown): string {
   const n = num(v);
   return n === null ? "—" : `$${n.toFixed(6)}`;
@@ -62,11 +59,11 @@ function fmtRemain(ms: number | null): string {
   if (ms === null) return "—";
   const s = Math.ceil(ms / 1000);
   if (s <= 0) return "已到期";
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.floor(s / 60)}m${s % 60}s`;
+  if (s < 60) return `${s}秒`;
+  if (s < 3600) return `${Math.floor(s / 60)}分${s % 60}秒`;
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
-  return `${h}h${m}m`;
+  return `${h}小时${m}分`;
 }
 function tierName(level: unknown): string {
   const t = num(level);
@@ -285,14 +282,14 @@ watch(() => [nav.groupId, nav.modelKey].join("|"), () => { void load(); });
           </div>
           <div class="rounded-lg border border-line-soft bg-app px-3 py-2.5">
             <p class="text-[11.5px] text-ink-3">平均耗时</p>
-            <p class="mt-0.5 font-mono text-[17px] font-semibold tabular-nums text-ink">{{ fmtMs(member.avg_duration_ms) }}</p>
+            <p class="mt-0.5 font-mono text-[17px] font-semibold tabular-nums text-ink">{{ fmtSec(member.avg_duration_ms) }}</p>
           </div>
         </div>
 
         <dl class="mt-3 grid grid-cols-1 gap-x-5 gap-y-1.5 text-[12.5px] sm:grid-cols-2">
           <div class="flex items-baseline justify-between gap-2 border-t border-line-soft pt-1.5">
             <dt class="shrink-0 text-ink-3">平均 TTFT</dt>
-            <dd class="font-mono tabular-nums text-ink">{{ fmtMs(member.avg_ttft_ms) }}</dd>
+            <dd class="font-mono tabular-nums text-ink">{{ fmtSec(member.avg_ttft_ms) }}</dd>
           </div>
           <div class="flex items-baseline justify-between gap-2 border-t border-line-soft pt-1.5">
             <dt class="shrink-0 text-ink-3">tokens 输入 / 输出</dt>
@@ -395,7 +392,7 @@ watch(() => [nav.groupId, nav.modelKey].join("|"), () => { void load(); });
                   <td class="whitespace-nowrap px-3 py-2"><Badge :tone="outcomeInfo(row.outcome).tone">{{ outcomeInfo(row.outcome).label }}</Badge></td>
                   <td class="whitespace-nowrap px-3 py-2"><Badge :tone="errorClass(row.error_class).tone">{{ errorClass(row.error_class).text || "—" }}</Badge></td>
                   <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums text-ink-2">{{ fmtInt(row.http_status) }}</td>
-                  <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums text-ink-2">{{ fmtMs(row.latency_ms) }}</td>
+                  <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums text-ink-2">{{ fmtSec(row.latency_ms) }}</td>
                   <td class="max-w-[320px] truncate px-3 py-2 text-ink-3" :title="fmtText(row.message)">{{ fmtText(row.message) }}</td>
                 </tr>
               </tbody>

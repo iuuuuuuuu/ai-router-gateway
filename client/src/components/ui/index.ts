@@ -5,6 +5,7 @@ export { default as Card } from "./Card.vue";
 export { default as PageHeader } from "./PageHeader.vue";
 export { default as Field } from "./Field.vue";
 export { default as TInput } from "./TInput.vue";
+export { default as SecInput } from "./SecInput.vue";
 export { default as TSelect } from "./TSelect.vue";
 export { default as TTextarea } from "./TTextarea.vue";
 export { default as TToggle } from "./TToggle.vue";

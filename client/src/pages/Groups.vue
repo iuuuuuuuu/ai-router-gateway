@@ -12,6 +12,7 @@ import { Badge, Btn, Card, Empty, IconBtn } from "../components/ui";
 import { openGroupDetail, openModelDetail } from "../nav";
 import { apiKeys, bindingLabel, channelName, groups, groupsUsingModel, markDirty, models, state, uid } from "../store";
 import { toast } from "../toast";
+import { fmtSec } from "../format";
 import {
   api, type Group, type GroupMember, type GroupMembersPayload, type GroupStatRow,
   type InflightSnapshot, type StatsPayload, type Tier,
@@ -178,8 +179,7 @@ function statCost(groupId: string): string {
 }
 /** 平均耗时：服务端只对成功请求求平均，无成功请求时为 null → 「—」。 */
 function statAvg(groupId: string): string {
-  const n = statNum(statOf(groupId)?.avg_duration_ms);
-  return n === null ? "—" : `${Math.round(n)}ms`;
+  return fmtSec(statOf(groupId)?.avg_duration_ms ?? null);
 }
 function statTokens(groupId: string): { short: string; full: string } {
   const row = statOf(groupId);
