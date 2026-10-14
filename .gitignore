@@ -126,3 +126,13 @@ Desktop.ini
 /tools/_e2e-driver.mjs
 /tools/_e2e-launch.mjs
 /tools/_e2e-up-b.mjs
+
+# ── v0.4.3 真机验收：统计图表 / 请求日志派生字段 / 侧栏折叠（本机证据，不入库）──
+/tools/_accept-v043.mjs
+/tools/_accept-chart.mjs
+/tools/_x1.mjs
+/tools/_x2.mjs
+/tools/_x3.mjs
+/tools/_x4.mjs
+/tools/_x5.mjs
+/tools/_x6.mjs

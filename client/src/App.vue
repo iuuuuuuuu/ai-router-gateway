@@ -99,8 +99,9 @@ const headingHint = computed(() => (detailGroup.value
       class="flex shrink-0 flex-col border-r border-line bg-rail transition-[width] duration-150"
       :style="{ width: collapsed ? '60px' : '186px' }"
     >
-      <div class="flex h-[52px] items-center gap-2 px-3">
-        <div class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-brand-500 text-white shadow-sm">
+      <!-- 折叠时整块只留展开按钮：logo 与标题都收起（logo 只在展开态显示）。 -->
+      <div class="flex h-[52px] items-center gap-2 px-3" :class="collapsed ? 'justify-center' : ''">
+        <div v-if="!collapsed" class="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-brand-500 text-white shadow-sm">
           <Zap :size="16" />
         </div>
         <span v-if="!collapsed" class="min-w-0 flex-1 truncate text-[13.5px] font-semibold text-ink">AI 网关控制台</span>

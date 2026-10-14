@@ -1,9 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { Eraser, Layers, RefreshCw, Repeat, ScrollText, ShieldAlert } from "@lucide/vue";
+import { BarChart3, Eraser, Layers, PieChart, RefreshCw, Repeat, ScrollText, ShieldAlert } from "@lucide/vue";
+import type { EChartsCoreOption } from "echarts/core";
 import { api, type CooldownRow as ApiCooldownRow, type GroupStatRow, type StatsPayload } from "../api";
 import { channelName, groups } from "../store";
 import { toast } from "../toast";
+import { chartPalette, chartTheme } from "../chart-theme";
+import EChart from "../components/EChart.vue";
 import {
   Alert, Badge, Btn, Card, Empty, Spinner, TSelect, TToggle,
 } from "../components/ui";
@@ -75,6 +78,7 @@ async function load(silent = false) {
     // api.stats 自己会拼 "?group_id=..."；传 undefined 即全局统计。
     const payload = (await api.stats(scopedId.value || undefined)) as StatsPayload;
     data.value = payload;
+    palette.value = chartPalette(chartTheme());
     lastAt.value = Date.now();
   } catch (e: any) {
     err.value = String(e?.message || e);
@@ -170,8 +174,8 @@ function shareText(row: Row): string {
 }
 
 /* ------------------------------ 分组用量 ------------------------------ */
-// 后端 stats_by_group() 永远统计全部分组（server/src/store.rs），不受上面的 scope 影响，
-// 所以这里渲染的是「全局总览」，点击某行才把 scope 切到那个分组。
+// 后端 stats_by_group() 会跟着上面的 scope 一起过滤（server/src/store.rs 的 WHERE 拼接）：
+// 全局时列出所有分组，选了某个分组时只返回那一行。点行可把 scope 切过去 / 再点一次切回全局。
 function groupLabel(id: unknown): string {
   const g = String(id ?? "").trim();
   // request_logs.group_id 允许为空串（列级迁移的历史行）→ 统一显示为「未知分组」
@@ -278,6 +282,96 @@ async function clearCool(channelId: string) {
   }
 }
 
+
+/* ------------------------------- 图表 ------------------------------- */
+// ECharts 是 canvas 渲染，读不到 CSS 变量；这里在每次拉完数据后现取一遍设计 token，
+// 保证图表配色永远跟页面一致（含侧栏折叠、窗口缩放这类布局变化）。
+const palette = ref<string[]>(chartPalette(chartTheme()));
+
+// 横轴名字太长会把图表挤扁，统一截断成短标签。
+function shortLabel(s: string, max = 14): string {
+  const t = s && s !== "—" ? s : "未知";
+  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+}
+
+function modelRequests(row: Row): number {
+  return firstNum(row, ["requests", "request_count", "count", "total_requests"]) ?? 0;
+}
+function modelTokens(row: Row): number {
+  return (firstNum(row, ["input_tokens", "prompt_tokens", "input"]) ?? 0)
+    + (firstNum(row, ["output_tokens", "completion_tokens", "output"]) ?? 0);
+}
+
+// 横向条形图：按模型请求数排行（前 8 名），颜色统一用品牌橙。
+const reqOption = computed<EChartsCoreOption>(() => {
+  const t = chartTheme();
+  const rows = byModel.value.slice().sort((a, b) => modelRequests(b) - modelRequests(a)).slice(0, 8).reverse();
+  return {
+    animationDuration: 320,
+    grid: { left: 4, right: 28, top: 8, bottom: 4, containLabel: true },
+    tooltip: {
+      trigger: "axis", axisPointer: { type: "shadow" },
+      backgroundColor: t.surface, borderColor: t.line, borderWidth: 1,
+      textStyle: { color: t.ink, fontSize: 12, fontFamily: t.mono },
+      formatter: (p: any) => {
+        const it = Array.isArray(p) ? p[0] : p;
+        return it.name + "<br/>请求 <b>" + it.value + "</b>";
+      },
+    },
+    xAxis: {
+      type: "value", minInterval: 1,
+      axisLine: { show: false }, axisTick: { show: false },
+      splitLine: { lineStyle: { color: t.line, type: "dashed" } },
+      axisLabel: { color: t.ink3, fontSize: 11 },
+    },
+    yAxis: {
+      type: "category",
+      data: rows.map(r => shortLabel(modelExposed(r))),
+      axisLine: { lineStyle: { color: t.line } }, axisTick: { show: false },
+      axisLabel: { color: t.ink2, fontSize: 11 },
+    },
+    series: [{
+      type: "bar", barMaxWidth: 18,
+      data: rows.map(modelRequests),
+      itemStyle: { color: t.brand, borderRadius: [0, 4, 4, 0] },
+      label: { show: true, position: "right", color: t.ink2, fontSize: 11, fontFamily: t.mono },
+    }],
+  };
+});
+
+// 环形图：按模型 token 占比（输入 + 输出），第 6 名以后合并成「其他」。
+const tokenTotal = computed(() => byModel.value.reduce((s, r) => s + modelTokens(r), 0));
+const tokenOption = computed<EChartsCoreOption>(() => {
+  const t = chartTheme();
+  const rows = byModel.value.slice().sort((a, b) => modelTokens(b) - modelTokens(a));
+  const items = rows.slice(0, 6).map(r => ({ name: shortLabel(modelExposed(r)), value: modelTokens(r) }));
+  const rest = rows.slice(6);
+  const restSum = rest.reduce((s, r) => s + modelTokens(r), 0);
+  if (restSum > 0) items.push({ name: "其他 " + rest.length + " 个", value: restSum });
+  return {
+    animationDuration: 320,
+    color: palette.value,
+    tooltip: {
+      trigger: "item",
+      backgroundColor: t.surface, borderColor: t.line, borderWidth: 1,
+      textStyle: { color: t.ink, fontSize: 12, fontFamily: t.mono },
+      formatter: (p: any) => p.name + "<br/>" + p.value + " tokens（" + p.percent + "%）",
+    },
+    legend: {
+      type: "scroll", orient: "vertical", right: 0, top: "center",
+      itemWidth: 8, itemHeight: 8, icon: "circle",
+      textStyle: { color: t.ink2, fontSize: 11 },
+    },
+    series: [{
+      type: "pie", radius: ["46%", "70%"], center: ["34%", "50%"],
+      avoidLabelOverlap: true,
+      itemStyle: { borderColor: t.surface, borderWidth: 2 },
+      label: { show: false }, labelLine: { show: false },
+      data: items,
+    }],
+  };
+});
+
 /* ------------------------------ 定时器 ------------------------------ */
 let poll: number | undefined;
 let tick: number | undefined;
@@ -374,6 +468,40 @@ onUnmounted(() => {
         </Card>
       </div>
 
+      <!-- ---------------------------- 图表 ---------------------------- -->
+      <div class="mt-5 grid grid-cols-1 gap-3 lg:grid-cols-2">
+        <Card :pad="false" class="overflow-hidden">
+          <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+            <BarChart3 :size="15" class="text-ink-3" />
+            <h2 class="text-[13.5px] font-semibold text-ink">请求数 · 按模型</h2>
+            <span class="ml-auto text-[12px] text-ink-3">
+              {{ byModel.length ? `Top ${Math.min(8, byModel.length)} / 共 ${byModel.length} 个模型` : "暂无数据" }}
+            </span>
+          </div>
+          <Empty v-if="!byModel.length" title="暂无请求数据" hint="产生请求后这里会按模型展示请求数排行">
+            <template #icon><BarChart3 :size="28" /></template>
+          </Empty>
+          <div v-else class="px-3 py-3" data-test="stats-chart-req">
+            <EChart :option="reqOption" :height="Math.max(150, Math.min(8, byModel.length) * 32 + 46)" />
+          </div>
+        </Card>
+
+        <Card :pad="false" class="overflow-hidden">
+          <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+            <PieChart :size="15" class="text-ink-3" />
+            <h2 class="text-[13.5px] font-semibold text-ink">用量占比 · 按模型</h2>
+            <span class="ml-auto text-[12px] text-ink-3">
+              {{ tokenTotal > 0 ? `共 ${fmtInt(tokenTotal)} tokens` : "暂无数据" }}
+            </span>
+          </div>
+          <Empty v-if="!(tokenTotal > 0)" title="暂无 token 数据" hint="上游返回 usage 后，这里会按模型展示输入 + 输出的 token 占比">
+            <template #icon><PieChart :size="28" /></template>
+          </Empty>
+          <div v-else class="px-3 py-3" data-test="stats-chart-token">
+            <EChart :option="tokenOption" :height="260" />
+          </div>
+        </Card>
+      </div>
       <!-- -------------------------- 按模型成本 -------------------------- -->
       <Card :pad="false" class="mt-5 overflow-hidden">
         <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
@@ -434,11 +562,11 @@ onUnmounted(() => {
           <Layers :size="15" class="text-ink-3" />
           <h2 class="text-[13.5px] font-semibold text-ink">分组用量</h2>
           <span class="ml-auto text-[12px] text-ink-3">
-            {{ byGroup.length ? `共 ${byGroup.length} 个分组 · 全局总览，点行可切换统计范围` : "全局总览" }}
+            {{ byGroup.length ? `共 ${byGroup.length} 个分组 · 点行可切换统计范围` : (scopedId ? "该分组暂无用量" : "全局总览") }}
           </span>
         </div>
 
-        <Empty v-if="!byGroup.length" title="暂无分组用量" hint="带分组的请求产生后，这里会按分组汇总请求数、token 与成本">
+        <Empty v-if="!byGroup.length" title="暂无分组用量" hint="带分组的请求产生后，这里会按分组汇总请求数、token 与成本；切换统计范围后只显示被选中的分组">
           <template #icon><Layers :size="28" /></template>
         </Empty>
 

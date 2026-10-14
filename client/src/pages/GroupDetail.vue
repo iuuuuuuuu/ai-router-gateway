@@ -19,6 +19,7 @@ import {
 import { apiKeys, bindingLabel, channelName, markDirty, models, state } from "../store";
 import { closeGroupDetail, openModelDetail } from "../nav";
 import { toast } from "../toast";
+import { fmtTps, tpsOf } from "../format";
 import {
   Alert, Badge, Btn, Card, Empty, Field, IconBtn, PageHeader, Spinner, TInput, TSelect, TTextarea,
   TToggle,
@@ -1616,8 +1617,9 @@ function saveTiers() {
                 <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">尝试</th>
                 <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">tokens 输入 / 输出</th>
                 <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">成本</th>
-                <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">耗时</th>
-                <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">TTFT</th>
+                <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">总耗时</th>
+                <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">首字 TTFT</th>
+                <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3" title="输出速度：输出 tokens ÷ (总耗时 − 首字)，上游一次性返回时退化为 输出 tokens ÷ 总耗时">TPS 速度</th>
               </tr>
             </thead>
             <tbody>
@@ -1641,6 +1643,9 @@ function saveTiers() {
                 </td>
                 <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtMs(row.duration_ms) }}</td>
                 <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtMs(row.ttft_ms) }}</td>
+                <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums text-ink-2">
+                  {{ fmtTps(tpsOf(row.duration_ms, row.ttft_ms, row.output_tokens)) }}
+                </td>
               </tr>
             </tbody>
           </table>
