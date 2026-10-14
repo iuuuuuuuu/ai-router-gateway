@@ -1,18 +1,21 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { RefreshCw, ScrollText } from "@lucide/vue";
-import { api, type RequestLog, type SwitchLog } from "../api";
+import { api, type LogPage, type RequestLog, type SwitchLog } from "../api";
 import { channelName, groups } from "../store";
 import { fmtSec, fmtTps, tpsOf } from "../format";
 import { toast } from "../toast";
 import {
-  Alert, Badge, Btn, Card, Empty, Spinner, TInput, TSelect, TToggle,
+  Alert, Badge, Btn, Card, Empty, Spinner, TInput, TPager, TSelect, TToggle,
 } from "../components/ui";
 
 type Tone = "gray" | "teal" | "ok" | "warn" | "err" | "brand";
 type TabKey = "switch" | "request";
 
-const LIMIT = 300;
+// 每页条数由分页条自己选，默认 50：日志表一行要读好几个字段，50 行已经占满一屏，
+// 再多就只是把滚动条拉长。服务端把单页上限钳在 1000（server/src/store.rs 的 page_bounds）。
+const PAGE_SIZES = [20, 50, 100, 200];
+const DEFAULT_SIZE = 50;
 
 /* ------------------------------ 格式化兜底 ------------------------------ */
 function num(v: unknown): number | null {
@@ -119,6 +122,12 @@ const err = ref("");
 const lastAt = ref(0);
 const switchRows = ref<SwitchLog[]>([]);
 const requestRows = ref<RequestLog[]>([]);
+// 分页状态：页码从 1 开始；total 是服务端给的「过滤器命中的总行数」（不是当前页行数），
+// 切换日志与请求日志各自记一份，切 tab 时页大小和页码都从头来。
+const page = ref(1);
+const pageSize = ref(DEFAULT_SIZE);
+const switchTotal = ref(0);
+const requestTotal = ref(0);
 
 // reka-ui 的 SelectItem 不允许空字符串 value（空串是「清空选择、显示 placeholder」的语义），
 // 所以「全部分组」用哨兵值表示，发请求前再转成 undefined，让 api 的 qs() 丢掉这个参数。
@@ -135,7 +144,10 @@ const tabs: { key: TabKey; label: string }[] = [
   { key: "request", label: "请求日志" },
 ];
 
-const count = computed(() => (tab.value === "switch" ? switchRows.value.length : requestRows.value.length));
+// 工具条上的「共 N 条」用服务端给的总行数（不受分页影响），「本页 N 条」才是这一页的行数；
+// 两者分开显示，否则一加分页总数就永远等于页大小，看起来像数据凭空少了一大截。
+const total = computed(() => (tab.value === "switch" ? switchTotal.value : requestTotal.value));
+const pageCount = computed(() => (tab.value === "switch" ? switchRows.value.length : requestRows.value.length));
 const filterLabel = computed(() => {
   const parts: string[] = [];
   if (groupId.value !== ALL_GROUPS) parts.push(`分组：${groupName(groupId.value)}`);
@@ -151,12 +163,21 @@ async function load(silent = false) {
   if (!silent) loading.value = true;
   err.value = "";
   try {
+    const offset = (page.value - 1) * pageSize.value;
     if (tab.value === "switch") {
-      switchRows.value = await api.switchLogs(LIMIT, q.value.trim() || undefined, scopeId.value);
+      const res: LogPage<SwitchLog> = await api.switchLogsPage(pageSize.value, offset, q.value.trim() || undefined, scopeId.value);
+      switchRows.value = Array.isArray(res?.rows) ? res.rows : [];
+      switchTotal.value = Number(res?.total ?? 0) || 0;
     } else {
-      requestRows.value = await api.requestLogs(LIMIT, q.value.trim() || undefined, scopeId.value);
+      const res: LogPage<RequestLog> = await api.requestLogsPage(pageSize.value, offset, q.value.trim() || undefined, scopeId.value);
+      requestRows.value = Array.isArray(res?.rows) ? res.rows : [];
+      requestTotal.value = Number(res?.total ?? 0) || 0;
     }
     lastAt.value = Date.now();
+    // 服务端钳过 offset/limit，页码越界时要跟着收敛，否则会停在一个空页上。
+    // 写回 page 会触发上面的 watch，用新页码再拉一次。
+    const last = Math.max(1, Math.ceil(total.value / pageSize.value));
+    if (page.value > last) { page.value = last; }
   } catch (e: any) {
     err.value = String(e?.message || e);
   } finally {
@@ -183,9 +204,13 @@ watch(q, () => {
   }, 350);
 });
 
-watch(tab, () => { void load(); });
+// 换 tab / 换分组都换了一批数据，页码必须回到第 1 页，否则会停在上一个筛选的深处。
+// page 本来就已经是 1 时赋值不会触发 watch，所以这两处仍然要自己调一次 load()。
+watch(tab, () => { page.value = 1; void load(); });
 // 切换分组同样重新拉取（api 侧按 group_id 过滤）
-watch(groupId, () => { void load(); });
+watch(groupId, () => { page.value = 1; void load(); });
+// 翻页 / 改页大小：页大小变化时 TPager 已经把 page 归 1，这里只负责重新拉取。
+watch([page, pageSize], () => { void load(); });
 
 async function copyId(id: unknown) {
   const s = String(id ?? "");
@@ -239,7 +264,7 @@ onUnmounted(() => {
     <!-- 工具条：左侧统计文字 + request_id 过滤，右侧刷新 / 自动刷新 -->
     <div class="mb-3 flex flex-wrap items-center gap-2">
       <div class="text-[12px] text-ink-3">
-        共 {{ count }} 条记录<template v-if="filterLabel"> · {{ filterLabel }}</template>
+        共 {{ total }} 条记录<template v-if="pageCount"> · 本页 {{ pageCount }} 条</template><template v-if="filterLabel"> · {{ filterLabel }}</template>
         <span v-if="lastAt" class="ml-1 font-mono text-[11.5px]">· 最后更新 {{ fmtClock(lastAt) }}</span>
       </div>
       <!-- data-test 必须挂在包裹 div 上：reka-ui 的 SelectRoot 是 inheritAttrs:false 且未 v-bind="$attrs"，
@@ -279,11 +304,11 @@ onUnmounted(() => {
     </div>
 
     <Card :pad="false" class="overflow-hidden">
-      <div v-if="loading && !count" class="flex items-center justify-center gap-2 py-14 text-[13px] text-ink-3">
+      <div v-if="loading && !pageCount" class="flex items-center justify-center gap-2 py-14 text-[13px] text-ink-3">
         <Spinner :size="16" /> 正在加载…
       </div>
 
-      <Empty v-else-if="!count" title="暂无记录" hint="发出请求后这里会显示每一次上游切换与最终结果">
+      <Empty v-else-if="!pageCount" title="暂无记录" hint="发出请求后这里会显示每一次上游切换与最终结果">
         <template #icon><ScrollText :size="28" /></template>
       </Empty>
 
@@ -406,6 +431,19 @@ onUnmounted(() => {
           </tbody>
         </table>
       </div>
+
+      <!-- 分页条：两张表共用一条，页码/总数按当前 tab 走；没有数据时不占位。
+           翻页只改 page，由 script 里的 watch([page, pageSize]) 去重新拉取。 -->
+      <TPager
+        v-if="total > 0"
+        v-model:page="page"
+        v-model:size="pageSize"
+        :total="total"
+        :page-size="pageSize"
+        :size-options="PAGE_SIZES"
+        :loading="loading"
+        unit="条日志"
+      />
     </Card>
   </div>
 </template>

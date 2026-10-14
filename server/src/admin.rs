@@ -93,24 +93,36 @@ pub async fn put_config(State(state): State<AppState>, headers: HeaderMap, Json(
 
 #[derive(Deserialize)]
 pub struct LogQuery {
+    /// Page size; omitted = 100, and the store clamps it to 1000.
     pub limit: Option<u32>,
+    /// Rows to skip, newest-first: `offset = (page - 1) * limit`. Omitted = 0,
+    /// so every pre-paging caller keeps getting the newest `limit` rows.
+    pub offset: Option<u32>,
     pub request_id: Option<String>,
     /// Scopes the log to one routing group; omitted = every group.
     pub group_id: Option<String>,
 }
 
+/// Answers `{"rows":[...],"total":N,"limit":L,"offset":O}`. `total` is the row
+/// count the SAME filter matches ignoring the page window — that is what the
+/// console draws "第 X / Y 页" from, and it comes from the same `build_filters`
+/// as the rows, so the two can never disagree.
 pub async fn switch_logs(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<LogQuery>) -> Response {
     if let Err(r) = authorize(&state, &headers) { return r }
-    match state.store.list_switch_logs((q.limit.unwrap_or(100).min(1000)) as i64, q.request_id.as_deref(), q.group_id.as_deref()) {
-        Ok(rows) => Json(rows).into_response(),
+    let limit = q.limit.unwrap_or(100) as i64;
+    let offset = q.offset.unwrap_or(0) as i64;
+    match state.store.list_switch_logs_page(limit, offset, q.request_id.as_deref(), q.group_id.as_deref()) {
+        Ok(page) => Json(page.into_json()).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }
 
 pub async fn request_logs(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<LogQuery>) -> Response {
     if let Err(r) = authorize(&state, &headers) { return r }
-    match state.store.list_request_logs((q.limit.unwrap_or(100).min(1000)) as i64, q.request_id.as_deref(), q.group_id.as_deref()) {
-        Ok(rows) => Json(rows).into_response(),
+    let limit = q.limit.unwrap_or(100) as i64;
+    let offset = q.offset.unwrap_or(0) as i64;
+    match state.store.list_request_logs_page(limit, offset, q.request_id.as_deref(), q.group_id.as_deref()) {
+        Ok(page) => Json(page.into_json()).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
 }

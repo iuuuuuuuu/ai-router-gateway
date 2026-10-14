@@ -197,14 +197,30 @@ async function req(method: string, path: string, body?: unknown): Promise<any> {
   return parsed;
 }
 
+/**
+ * One page of log rows plus the total row count the same filter matches.
+ * `total` counts rows IGNORING the page window, so the console can render
+ * "第 X / Y 页" without a second round trip. Server contract: /admin/api/logs/switch
+ * and /admin/api/logs/requests both answer this exact shape.
+ */
+export interface LogPage<T> {
+  rows: T[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 export const api = {
   getConfig: (): Promise<AdminConfig> => req("GET", "/admin/api/config"),
   putConfig: (cfg: AdminConfig): Promise<{ ok: boolean; config_version: number }> =>
     req("PUT", "/admin/api/config", cfg),
-  switchLogs: (limit = 200, requestId?: string, groupId?: string): Promise<SwitchLog[]> =>
-    req("GET", `/admin/api/logs/switch?limit=${limit}` + qs({ request_id: requestId, group_id: groupId })),
-  requestLogs: (limit = 200, requestId?: string, groupId?: string): Promise<RequestLog[]> =>
-    req("GET", `/admin/api/logs/requests?limit=${limit}` + qs({ request_id: requestId, group_id: groupId })),
+  // Log rows always come back paged: { rows, total, limit, offset }. Every caller
+  // (Logs.vue page buttons, GroupDetail.vue and ModelDetail.vue "newest N" lists)
+  // goes through these two; there is no array-only variant left to keep in sync.
+  switchLogsPage: (limit = 200, offset = 0, requestId?: string, groupId?: string): Promise<LogPage<SwitchLog>> =>
+    req("GET", `/admin/api/logs/switch?limit=${limit}&offset=${offset}` + qs({ request_id: requestId, group_id: groupId })),
+  requestLogsPage: (limit = 200, offset = 0, requestId?: string, groupId?: string): Promise<LogPage<RequestLog>> =>
+    req("GET", `/admin/api/logs/requests?limit=${limit}&offset=${offset}` + qs({ request_id: requestId, group_id: groupId })),
   // NOTE: the other endpoints already carry "?limit=", so qs()'s leading "&"
   // works there. /stats has no other parameter, so the "?" has to be explicit
   // here — otherwise the URL becomes "/admin/api/stats&group_id=..." → 404.

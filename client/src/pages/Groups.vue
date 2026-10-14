@@ -67,11 +67,30 @@ function memberKey(groupId: string, tierLevel: number, modelId: string): string 
   return b ? `${b.channel_id}::${b.upstream}` : "";
 }
 /** 该成员此刻的并发数：优先成员级快照（服务端按 key 聚合），缺失时退回全组口径。 */
+/**
+ * 该成员此刻的并发数：优先成员级快照（服务端按 key 聚合），缺失时退回全组口径。
+ * ★非响应依赖：它读 inflight.value，但函数本身没有 .value 属性（memberInflight.value 恒为 undefined）。
+ * 想在模板或计算属性里判断「在用」，一律用下面的 memberInUse()，不要直接用这个原始数字。
+ */
 function memberInflight(groupId: string, tierLevel: number, modelId: string): number {
   const key = memberKey(groupId, tierLevel, modelId);
   const fromKey = key ? inflight.value?.members?.[key] : undefined;
   if (typeof fromKey === "number") return fromKey;
   return memberOf(groupId, tierLevel, modelId)?.inflight ?? 0;
+}
+/**
+ * 该成员此刻是否真的在用（**真实 in-flight 并发 > 0**，唯一数据来源 GET /admin/api/inflight）。
+ * ★必须是普通函数、不可改写成 computed：computed 会让 memberInUse.value 恒为 undefined，
+ * 在模板里就是恒假 —— 「使用中」高亮会悄悄永不出现，属于假绿。
+ */
+function memberInUse(groupId: string, tierLevel: number, modelId: string): boolean {
+  return memberInflight(groupId, tierLevel, modelId) > 0;
+}
+/** 高亮的 title：把「在被谁用、并发多少」说清楚，避免与一级的静态色调混淆。 */
+function memberInUseTitle(groupId: string, tierLevel: number, modelId: string): string {
+  const g = groups.value.find(x => x.id === groupId);
+  const n = memberInflight(groupId, tierLevel, modelId);
+  return (g?.name ?? groupId) + "：此刻正在使用该 (渠道, 上游模型) 的并发请求数 " + n;
 }
 function memberRequests(groupId: string, tierLevel: number, modelId: string): number {
   return memberOf(groupId, tierLevel, modelId)?.requests ?? 0;
@@ -525,13 +544,26 @@ function confirmRemoveGroup() {
                       v-for="(m, mi) in t.members"
                       :key="t.level + '-' + m.model_id"
                       data-test="member-chip"
+                      :data-in-use="memberInUse(g.id, t.level, m.model_id) ? '1' : '0'"
                       class="flex cursor-pointer items-center gap-2 rounded-[10px] border px-2.5 py-1 transition-colors hover:border-teal-300"
-                      :class="t.level === 1
-                        ? 'border-teal-200 bg-teal-50/60'
-                        : 'border-line bg-app'"
-                      :title="'查看 ' + bindingLabel(m.model_id) + ' 的详情'"
+                      :class="memberInUse(g.id, t.level, m.model_id)
+                        ? 'border-teal-400 bg-teal-100 ring-2 ring-teal-500/35'
+                        : (t.level === 1
+                          ? 'border-teal-200 bg-teal-50/60'
+                          : 'border-line bg-app')"
+                      :title="memberInUse(g.id, t.level, m.model_id)
+                        ? memberInUseTitle(g.id, t.level, m.model_id)
+                        : '查看 ' + bindingLabel(m.model_id) + ' 的详情'"
                       @click="openMember(g.id, t.level, m.model_id)"
                     >
+                      <span
+                        v-if="memberInUse(g.id, t.level, m.model_id)"
+                        class="relative flex h-2 w-2 shrink-0"
+                        aria-hidden="true"
+                      >
+                        <span class="absolute inline-flex h-full w-full animate-ping rounded-full bg-teal-500 opacity-70"></span>
+                        <span class="relative inline-flex h-2 w-2 rounded-full bg-teal-600"></span>
+                      </span>
                       <span
                         class="font-mono text-[12.5px] text-ink"
                       >{{ bindingLabel(m.model_id) }}</span>

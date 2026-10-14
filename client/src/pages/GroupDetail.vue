@@ -280,15 +280,17 @@ async function load(silent = false) {
   try {
     const [s, sw, rq, hl, gm] = await Promise.all([
       api.stats(g.id),
-      api.switchLogs(LIMIT, undefined, g.id),
-      api.requestLogs(LIMIT, undefined, g.id),
+      // 分页接口（v0.4.4 起服务端返回 {rows,total,limit,offset}）：详情页的语义是
+      // 「该分组最近 LIMIT 条」，固定 offset=0 取 rows 即可，不需要页码。
+      api.switchLogsPage(LIMIT, 0, undefined, g.id),
+      api.requestLogsPage(LIMIT, 0, undefined, g.id),
       api.health(),
       // 成员数据失败不拖垮整页：单独吞掉错误，退化成「0 次 + 无使用中（并发未知）」。
       api.groupMembers(g.id).catch(() => null),
     ]);
     stats.value = (s ?? null) as StatsPayload | null;
-    switchRows.value = Array.isArray(sw) ? sw : [];
-    requestRows.value = Array.isArray(rq) ? rq : [];
+    switchRows.value = Array.isArray(sw?.rows) ? sw.rows : [];
+    requestRows.value = Array.isArray(rq?.rows) ? rq.rows : [];
     cooldowns.value = Array.isArray(hl?.cooldowns) ? hl.cooldowns : [];
     memberPayload.value = (gm ?? null) as GroupMembersPayload | null;
   } catch (e: any) {
@@ -1322,13 +1324,16 @@ function saveTiers() {
                   <div
                     v-for="(m, mi) in t.members"
                     :key="mi"
-                    class="flex items-center gap-2 rounded-[10px] border border-line bg-surface px-2.5 py-1.5"
+                    class="flex items-center gap-2 rounded-[10px] border px-2.5 py-1.5"
                     :class="dragMember === m
                       ? 'relative z-20 border-brand-200 bg-brand-50 shadow-lg'
-                      : 'relative'"
+                      : (isMemberInUse(t.level, m.model_id)
+                        ? 'relative border-teal-400 bg-teal-100 ring-2 ring-teal-500/35'
+                        : 'relative border-line bg-surface')"
                     :style="dragMember === m ? dragStyle : undefined"
                     data-test="member-row"
                     :data-model="m.model_id"
+                    :data-in-use="isMemberInUse(t.level, m.model_id) ? '1' : '0'"
                   >
                     <button
                       type="button"

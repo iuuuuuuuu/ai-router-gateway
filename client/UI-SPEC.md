@@ -73,11 +73,13 @@ import { state, markDirty, channelName, modelLabel, uid, channels, models, group
 import { api } from "../api";
 api.testChannel(channelId, upstreamModel?)  // → {ok,status,latency_ms,sample} | {ok:false,error,latency_ms}
 api.clearCooldown(channelId)                // → {ok:true}
-api.switchLogs(limit=200, requestId?)       // → SwitchLog[]
-api.requestLogs(limit=200)                  // → RequestLog[]
-api.stats()                                 // → {summary, by_model, health}
+api.switchLogsPage(limit=100, offset=0, requestId?, groupId?)   // → LogPage<SwitchLog>
+api.requestLogsPage(limit=100, offset=0, requestId?, groupId?)  // → LogPage<RequestLog>
+api.stats(groupId?)                         // → {summary, by_model, by_group, health}
 api.health()                                // → {cooldowns: CooldownRow[]}
 ```
+
+★ `LogPage<T> = { rows: T[]; total: number; limit: number; offset: number }` —— `total` 是**忽略分页窗口**的过滤命中总数，控制台据此渲染「第 X / Y 页」。
 
 类型全部已导出：`Channel, ModelBinding, TierMember, Tier, Group, ApiKey, AdminConfig,
 SwitchLog, RequestLog, CooldownRow, StatsPayload, TestChannelResult, RetryConfig`。

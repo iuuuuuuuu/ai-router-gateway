@@ -59,8 +59,49 @@ export function normalize(cfg: any): AdminConfig {
   return c;
 }
 
+/**
+ * 保存前的本地自检：把 server/src/admin.rs:56-70 那两条引用完整性规则在本地先跑一遍。
+ *
+ * ★ 为什么值得单独做（2026-10-14 修「我保存失败了」）：
+ *   服务端 PUT /admin/api/config 是「先校验、后整体替换」——只要有一处悬空引用，
+ *   整份配置 400 拒收、一个字节都不落库；用户看到的就只有一行机器味的
+ *   `group grp_pro tier 1 references missing model mdl_pro_real`，既不知道是哪张卡弄的，
+ *   也不知道该去哪儿修。这里就地翻成人话，并直接指出该去哪里处理。
+ *   （删除路径已经在 Channels.vue 的 dropGroupRefs() 里清理引用；这里是第二道兜底。）
+ */
+function configProblems(cfg: AdminConfig): string[] {
+  const out: string[] = [];
+  const chIds = new Set((cfg.channels ?? []).map(c => c.id));
+  const mIds = new Set((cfg.models ?? []).map(m => m.id));
+  for (const m of cfg.models ?? []) {
+    if (!chIds.has(m.channel_id)) {
+      out.push(`模型绑定「${m.exposed || m.id}」挂在已不存在的渠道 ${m.channel_id} 上`);
+    }
+  }
+  for (const g of cfg.groups ?? []) {
+    for (const t of g.tiers ?? []) {
+      for (const mem of t.members ?? []) {
+        if (!mIds.has(mem.model_id)) {
+          out.push(`分组「${g.name || g.id}」第 ${t.level} 级引用了已删除的模型绑定 ${mem.model_id}`);
+        }
+      }
+    }
+  }
+  return out;
+}
+
 export async function saveConfig(): Promise<boolean> {
   if (!state.cfg) return false;
+  // ★ 本地先拦一道：悬空引用不是「保存失败」而是「配置本身不成立」，
+  //   说清数量与前几条，并告诉用户去哪儿处理，而不是把服务端 raw 400 甩出去。
+  const problems = configProblems(state.cfg);
+  if (problems.length) {
+    toast.err(
+      `保存失败：配置里还有 ${problems.length} 处失效引用 —— ${problems.slice(0, 3).join("；")}` +
+      `${problems.length > 3 ? " 等" : ""}。请到「渠道与模型」页删除对应绑定，或到分组详情页把该成员移除后重试。`,
+    );
+    return false;
+  }
   state.saving = true;
   try {
     const res = await api.putConfig(JSON.parse(JSON.stringify(state.cfg)));

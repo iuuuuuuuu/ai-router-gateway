@@ -9,7 +9,7 @@ import { fmtSec } from "../format";
 import { chartPalette, chartTheme } from "../chart-theme";
 import EChart from "../components/EChart.vue";
 import {
-  Alert, Badge, Btn, Card, Empty, Spinner, TSelect, TToggle,
+  Alert, Badge, Btn, Card, Empty, Spinner, TPager, TSelect, TToggle,
 } from "../components/ui";
 
 type Tone = "gray" | "teal" | "ok" | "warn" | "err" | "brand";
@@ -64,6 +64,21 @@ const autoRefresh = ref(true);
 const lastAt = ref(0);
 const clearing = ref("");
 const now = ref(Date.now());
+
+/* ------------------------------- 表格分页 ------------------------------- */
+// 统计接口返回的是全量聚合（by_model 按成本排序、by_group 按分组），条数由「用过几个模型 /
+// 几个分组」决定，几十行的量级；所以这里只做前端切片，不再打接口——翻页是零延迟的。
+// 两张表共用一份可选值；分页条在有行时就渲染（哪怕只有 1 页），
+// 这样「每页条数」这个偏好永远可达——否则行数少于默认页大小时用户根本改不了它。
+const SIZE_OPTIONS = [5, 10, 20, 50, 100];
+const modelPage = ref(1);
+const modelSize = ref(20);
+const groupPage = ref(1);
+const groupSize = ref(20);
+function clampPage(p: number, size: number, rows: number): number {
+  const last = Math.max(1, Math.ceil(rows / Math.max(1, size)));
+  return Math.min(Math.max(1, p), last);
+}
 
 let inflight = false;
 async function load(silent = false) {
@@ -181,6 +196,22 @@ function groupLabel(id: unknown): string {
 }
 const byGroup = computed<GroupStatRow[]>(() =>
   Array.isArray(data.value?.by_group) ? (data.value!.by_group as GroupStatRow[]) : []);
+
+// 切统计范围 / 刷新后行数会变，页码要跟着收敛到最后一页，否则会停在空白页上。
+watch([() => byModel.value.length, modelSize], () => {
+  modelPage.value = clampPage(modelPage.value, modelSize.value, byModel.value.length);
+});
+watch([() => byGroup.value.length, groupSize], () => {
+  groupPage.value = clampPage(groupPage.value, groupSize.value, byGroup.value.length);
+});
+const pagedByModel = computed<Row[]>(() => {
+  const start = (modelPage.value - 1) * modelSize.value;
+  return byModel.value.slice(start, start + modelSize.value);
+});
+const pagedByGroup = computed<GroupStatRow[]>(() => {
+  const start = (groupPage.value - 1) * groupSize.value;
+  return byGroup.value.slice(start, start + groupSize.value);
+});
 
 function groupRequests(row: GroupStatRow): number | null {
   return num(row?.requests);
@@ -511,6 +542,8 @@ onUnmounted(() => {
           <template #icon><ScrollText :size="28" /></template>
         </Empty>
 
+        <!-- 空态与表格行都按全量 byModel 判断：翻到第 5 页时 byModel 仍然非空，
+             用分页切片判断会让表格在翻页瞬间闪成「暂无成本数据」。 -->
         <div v-else class="overflow-x-auto">
           <table class="w-full text-[12.5px]">
             <thead>
@@ -525,7 +558,7 @@ onUnmounted(() => {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="(row, i) in byModel" :key="i" class="border-t border-line-soft hover:bg-app">
+              <tr v-for="(row, i) in pagedByModel" :key="modelPage + ':' + i" class="border-t border-line-soft hover:bg-app">
                 <td class="whitespace-nowrap px-3 py-2">{{ modelExposed(row) }}</td>
                 <td class="whitespace-nowrap px-3 py-2">{{ modelChannel(row) }}</td>
                 <td class="px-3 py-2 font-mono text-[11.5px] text-ink-2">{{ modelUpstream(row) }}</td>
@@ -551,6 +584,17 @@ onUnmounted(() => {
             </tbody>
           </table>
         </div>
+
+        <!-- 纯前端分页：byModel 已经是全量聚合，切片即可 -->
+        <TPager
+          v-if="byModel.length"
+          v-model:page="modelPage"
+          v-model:size="modelSize"
+          :total="byModel.length"
+          :page-size="modelSize"
+          :size-options="SIZE_OPTIONS"
+          unit="个模型"
+        />
       </Card>
 
       <!-- --------------------------- 分组用量 --------------------------- -->
@@ -583,7 +627,7 @@ onUnmounted(() => {
             </thead>
             <tbody>
               <tr
-                v-for="(row, i) in byGroup" :key="row.group_id || i"
+                v-for="(row, i) in pagedByGroup" :key="row.group_id || i"
                 class="cursor-pointer border-t border-line-soft transition-colors hover:bg-app"
                 :class="isCurrentScope(row) ? 'bg-app' : ''"
                 :title="`点击按「${groupLabel(row.group_id)}」过滤统计`"
@@ -608,6 +652,17 @@ onUnmounted(() => {
             </tbody>
           </table>
         </div>
+
+        <!-- 分组一般只有个位数，但同一个分页条的好处是「范围一换行数就变」时页码自动收敛 -->
+        <TPager
+          v-if="byGroup.length"
+          v-model:page="groupPage"
+          v-model:size="groupSize"
+          :total="byGroup.length"
+          :page-size="groupSize"
+          :size-options="SIZE_OPTIONS"
+          unit="个分组"
+        />
       </Card>
 
       <!-- --------------------------- 冷却状态 --------------------------- -->

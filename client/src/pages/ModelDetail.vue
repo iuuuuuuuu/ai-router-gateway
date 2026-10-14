@@ -4,7 +4,7 @@
 // 与 /admin/api/logs/switch（本分组最近若干条切换日志，客户端按渠道 + 上游模型过滤）。
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { ArrowLeft, RefreshCw, Repeat, ScrollText, ShieldAlert, Waypoints } from "@lucide/vue";
-import { api, type GroupMember, type GroupMembersPayload, type SwitchLog } from "../api";
+import { api, type GroupMember, type GroupMembersPayload, type LogPage, type SwitchLog } from "../api";
 import { channelName, bindingLabel } from "../store";
 import { closeModelDetail, nav } from "../nav";
 import { fmtSec } from "../format";
@@ -165,7 +165,9 @@ async function load() {
     // 两个请求各自独立失败：成员快照挂了也要尽力显示失败明细，反之亦然。
     const [members, rows] = await Promise.allSettled([
       api.groupMembers(groupId),
-      api.switchLogs(LIMIT, undefined, groupId) as Promise<SwitchRow[]>,
+      // 分页接口（v0.4.4 起返回 {rows,total,limit,offset}）；详情页只要「本分组该成员最近 LIMIT 条」，
+      // 固定 offset=0，下面从 rows 里取。
+      api.switchLogsPage(LIMIT, 0, undefined, groupId) as Promise<LogPage<SwitchRow>>,
     ]);
     if (members.status === "fulfilled") payload.value = members.value;
     else {
@@ -173,7 +175,7 @@ async function load() {
       err.value = members.reason instanceof Error ? members.reason.message : String(members.reason);
     }
     // 明细拉失败不算致命：概览照常显示，表格退化为空态文案。
-    switchRows.value = rows.status === "fulfilled" && Array.isArray(rows.value) ? rows.value : [];
+    switchRows.value = rows.status === "fulfilled" && Array.isArray(rows.value?.rows) ? rows.value.rows : [];
     lastAt.value = Date.now();
   } finally {
     loading.value = false;

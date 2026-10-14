@@ -483,18 +483,54 @@ const deleteImpact = computed(() => {
   return { models: bound.length, groups: gset.size };
 });
 
+/**
+ * 连带清理：把即将消失的模型绑定从所有分组的故障转移层级里摘掉。
+ *
+ * ★ 为什么必须做（2026-10-14 修「保存失败」）：
+ *   服务端 PUT /admin/api/config 是**整体替换 + 先校验**（server/src/admin.rs:62-70）：
+ *   只要有一处 tiers[].members[] 指向不存在的 model_id，整份配置 400 拒收、一个字节都不落库，
+ *   用户看到的就是「保存失败：group grp_x tier 1 references missing model mdl_y」。
+ *   而删除弹窗本来就写着「这些候选会消失」——所以这里替用户把引用一并摘干净，
+ *   否则界面看着正常（分组卡片照样渲染成员），一保存就必然失败。
+ *
+ * 空层保留不删：服务端接受没有成员的层（admin.rs 只校验引用是否存在），路由时该层没有候选、
+ * 等价于不存在；保住用户排好的层号比把界面擦干净更重要。
+ *
+ * @returns 受影响的分组名（用于 toast 如实告知改了哪些分组）。
+ */
+function dropGroupRefs(modelIds: Set<string>): string[] {
+  const cfg = state.cfg;
+  if (!cfg || !modelIds.size) return [];
+  const hits: string[] = [];
+  for (const g of cfg.groups) {
+    let removed = 0;
+    for (const t of g.tiers ?? []) {
+      const before = (t.members ?? []).length;
+      t.members = (t.members ?? []).filter(m => !modelIds.has(m.model_id));
+      removed += before - t.members.length;
+    }
+    if (removed) hits.push(g.name || g.id);
+  }
+  return hits;
+}
+
 /** 确认删除：WebView2 里 window.confirm 不可用，改用页面内 Modal。 */
 function confirmRemove() {
   const cfg = state.cfg;
   const ch = pendingDelete.value;
   if (!cfg || !ch) return;
-  const bound = cfg.models.filter(m => m.channel_id === ch.id).length;
+  const bound = cfg.models.filter(m => m.channel_id === ch.id);
   cfg.channels = cfg.channels.filter(c => c.id !== ch.id);
-  if (bound) cfg.models = cfg.models.filter(m => m.channel_id !== ch.id);
+  if (bound.length) cfg.models = cfg.models.filter(m => m.channel_id !== ch.id);
+  const hitGroups = dropGroupRefs(new Set(bound.map(m => m.id)));
   markDirty();
   epoch.value++;
   confirming.value = false;
-  toast.ok(bound ? "已删除渠道，并移除 " + bound + " 个模型绑定" : "渠道已删除");
+  const tail = [
+    bound.length ? `移除 ${bound.length} 个模型绑定` : "",
+    hitGroups.length ? `并从 ${hitGroups.length} 个分组的层级里摘掉对应成员（${hitGroups.join("、")}）` : "",
+  ].filter(Boolean).join("，");
+  toast.ok(tail ? "已删除渠道，" + tail : "渠道已删除");
 }
 
 const pendingModel = ref<ModelBinding | null>(null);
@@ -513,11 +549,22 @@ function confirmRemoveModel() {
   const cfg = state.cfg;
   const m = pendingModel.value;
   if (!cfg || !m) return;
+  const refsBefore = groupsUsingModel(m.id).length;
   cfg.models = cfg.models.filter(x => x.id !== m.id);
+  // ★ 与删渠道同理：先摘掉分组层级里的引用，再让用户保存 ——
+  //   留着悬空 model_id，顶栏「保存」会被服务端 400 全量拒收。
+  const hitGroups = dropGroupRefs(new Set([m.id]));
   markDirty();
   epoch.value++;
   modelConfirming.value = false;
-  toast.ok("模型绑定已删除");
+  const tail = hitGroups.length
+    ? `，并从 ${hitGroups.length} 个分组的层级里摘掉该成员（${hitGroups.join("、")}）`
+    : "";
+  toast.ok(
+    hitGroups.length || refsBefore
+      ? `模型绑定「${m.exposed || m.id}」已删除` + tail
+      : "模型绑定已删除",
+  );
 }
 </script>
 
@@ -816,7 +863,7 @@ function confirmRemoveModel() {
         确定删除渠道「<span class="font-medium text-ink">{{ pendingDelete?.name || pendingDelete?.id }}</span>」？
       </p>
       <p v-if="deleteImpact.models || deleteImpact.groups" class="mt-1.5 text-[11.5px] leading-4 text-ink-3">
-        会级联删除该渠道下的 {{ deleteImpact.models }} 个模型绑定<template v-if="deleteImpact.groups">，并影响 {{ deleteImpact.groups }} 个分组的故障转移层级（这些候选会消失）</template>。
+        会级联删除该渠道下的 {{ deleteImpact.models }} 个模型绑定<template v-if="deleteImpact.groups">，并从 {{ deleteImpact.groups }} 个分组的故障转移层级里摘掉对应成员（层本身与其余成员保留）</template>。
       </p>
 
       <template #footer>
@@ -836,7 +883,7 @@ function confirmRemoveModel() {
         确定删除模型绑定「<span class="font-medium text-ink">{{ pendingModel?.exposed || pendingModel?.id }}</span>」？
       </p>
       <p v-if="modelRefs.length" class="mt-1.5 text-[11.5px] leading-4 text-ink-3">
-        它正被 {{ modelRefs.length }} 个分组引用：{{ modelRefs.map(g => g.name || g.id).join("、") }}。删除后这些层级会少掉一个候选。
+        它正被 {{ modelRefs.length }} 个分组引用：{{ modelRefs.map(g => g.name || g.id).join("、") }}。删除后会从这些分组的层级里摘掉该成员（层本身与其余成员保留）。
       </p>
 
       <template #footer>

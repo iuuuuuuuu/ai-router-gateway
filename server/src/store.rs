@@ -59,9 +59,9 @@ pub struct RequestLog {
 
 /// Builds the shared `WHERE` clause for the two log queries. Returns the
 /// clause (with a leading space, or "" when unfiltered) plus the bind values
-/// in positional order; the caller appends `LIMIT` with the next index so a
-/// filtered and an unfiltered query share one code path.
-fn build_filters(request_id: Option<&str>, group_id: Option<&str>, limit: i64) -> (String, Vec<String>) {
+/// in positional order; the caller appends `LIMIT`/`OFFSET` with the next
+/// indexes so a filtered and an unfiltered query share one code path.
+fn build_filters(request_id: Option<&str>, group_id: Option<&str>) -> (String, Vec<String>) {
     let mut clauses: Vec<&str> = Vec::new();
     let mut binds: Vec<String> = Vec::new();
     if let Some(rid) = request_id {
@@ -76,11 +76,47 @@ fn build_filters(request_id: Option<&str>, group_id: Option<&str>, limit: i64) -
             binds.push(gid.to_string());
         }
     }
-    binds.push(limit.to_string());
     if clauses.is_empty() {
         (String::new(), binds)
     } else {
         (format!(" WHERE {}", clauses.join(" AND ")), binds)
+    }
+}
+
+/// Clamps a paging request into something the SQL layer can always execute:
+/// `limit` defaults to 100 and is capped at 1000 (the same ceiling the admin
+/// route enforced before paging existed), `offset` is never negative.
+fn page_bounds(limit: i64, offset: i64) -> (i64, i64) {
+    (if limit <= 0 { 100 } else { limit.min(1000) }, offset.max(0))
+}
+
+/// Total number of rows a log filter matches, ignoring the page window — what
+/// the console needs to draw "第 X / Y 页". It shares `build_filters` with the
+/// page queries so a count can never disagree with the rows it labels.
+fn count_rows(conn: &Connection, table: &str, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<i64> {
+    let (where_sql, binds) = build_filters(request_id, group_id);
+    let sql = format!("SELECT COUNT(*) FROM {table}{where_sql}");
+    let n: i64 = conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |r| r.get(0))?;
+    Ok(n)
+}
+
+/// One page of log rows plus the total behind it. Always the same shape, so
+/// the console can page through without a second request per page.
+pub struct LogPage {
+    rows: Vec<serde_json::Value>,
+    total: i64,
+    limit: i64,
+    offset: i64,
+}
+
+impl LogPage {
+    pub fn into_json(self) -> serde_json::Value {
+        serde_json::json!({
+            "rows": self.rows,
+            "total": self.total,
+            "limit": self.limit,
+            "offset": self.offset,
+        })
     }
 }
 
@@ -249,31 +285,58 @@ impl Store {
 
     /// `group_id` scopes the log to one routing group, `request_id` to one request.
     /// Both are optional and combine (a request belongs to exactly one group).
+    ///
+    /// Unpaged entry point: the newest `limit` rows. Kept for the test-suite;
+    /// the console always goes through `list_switch_logs_page` so it can page.
     pub fn list_switch_logs(&self, limit: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
-        let conn = self.conn.lock().unwrap();
-        let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'attempt_no',attempt_no,'tier',tier,'channel_id',channel_id,'channel_name',channel_name,'upstream_model',upstream_model,'outcome',outcome,'error_class',error_class,'http_status',http_status,'latency_ms',latency_ms,'message',message)";
-        let (where_sql, binds) = build_filters(request_id, group_id, limit);
-        let sql = format!("SELECT {cols} FROM switch_logs{where_sql} ORDER BY id DESC LIMIT ?{}", binds.len());
-        // bind the SQL to a local so the borrow outlives the prepared statement
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows.into_iter().map(|s| serde_json::from_str(&s).unwrap()).collect())
+        Ok(self.list_switch_logs_page(limit, 0, request_id, group_id)?.rows)
     }
 
-    pub fn list_request_logs(&self, limit: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
+    /// One page of switch logs: the newest `limit` rows after skipping `offset`,
+    /// plus the total number of rows the very same filter matches.
+    pub fn list_switch_logs_page(&self, limit: i64, offset: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<LogPage> {
+        let (limit, offset) = page_bounds(limit, offset);
         let conn = self.conn.lock().unwrap();
-        let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'exposed_model',exposed_model,'entry_protocol',entry_protocol,'status',status,'final_channel',final_channel,'final_upstream_model',final_upstream_model,'attempts',attempts,'loop_retries',loop_retries,'input_tokens',input_tokens,'output_tokens',output_tokens,'cache_read_tokens',cache_read_tokens,'cache_creation_tokens',cache_creation_tokens,'cost_usd',cost_usd,'wasted_cost_usd',wasted_cost_usd,'duration_ms',duration_ms,'ttft_ms',ttft_ms)";
-        let (where_sql, binds) = build_filters(request_id, group_id, limit);
+        let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'attempt_no',attempt_no,'tier',tier,'channel_id',channel_id,'channel_name',channel_name,'upstream_model',upstream_model,'outcome',outcome,'error_class',error_class,'http_status',http_status,'latency_ms',latency_ms,'message',message)";
+        let total = count_rows(&conn, "switch_logs", request_id, group_id)?;
+        let (where_sql, mut binds) = build_filters(request_id, group_id);
+        let n = binds.len();
+        binds.push(limit.to_string());
+        binds.push(offset.to_string());
+        let sql = format!("SELECT {cols} FROM switch_logs{where_sql} ORDER BY id DESC LIMIT ?{} OFFSET ?{}", n + 1, n + 2);
         // bind the SQL to a local so the borrow outlives the prepared statement
-        let sql = format!("SELECT {cols} FROM request_logs{where_sql} ORDER BY id DESC LIMIT ?{}", binds.len());
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows.into_iter().map(|s| serde_json::from_str(&s).unwrap()).collect())
+        Ok(LogPage { rows: rows.into_iter().map(|s| serde_json::from_str(&s).unwrap()).collect(), total, limit, offset })
     }
+
+    /// Unpaged entry point for request logs (see `list_switch_logs`).
+    pub fn list_request_logs(&self, limit: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
+        Ok(self.list_request_logs_page(limit, 0, request_id, group_id)?.rows)
+    }
+
+    /// One page of request logs: the newest `limit` rows after skipping `offset`,
+    /// plus the total number of rows the very same filter matches.
+    pub fn list_request_logs_page(&self, limit: i64, offset: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<LogPage> {
+        let (limit, offset) = page_bounds(limit, offset);
+        let conn = self.conn.lock().unwrap();
+        let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'exposed_model',exposed_model,'entry_protocol',entry_protocol,'status',status,'final_channel',final_channel,'final_upstream_model',final_upstream_model,'attempts',attempts,'loop_retries',loop_retries,'input_tokens',input_tokens,'output_tokens',output_tokens,'cache_read_tokens',cache_read_tokens,'cache_creation_tokens',cache_creation_tokens,'cost_usd',cost_usd,'wasted_cost_usd',wasted_cost_usd,'duration_ms',duration_ms,'ttft_ms',ttft_ms)";
+        let total = count_rows(&conn, "request_logs", request_id, group_id)?;
+        let (where_sql, mut binds) = build_filters(request_id, group_id);
+        let n = binds.len();
+        binds.push(limit.to_string());
+        binds.push(offset.to_string());
+        // bind the SQL to a local so the borrow outlives the prepared statement
+        let sql = format!("SELECT {cols} FROM request_logs{where_sql} ORDER BY id DESC LIMIT ?{} OFFSET ?{}", n + 1, n + 2);
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(LogPage { rows: rows.into_iter().map(|s| serde_json::from_str(&s).unwrap()).collect(), total, limit, offset })
+    }
+
 
     /// Per-member aggregates for ONE group, keyed by
     /// `"<channel_id>::<upstream_model>"` — the same key the console uses as a
