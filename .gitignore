@@ -183,3 +183,6 @@ Desktop.ini
 /tools/_probe-aw.mjs
 /tools/_dbg-drag2.mjs
 /tools/_dbg-drag3.mjs
+
+# ── v0.4.7 真机验收：分组详情页视口适配（高度铺满 / 分页贴底 / 表格自带滚动条）（本机证据，不入库）──
+/tools/_accept-viewport.mjs

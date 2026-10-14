@@ -989,7 +989,7 @@ function saveTiers() {
 </style>
 
 <template>
-  <div class="px-5 py-5 space-y-3.5" data-test="group-dashboard">
+  <div class="flex h-full min-h-0 flex-col gap-3.5 px-5 py-4" data-test="group-dashboard">
     <!-- ------------------------------ 页头 ------------------------------ -->
     <PageHeader
       :title="'分组详情 · ' + (group.name || group.id)"
@@ -1023,7 +1023,7 @@ function saveTiers() {
       <span v-else class="ml-auto font-mono text-[11.5px] text-ink-3">最近成功 —（本分组还没有成功请求）</span>
     </div>
     <!-- ------------------------------ 吸顶页签条 ------------------------------ -->
-    <div class="sticky top-0 z-10 -mx-5 mb-3.5 flex flex-wrap items-center gap-2 border-b border-line bg-app px-5">
+    <div class="-mx-5 flex shrink-0 flex-wrap items-center gap-2 border-b border-line bg-app px-5">
       <button
         v-for="t in tabs" :key="t.key" type="button"
         :data-test="'group-dashboard-tab-' + t.key"
@@ -1039,15 +1039,15 @@ function saveTiers() {
       </div>
     </div>
 
-    <Alert v-if="err" tone="err">加载失败：{{ err }}</Alert>
+    <Alert v-if="err" tone="err" class="shrink-0">加载失败：{{ err }}</Alert>
 
-    <div v-if="loading && !stats" class="flex items-center justify-center gap-2 py-14 text-[13px] text-ink-3">
+    <div v-if="loading && !stats" class="flex flex-1 items-center justify-center gap-2 py-14 text-[13px] text-ink-3">
       <Spinner :size="16" /> 正在加载…
     </div>
 
     <template v-else>
       <!-- ------------------------------ 概览 ------------------------------ -->
-      <div v-if="tab === 'overview'" class="space-y-3.5">
+      <div v-if="tab === 'overview'" class="min-h-0 flex-1 space-y-3.5 overflow-y-auto">
         <!-- ------------------------ 分组设置（内联编辑） ------------------------ -->
         <Card :pad="false" class="overflow-hidden" data-test="group-settings-card">
           <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
@@ -1537,7 +1537,7 @@ function saveTiers() {
       </div>
 
       <!-- ------------------------------ 用量 ------------------------------ -->
-      <div v-else-if="tab === 'usage'" class="space-y-3.5">
+      <div v-else-if="tab === 'usage'" class="min-h-0 flex-1 space-y-3.5 overflow-y-auto">
         <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
           <Card>
             <div class="text-[11.5px] text-ink-3">请求数</div>
@@ -1632,14 +1632,16 @@ function saveTiers() {
       </div>
 
       <!-- ---------------------------- 请求日志 ---------------------------- -->
-      <Card v-else-if="tab === 'request'" :pad="false" class="overflow-hidden">
-        <Empty v-if="!requestTotal" title="暂无请求记录" hint="本分组产生请求后，这里会显示每一次请求的最终结果">
-          <template #icon><ScrollText :size="28" /></template>
-        </Empty>
+      <Card v-else-if="tab === 'request'" :pad="false" class="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div v-if="!requestTotal" class="flex flex-1 items-center justify-center">
+          <Empty title="暂无请求记录" hint="本分组产生请求后，这里会显示每一次请求的最终结果">
+            <template #icon><ScrollText :size="28" /></template>
+          </Empty>
+        </div>
 
-        <div v-else class="overflow-x-auto">
+        <div v-else class="min-h-0 flex-1 overflow-auto">
           <table class="w-full text-[12.5px]">
-            <thead>
+            <thead class="sticky top-0 z-[1] bg-surface">
               <tr>
                 <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">时间</th>
                 <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3 min-w-[200px]">暴露模型</th>
@@ -1683,7 +1685,7 @@ function saveTiers() {
           </table>
         </div>
 
-        <div v-if="requestTotal > 0" data-test="pager-request">
+        <div v-if="requestTotal > 0" class="shrink-0" data-test="pager-request">
           <TPager
             v-model:page="requestPage" v-model:size="requestSize"
             :total="requestTotal" :page-size="requestSize" :size-options="PAGE_SIZES"
@@ -1693,14 +1695,16 @@ function saveTiers() {
       </Card>
 
       <!-- ---------------------------- 切换日志 ---------------------------- -->
-      <Card v-else-if="tab === 'switch'" :pad="false" class="overflow-hidden">
-        <Empty v-if="!switchTotal" title="暂无切换记录" hint="本分组的请求发生故障转移时，这里会显示每一次上游尝试">
-          <template #icon><ScrollText :size="28" /></template>
-        </Empty>
+      <Card v-else-if="tab === 'switch'" :pad="false" class="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div v-if="!switchTotal" class="flex flex-1 items-center justify-center">
+          <Empty title="暂无切换记录" hint="本分组的请求发生故障转移时，这里会显示每一次上游尝试">
+            <template #icon><ScrollText :size="28" /></template>
+          </Empty>
+        </div>
 
-        <div v-else class="overflow-x-auto">
+        <div v-else class="min-h-0 flex-1 overflow-auto">
           <table class="w-full text-[12.5px]">
-            <thead>
+            <thead class="sticky top-0 z-[1] bg-surface">
               <tr>
                 <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">时间</th>
                 <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">尝试#</th>
@@ -1742,7 +1746,7 @@ function saveTiers() {
           </table>
         </div>
 
-        <div v-if="switchTotal > 0" data-test="pager-switch">
+        <div v-if="switchTotal > 0" class="shrink-0" data-test="pager-switch">
           <TPager
             v-model:page="switchPage" v-model:size="switchSize"
             :total="switchTotal" :page-size="switchSize" :size-options="PAGE_SIZES"
@@ -1752,8 +1756,8 @@ function saveTiers() {
       </Card>
 
       <!-- ---------------------------- 冷却状态 ---------------------------- -->
-      <Card v-else :pad="false" class="overflow-hidden">
-        <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+      <Card v-else :pad="false" class="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div class="flex shrink-0 flex-wrap items-center gap-2 border-b border-line px-4 py-3">
           <ShieldAlert :size="15" class="text-ink-3" />
           <h2 class="text-[13.5px] font-semibold text-ink">冷却状态</h2>
           <span class="ml-auto text-[12px] text-ink-3" data-test="gd-cooldown-count">
@@ -1761,13 +1765,15 @@ function saveTiers() {
           </span>
         </div>
 
-        <Empty v-if="!scopedCooldowns.length" title="本分组相关渠道暂无冷却" hint="冷却中的渠道会在这里显示剩余时间；这里只列出本分组层级里引用到的渠道">
-          <template #icon><ShieldAlert :size="28" /></template>
-        </Empty>
+        <div v-if="!scopedCooldowns.length" class="flex flex-1 items-center justify-center">
+          <Empty title="本分组相关渠道暂无冷却" hint="冷却中的渠道会在这里显示剩余时间；这里只列出本分组层级里引用到的渠道">
+            <template #icon><ShieldAlert :size="28" /></template>
+          </Empty>
+        </div>
 
-        <div v-else class="overflow-x-auto">
+        <div v-else class="min-h-0 flex-1 overflow-auto">
           <table class="w-full text-[12.5px]">
-            <thead>
+            <thead class="sticky top-0 z-[1] bg-surface">
               <tr>
                 <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">渠道</th>
                 <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">上游模型</th>
@@ -1794,7 +1800,7 @@ function saveTiers() {
           </table>
         </div>
 
-        <div v-if="scopedCooldowns.length" data-test="pager-cooldown">
+        <div v-if="scopedCooldowns.length" class="shrink-0" data-test="pager-cooldown">
           <TPager
             v-model:page="cooldownPage" v-model:size="cooldownSize"
             :total="scopedCooldowns.length" :page-size="cooldownSize" :size-options="COOLDOWN_PAGE_SIZES"
@@ -1802,7 +1808,7 @@ function saveTiers() {
           />
         </div>
 
-        <p v-if="scopedCooldowns.length && otherCooldowns > 0" class="border-t border-line-soft px-4 py-2 text-[11.5px] text-ink-3">
+        <p v-if="scopedCooldowns.length && otherCooldowns > 0" class="shrink-0 border-t border-line-soft px-4 py-2 text-[11.5px] text-ink-3">
           另有 {{ otherCooldowns }} 条其它渠道的冷却未显示（本分组没有引用这些渠道）。
         </p>
       </Card>
