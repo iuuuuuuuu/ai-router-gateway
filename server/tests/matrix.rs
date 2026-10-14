@@ -503,6 +503,40 @@ async fn t22_all_cooling_without_wait_is_503_not_404() {
     assert!(logs.is_empty(), "no upstream attempt may be made while cooling: {logs:?}");
 }
 
+// ---- 22b. the 503 all-cooling reply must carry a well-formed retry-after: 30 ----
+#[tokio::test]
+async fn t22b_all_cooling_carries_retry_after_header() {
+    let (base, prefixes) = spawn_fake_upstreams(&[Behavior::GoodJson]).await;
+    let mut cfg = test_config(&base, &prefixes, &[gw_server::config::Protocol::Openai], 1, EXPOSED, test_retry());
+    cfg.retry.cooldown_wait = false;
+    let (st, router) = gateway(cfg).await;
+    arm(&st, "ch0", "up-model-0", std::time::Duration::from_secs(60));
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", "Bearer gw-test-key")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "model": EXPOSED, "stream": false,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 503, "all cooling must be a 503");
+    // The value must be exactly "30" (bare seconds): a client library parses it, so a
+    // malformed value ("retry-after: 30") silently breaks retry pacing.
+    assert_eq!(
+        resp.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+        Some("30"),
+        "headers={:?}",
+        resp.headers()
+    );
+}
+
 // ---- 23. every candidate PERMANENTLY isolated (401) => 503, not 404 ----
 #[tokio::test]
 async fn t23_all_permanent_isolation_is_503() {

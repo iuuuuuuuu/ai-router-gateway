@@ -4,8 +4,9 @@
 // 2026-10-14：「模型配置」原本是一个独立子页（nav.groupView === "models"），已并入本页 ——
 // 层级 / 成员 / 权重直接在当前页面编辑，不再跳来跳去。本页因此同时管两份草稿（分组设置一份、
 // 路由层级一份），各自有独立的「保存 / 放弃」按钮，落库仍由顶栏「保存」统一负责。
-// 进入页面时用 Promise.all 一次性并发拉全四份数据，页签切换只切本地视图、不再发请求；
-// 「自动刷新 5s」开关控制 5s 轮询，离开页面（组件卸载）时定时器一并清掉。
+// 进入页面时用 Promise.all 一次性并发拉全四份数据，页签切换只切本地视图；
+// 三个页签各自分页（请求日志 / 切换日志走服务端 limit+offset，冷却状态是本地分片），
+// 翻页只重拉两份日志，stats / health / 成员不动。
 // 页面由 App.vue 按 nav.groupId 挂载，group 一定非空；Esc 等价于点顶栏「返回」。
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
@@ -21,8 +22,8 @@ import { closeGroupDetail, openModelDetail } from "../nav";
 import { toast } from "../toast";
 import { fmtSec, fmtTps, tpsOf } from "../format";
 import {
-  Alert, Badge, Btn, Card, Empty, Field, IconBtn, PageHeader, SecInput, Spinner, TInput, TSelect,
-  TTextarea, TToggle,
+  Alert, Badge, Btn, Card, Empty, Field, IconBtn, PageHeader, SecInput, Spinner, TInput, TPager,
+  TSelect, TTextarea, TToggle,
 } from "../components/ui";
 
 type Tone = "gray" | "teal" | "ok" | "warn" | "err" | "brand";
@@ -36,8 +37,12 @@ type CooldownRow = ApiCooldownRow & {
 
 const props = defineProps<{ group: Group }>();
 
-// 整页有空间，日志一次多拉一些（服务端上限由路由决定，多拿不会报错）。
-const LIMIT = 200;
+// 三个页签各自分页：请求日志 / 切换日志走服务端分页（limit + offset），
+// 冷却状态的数据源是 /admin/api/health 的全量快照，没有分页接口，只能前端本地分片。
+const PAGE_SIZES = [20, 50, 100, 200];
+const DEFAULT_SIZE = 20;
+const COOLDOWN_PAGE_SIZES = [10, 20, 50];
+const COOLDOWN_SIZE = 20;
 const TIER_NAMES = ["一级", "二级", "三级", "四级", "五级", "六级"];
 
 /**
@@ -260,6 +265,18 @@ const switchRows = ref<SwitchLog[]>([]);
 const requestRows = ref<RequestLog[]>([]);
 const cooldowns = ref<CooldownRow[]>([]);
 
+// 分页状态：页码从 1 开始，三个页签各记一份（切页签不互相影响）。
+// total 是服务端给的「过滤命中总数」，忽略分页窗口，所以翻页时它不变。
+const requestPage = ref(1);
+const requestSize = ref(DEFAULT_SIZE);
+const requestTotal = ref(0);
+const switchPage = ref(1);
+const switchSize = ref(DEFAULT_SIZE);
+const switchTotal = ref(0);
+// 冷却没有服务端分页，只记页码与每页条数。
+const cooldownPage = ref(1);
+const cooldownSize = ref(COOLDOWN_SIZE);
+
 const tabs: { key: TabKey; label: string }[] = [
   { key: "overview", label: "概览" },
   { key: "usage", label: "用量" },
@@ -271,33 +288,46 @@ const tabs: { key: TabKey; label: string }[] = [
 /* -------------------------------- 数据拉取 -------------------------------- */
 // 进入页面一次性并发拉全：分组 scoped 的 stats + 该分组最近 LIMIT 条切换/请求日志 + 全局冷却列表。
 let loadInflight = false;
+// 翻页请求撞上 5 秒自动刷新时不能把这一页丢掉：置一个待办标记，等当前这轮结束后补拉一次。
+// 否则连点「下一页」会被互斥锁静默吞掉 —— 页码变了，表格还停在上一个页码的数据上。
+let loadPending = false;
 async function load(silent = false) {
   const g = props.group;
-  if (!g || loadInflight) return;
+  if (!g) return;
+  if (loadInflight) { loadPending = true; return; }
   loadInflight = true;
-  if (!silent) loading.value = true;
-  err.value = "";
   try {
     const [s, sw, rq, hl, gm] = await Promise.all([
       api.stats(g.id),
-      // 分页接口（v0.4.4 起服务端返回 {rows,total,limit,offset}）：详情页的语义是
-      // 「该分组最近 LIMIT 条」，固定 offset=0 取 rows 即可，不需要页码。
-      api.switchLogsPage(LIMIT, 0, undefined, g.id),
-      api.requestLogsPage(LIMIT, 0, undefined, g.id),
+      // v0.4.4 起这两个接口返回 { rows, total, limit, offset }：total 是忽略分页窗口的
+      // 过滤命中总数，页签右侧与分页条都读它，翻页时不会变小。offset 由页签页码算出来。
+      api.switchLogsPage(switchSize.value, (switchPage.value - 1) * switchSize.value, undefined, g.id),
+      api.requestLogsPage(requestSize.value, (requestPage.value - 1) * requestSize.value, undefined, g.id),
       api.health(),
       // 成员数据失败不拖垮整页：单独吞掉错误，退化成「0 次 + 无使用中（并发未知）」。
       api.groupMembers(g.id).catch(() => null),
     ]);
     stats.value = (s ?? null) as StatsPayload | null;
     switchRows.value = Array.isArray(sw?.rows) ? sw.rows : [];
+    switchTotal.value = Number(sw?.total ?? 0) || 0;
     requestRows.value = Array.isArray(rq?.rows) ? rq.rows : [];
+    requestTotal.value = Number(rq?.total ?? 0) || 0;
     cooldowns.value = Array.isArray(hl?.cooldowns) ? hl.cooldowns : [];
     memberPayload.value = (gm ?? null) as GroupMembersPayload | null;
+    // 页码越界（比如这期间该分组的日志被清理了）时收敛回最后一页；
+    // 写回 page 会触发分页 watch 再拉一次，拿到的是有效页。
+    const lastSw = Math.max(1, Math.ceil(switchTotal.value / switchSize.value));
+    if (switchPage.value > lastSw) switchPage.value = lastSw;
+    const lastRq = Math.max(1, Math.ceil(requestTotal.value / requestSize.value));
+    if (requestPage.value > lastRq) requestPage.value = lastRq;
+    const lastCd = Math.max(1, Math.ceil(scopedCooldowns.value.length / cooldownSize.value));
+    if (cooldownPage.value > lastCd) cooldownPage.value = lastCd;
   } catch (e: any) {
     err.value = String(e?.message || e);
   } finally {
     loadInflight = false;
     loading.value = false;
+    if (loadPending) { loadPending = false; void load(true); }
   }
 }
 
@@ -307,6 +337,11 @@ function reset() {
   switchRows.value = [];
   requestRows.value = [];
   cooldowns.value = [];
+  switchTotal.value = 0;
+  requestTotal.value = 0;
+  switchPage.value = 1;
+  requestPage.value = 1;
+  cooldownPage.value = 1;
   err.value = "";
   lastAt.value = 0;
 }
@@ -337,6 +372,11 @@ function startTick() {
 }
 
 watch(autoRefresh, () => { startTimer(); });
+
+// 翻页 / 改每页条数：只重拉两份日志，stats / health / 成员都不动。
+// 冷却页是本地分片，换页不需要请求，所以不挂在这个 watch 上；
+// silent = true 让翻页时不要整页变成「正在加载…」骨架，表格就地替换。
+watch([requestPage, requestSize, switchPage, switchSize], () => { void load(true); });
 
 /** Esc = 返回分组路由（保留弹窗版按 Esc 关闭的习惯）。
  *  ★ 模型配置卡里正在拖动排序时不吃这一下：onDragKey 只放弃拖动，页面留在原地。 */
@@ -392,6 +432,12 @@ const groupChannelIds = computed<Set<string>>(() => {
 const scopedCooldowns = computed(() =>
   cooldowns.value.filter(r => groupChannelIds.value.has(String(r?.channel_id ?? ""))));
 const otherCooldowns = computed(() => cooldowns.value.length - scopedCooldowns.value.length);
+// 冷却列表来自 /admin/api/health 的全量快照，没有 limit/offset，所以这一页由前端自己切；
+// total 就是本分组相关渠道的条数（与表头「共 N 个条目」同一个数）。
+const pagedCooldowns = computed(() => {
+  const start = (cooldownPage.value - 1) * cooldownSize.value;
+  return scopedCooldowns.value.slice(start, start + cooldownSize.value);
+});
 
 /* ------------------------------ 用量数据 ------------------------------ */
 const summary = computed<Row>(() => (stats.value?.summary ?? {}) as Row);
@@ -987,8 +1033,8 @@ function saveTiers() {
           : 'border-transparent text-ink-3 hover:text-ink-2'"
         @click="tab = t.key"
       >{{ t.label }}</button>
-      <div class="ml-auto text-[12px] text-ink-3">
-        请求日志 {{ requestRows.length }} 条 · 切换日志 {{ switchRows.length }} 条
+      <div class="ml-auto text-[12px] text-ink-3" data-test="gd-tab-counts">
+        请求日志 {{ requestTotal }} 条 · 切换日志 {{ switchTotal }} 条
         <span v-if="lastAt" class="ml-1 font-mono text-[11.5px]">· 最后更新 {{ fmtClock(lastAt) }}</span>
       </div>
     </div>
@@ -1587,7 +1633,7 @@ function saveTiers() {
 
       <!-- ---------------------------- 请求日志 ---------------------------- -->
       <Card v-else-if="tab === 'request'" :pad="false" class="overflow-hidden">
-        <Empty v-if="!requestRows.length" title="暂无请求记录" hint="本分组产生请求后，这里会显示每一次请求的最终结果">
+        <Empty v-if="!requestTotal" title="暂无请求记录" hint="本分组产生请求后，这里会显示每一次请求的最终结果">
           <template #icon><ScrollText :size="28" /></template>
         </Empty>
 
@@ -1636,11 +1682,19 @@ function saveTiers() {
             </tbody>
           </table>
         </div>
+
+        <div v-if="requestTotal > 0" data-test="pager-request">
+          <TPager
+            v-model:page="requestPage" v-model:size="requestSize"
+            :total="requestTotal" :page-size="requestSize" :size-options="PAGE_SIZES"
+            :loading="loading" unit="条请求日志"
+          />
+        </div>
       </Card>
 
       <!-- ---------------------------- 切换日志 ---------------------------- -->
       <Card v-else-if="tab === 'switch'" :pad="false" class="overflow-hidden">
-        <Empty v-if="!switchRows.length" title="暂无切换记录" hint="本分组的请求发生故障转移时，这里会显示每一次上游尝试">
+        <Empty v-if="!switchTotal" title="暂无切换记录" hint="本分组的请求发生故障转移时，这里会显示每一次上游尝试">
           <template #icon><ScrollText :size="28" /></template>
         </Empty>
 
@@ -1687,6 +1741,14 @@ function saveTiers() {
             </tbody>
           </table>
         </div>
+
+        <div v-if="switchTotal > 0" data-test="pager-switch">
+          <TPager
+            v-model:page="switchPage" v-model:size="switchSize"
+            :total="switchTotal" :page-size="switchSize" :size-options="PAGE_SIZES"
+            :loading="loading" unit="条切换日志"
+          />
+        </div>
       </Card>
 
       <!-- ---------------------------- 冷却状态 ---------------------------- -->
@@ -1694,8 +1756,8 @@ function saveTiers() {
         <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
           <ShieldAlert :size="15" class="text-ink-3" />
           <h2 class="text-[13.5px] font-semibold text-ink">冷却状态</h2>
-          <span class="ml-auto text-[12px] text-ink-3">
-            {{ scopedCooldowns.length ? `${scopedCooldowns.length} 个条目` : "全部正常" }}
+          <span class="ml-auto text-[12px] text-ink-3" data-test="gd-cooldown-count">
+            {{ scopedCooldowns.length ? `共 ${scopedCooldowns.length} 个条目` : "全部正常" }}
           </span>
         </div>
 
@@ -1714,7 +1776,7 @@ function saveTiers() {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="(row, i) in scopedCooldowns" :key="healthKey(row, i)" class="border-t border-line-soft hover:bg-app">
+              <tr v-for="(row, i) in pagedCooldowns" :key="healthKey(row, i)" class="border-t border-line-soft hover:bg-app">
                 <td class="whitespace-nowrap px-3 py-2">{{ channelName(row.channel_id) }}</td>
                 <td class="whitespace-nowrap px-3 py-2">
                   <Badge v-if="row.upstream_model === '*'" tone="err">整渠道</Badge>
@@ -1730,6 +1792,14 @@ function saveTiers() {
               </tr>
             </tbody>
           </table>
+        </div>
+
+        <div v-if="scopedCooldowns.length" data-test="pager-cooldown">
+          <TPager
+            v-model:page="cooldownPage" v-model:size="cooldownSize"
+            :total="scopedCooldowns.length" :page-size="cooldownSize" :size-options="COOLDOWN_PAGE_SIZES"
+            unit="个条目"
+          />
         </div>
 
         <p v-if="scopedCooldowns.length && otherCooldowns > 0" class="border-t border-line-soft px-4 py-2 text-[11.5px] text-ink-3">

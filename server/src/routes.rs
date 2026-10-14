@@ -333,9 +333,9 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
             };
             let mut r = error_response(entry, code, kind, &format!("all {} upstream attempt(s) failed; see gateway request {request_id}", result.records.len()));
             if matches!(result.terminal, crate::router::Terminal::AllCooldown) {
-                if let Ok(v) = "retry-after: 30".parse::<axum::http::HeaderValue>() {
-                    r.headers_mut().insert("retry-after", v);
-                }
+                // 头部值必须是裸的秒数 "30"。旧写法把整行 "retry-after: 30" 当成值插入，
+                // 客户端解析 Retry-After 会拿到畸形字符串。
+                r.headers_mut().insert("retry-after", axum::http::HeaderValue::from_static("30"));
             }
             r
         }
