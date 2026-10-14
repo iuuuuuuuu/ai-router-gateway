@@ -151,8 +151,10 @@ Desktop.ini
 /tools/_accept-inuse.result.json
 /tools/_accept-save.mjs
 /tools/_accept-save-baseline.json
+/tools/_accept-gdpage.mjs
 /tools/_x_cfg.mjs
 /tools/_x_dirty.mjs
 /tools/_x_net.mjs
 /tools/_rel045/
 /tools/_relbody-045.md
+/tools/_rel046/
