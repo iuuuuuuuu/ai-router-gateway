@@ -117,7 +117,7 @@ TPS 口径是 `输出 tokens ÷ 解码耗时`，解码耗时 = 总耗时 − 首
 
 | 文件 | 说明 |
 |---|---|
-| `gw-client_0.4.4_x64-setup.exe` | 桌面控制台 NSIS 安装包（内含 `gw-server` sidecar，安装后托盘常驻、可开机自启） |
+| `gw-client_0.4.5_x64-setup.exe` | 桌面控制台 NSIS 安装包（内含 `gw-server` sidecar，安装后托盘常驻、可开机自启） |
 | `gw-server-x86_64-pc-windows-msvc.exe` | 仅服务端，裸跑用（见上「快速开始」） |
 | `SHA256SUMS.txt` | 上述文件的 SHA256 校验和 |
 
