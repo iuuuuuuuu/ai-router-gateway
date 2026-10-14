@@ -51,7 +51,11 @@ export interface ModelBinding {
 }
 export interface TierMember { model_id: string; weight: number }
 export interface Tier { level: number; members: TierMember[] }
-export interface Group { id: string; name: string; exposed_models: string[]; tiers: Tier[]; overrides?: GroupOverrides }
+// exposed_models 是**服务端按成员自动派生**的只读结果（不是可填字段）：
+// server/src/config.rs 的 Config::normalize_exposed_models 在每次启动与每次 PUT 时重算，
+// 控制台只显示。标成可选是为了容忍「更老的服务端 / 还没有成员的组」这两种回包，
+// 读取端一律用 `g.exposed_models ?? []`。
+export interface Group { id: string; name: string; exposed_models?: string[]; tiers: Tier[]; overrides?: GroupOverrides }
 export interface ApiKey { key: string; group_id: string; name: string; enabled: boolean }
 
 export interface GroupOverrides { retry?: RetryConfig | null }

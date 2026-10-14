@@ -35,7 +35,7 @@ pub async fn get_config(State(state): State<AppState>, headers: HeaderMap) -> Re
     }
 }
 
-pub async fn put_config(State(state): State<AppState>, headers: HeaderMap, Json(cfg): Json<crate::config::Config>) -> Response {
+pub async fn put_config(State(state): State<AppState>, headers: HeaderMap, Json(mut cfg): Json<crate::config::Config>) -> Response {
     if let Err(r) = authorize(&state, &headers) { return r }
 
     // I4 validation BEFORE publish
@@ -69,6 +69,18 @@ pub async fn put_config(State(state): State<AppState>, headers: HeaderMap, Json(
         }
     }
 
+    // Exposed models are DERIVED, not declared: the client may be an older
+    // build that still posts a hand-typed list (or a stale one), so the server
+    // re-derives every group's list from the members it just validated. This
+    // runs AFTER the integrity checks on purpose — a dangling member id must
+    // still be a 400, not a silently shortened list — and BEFORE the save, so
+    // the document that lands in SQLite (and that GET /admin/api/config hands
+    // back) is already the derived one.
+    let exposed_synced = cfg.normalize_exposed_models();
+    if exposed_synced > 0 {
+        tracing::info!(groups = exposed_synced, "exposed models re-derived from group members");
+    }
+
     // Defect B: reconcile cooldowns with the config we are about to save.
     // Snapshotted BEFORE publish so we can tell which channel identities changed
     // (a deleted channel, or one whose api_key/base_url was rewritten, must not
@@ -88,7 +100,14 @@ pub async fn put_config(State(state): State<AppState>, headers: HeaderMap, Json(
     }
     let version = state.config.publish(cfg);
     state.health.persist();
-    Json(json!({ "ok": true, "config_version": version, "cooldowns_cleared": cleared })).into_response()
+    Json(json!({
+        "ok": true,
+        "config_version": version,
+        "cooldowns_cleared": cleared,
+        // How many groups the derivation above rewrote. 0 means the client's
+        // document already agreed with its own members.
+        "exposed_synced": exposed_synced,
+    })).into_response()
 }
 
 #[derive(Deserialize)]

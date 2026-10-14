@@ -23,7 +23,7 @@ import { toast } from "../toast";
 import { fmtSec, fmtTps, tpsOf } from "../format";
 import {
   Alert, Badge, Btn, Card, Empty, Field, IconBtn, PageHeader, SecInput, Spinner, TInput, TPager,
-  TSelect, TTextarea, TToggle,
+  TSelect, TToggle,
 } from "../components/ui";
 
 type Tone = "gray" | "teal" | "ok" | "warn" | "err" | "brand";
@@ -409,7 +409,28 @@ onUnmounted(() => {
 });
 
 /* ------------------------------ 概览数据 ------------------------------ */
-const exposedModels = computed<string[]>(() => props.group?.exposed_models ?? []);
+/**
+ * 本分组的暴露模型：**服务端按成员自动派生**，控制台只读（页面上没有可填的输入框）。
+ * 口径与 `server/src/config.rs` 的 `derive_exposed_models` 一字不差：层级按 level 升序、
+ * 层内按声明顺序，取每个成员绑定的 `exposed`，首次出现去重。
+ * 这里再算一遍，只为让界面在「改了层级 / 换了绑定但还没点保存」时也立刻显示新结果；
+ * 真正生效的永远是服务端那一份 —— `GET /admin/api/config` 回来的就是派生后的列表。
+ */
+function deriveExposedTiers(tiers: Tier[] | undefined): string[] {
+  const out: string[] = [];
+  for (const t of [...(tiers ?? [])].sort((a, b) => a.level - b.level)) {
+    for (const mem of t.members ?? []) {
+      const b = models.value.find(x => x.id === mem.model_id);
+      if (!b || out.includes(b.exposed)) continue;
+      out.push(b.exposed);
+    }
+  }
+  return out;
+}
+function deriveExposed(g: Group | undefined): string[] {
+  return deriveExposedTiers(g?.tiers);
+}
+const exposedModels = computed<string[]>(() => deriveExposed(props.group));
 const sortedTiers = computed(() =>
   [...(props.group?.tiers ?? [])].sort((a, b) => a.level - b.level));
 const tierCount = computed(() => sortedTiers.value.length);
@@ -526,36 +547,41 @@ function shareText(row: Row): string {
 
 /* ---------------------------- 分组设置（内联编辑） ---------------------------- */
 // 2026-10-13 起，分组自己的设置不再走「编辑分组」弹窗，而是在这一页直接改：
-//  · 名称 / 暴露模型 —— 分组对客户端暴露的身份；
+//  · 名称            —— 分组对客户端暴露的身份之一；
 //  · 重试与超时      —— 这个分组自己的策略配置（跟随全局 ↔ 自有配置）。
-// 改动先进草稿（sName / sExposed / sRetry），点本卡右上「保存设置」才写回 state.cfg
+// 2026-10-14「暴露模型」退出本卡：它不再是可填字段，而是由服务端按本分组的成员自动派生
+// （`Config::normalize_exposed_models`），本页只读展示，见下方“暴露模型”那块。
+// 改动先进草稿（sName / sRetry），点本卡右上「保存设置」才写回 state.cfg
 // 并 markDirty()；真正的落库仍然由顶栏「保存」统一负责 —— 与其它页面同一套语义。
 // 路由层级 / 成员 / 权重 不在本卡：「模型配置」卡（data-test="gd-models-card"）管那一半 ——
 // 改的东西不一样（那边是路由表，还带拖动排序），所以两张卡各自有「保存 / 放弃」按钮。
 // ★ 两张卡写回时都必须把对方那半原样带回：saveSettings() 带 tiers，saveTiers() 带 overrides。
 
 const sName = ref("");
-const sExposed = ref("");
 /** null = 跟随全局；有对象 = 使用这个分组自己的配置（判据只有 overrides.retry 是否存在）。 */
 const sRetry = ref<RetryConfig | null>(null);
 
-/** 从当前分组把三份草稿重新灌一遍（进入页面、外部换配置、放弃修改时都走它）。 */
+/** 从当前分组把两份草稿重新灌一遍（进入页面、外部换配置、放弃修改时都走它）。 */
 function syncSettings() {
   const g = props.group;
   sName.value = g?.name ?? "";
-  sExposed.value = (g?.exposed_models ?? []).join("\n");
   sRetry.value = g?.overrides?.retry ? normRetry(g.overrides.retry) : null;
 }
 syncSettings();
 // 分组对象被换掉（顶栏「重新加载配置」、保存成功）时重新灌草稿，别拿着上一份的残留。
 watch(() => props.group, syncSettings);
 
-const sExposedList = computed(() =>
-  sExposed.value.split(/[\s,，;；、]+/).map(x => x.trim()).filter(Boolean),
-);
 const sNameError = computed(() => (sName.value.trim() ? "" : "请填写分组名。"));
-const sExposedError = computed(() =>
-  sExposedList.value.length ? "" : "至少填写一个暴露模型名，客户端用这些名字发起请求。");
+
+/**
+ * 暴露模型这一块的说明行：把「从哪来、为什么是空的」直接说出来。
+ * 之前这里有一句「至少填写一个暴露模型名」，现在没有可填的字段，改成陈述事实。
+ */
+const exposedNote = computed(() =>
+  exposedModels.value.length
+    ? "由下面的路由层级自动汇总，不需要手动维护。"
+    : "当前没有任何成员提供模型名，客户端用本分组还请求不到东西 —— 到「模型配置」里加成员即可。",
+);
 
 /**
  * 服务端不保证每个字段都回来（老服务端 / 以后会加新字段），缺的用全局值补齐，
@@ -618,18 +644,21 @@ const followLine = computed(() => {
   return `跟随全局（当前：max_attempts=${r.max_attempts} / 总超时 ${fmtSec(r.total_deadline_ms)} / 死循环拦截 ${r.loop_guard_enabled ? "开" : "关"}）`;
 });
 
-/** 有没有未保存的设置改动（顶栏之外的第二处脏标记，只描述本卡）。 */
+/**
+ * 有没有未保存的设置改动（顶栏之外的第二处脏标记，只描述本卡）。
+ * 2026-10-14：暴露模型不再是本卡的字段（服务端自动派生），所以本卡只剩两项 —— 名称与重试配置；
+ * 它也不再出现在脏判定里，否则「改了层级导致派生列表变了」会误报成「分组设置有改动」。
+ */
 const sDirty = computed(() => {
   const g = props.group;
   if (!g) return false;
   const nextRetry = sRetry.value ? normRetry(sRetry.value) : null;
   const curRetry = g.overrides?.retry ?? null;
   return sName.value.trim() !== (g.name ?? "")
-    || JSON.stringify(sExposedList.value) !== JSON.stringify(g.exposed_models ?? [])
     || JSON.stringify(nextRetry) !== JSON.stringify(curRetry);
 });
 
-const sValid = computed(() => !sNameError.value && !sExposedError.value && sBudget.value.ok);
+const sValid = computed(() => !sNameError.value && sBudget.value.ok);
 
 /** 写回配置（只进内存 + markDirty，落库交给顶栏「保存」）。 */
 function saveSettings() {
@@ -639,7 +668,10 @@ function saveSettings() {
   const clean: Group = {
     id: g.id,
     name: sName.value.trim(),
-    exposed_models: [...sExposedList.value],
+    // ★ 暴露模型是服务端按成员派生的，不是本卡能填的东西：原样带回当前值即可。
+    //   即使这里带的是旧的、过期的（比如同一份配置里层级刚被改过），
+    //   PUT /admin/api/config 也会在入库前用成员重算一遍 —— 服务端才是那个不变量。
+    exposed_models: [...(g.exposed_models ?? [])],
     // 层级归下面的「模型配置」卡管，这里原样深拷贝带回去，免得把那张卡改好的路由表抹掉。
     tiers: JSON.parse(JSON.stringify(g.tiers ?? [])),
     // ★ overrides 必须显式写：不带这个字段等于把该分组自己的重试配置静默抹掉，
@@ -1074,16 +1106,28 @@ function saveTiers() {
               </Field>
             </div>
 
-            <Field
-              label="暴露模型"
-              required
-              hint="客户端用这些模型名请求，会按本分组的路由表转发；逗号或换行分隔"
-            >
-              <TTextarea v-model="sExposed" data-test="group-exposed-input" :rows="2" placeholder="gpt-4o, claude-3-5-sonnet" />
-            </Field>
+            <!-- 暴露模型：只读。服务端按本分组的成员自动派生（Config::normalize_exposed_models），
+                 这里只是把它显示出来，没有可填的字段。 -->
+            <div data-test="group-exposed-readonly">
+              <div class="mb-1.5 flex items-baseline gap-2">
+                <span class="text-[12px] font-medium text-ink-2">暴露模型</span>
+                <span class="text-[11.5px] text-ink-3">自动维护 · {{ exposedModels.length }} 个</span>
+              </div>
+              <div v-if="exposedModels.length" class="flex flex-wrap gap-1.5 rounded-lg border border-line-soft bg-app px-2.5 py-2">
+                <Badge v-for="m in exposedModels" :key="m" tone="teal">
+                  <span class="font-mono">{{ m }}</span>
+                </Badge>
+              </div>
+              <div v-else class="rounded-lg border border-line-soft bg-app px-2.5 py-2 text-[12px] text-ink-3">
+                暂无
+              </div>
+              <p class="mt-1.5 text-[11.5px] leading-4 text-ink-3" data-test="group-exposed-auto-note">
+                {{ exposedNote }}
+              </p>
+            </div>
 
-            <Alert v-if="sNameError || sExposedError" tone="err" data-test="group-settings-error">
-              {{ sNameError || sExposedError }}
+            <Alert v-if="sNameError" tone="err" data-test="group-settings-error">
+              {{ sNameError }}
             </Alert>
 
         <!-- ------------------------ 重试与超时（本分组自己的策略配置） ------------------------ -->

@@ -186,3 +186,14 @@ Desktop.ini
 
 # ── v0.4.7 真机验收：分组详情页视口适配（高度铺满 / 分页贴底 / 表格自带滚动条）（本机证据，不入库）──
 /tools/_accept-viewport.mjs
+
+# ── 暴露模型自动维护（服务端按成员派生，控制台只读）真机验收（本机证据，不入库）──
+/tools/_accept-exposed.mjs
+/tools/_accept-exposed-baseline.json
+/tools/_accept-exposed-oldbuild.mjs
+/tools/_accept-exposed-newbuild.mjs
+/tools/_accept-exposed-grppro.mjs
+/tools/_rel046g/
+/tools/_ports.mjs
+/tools/_start-bg.mjs
+/tools/_build-server.sh

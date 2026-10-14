@@ -311,7 +311,7 @@ function createGroup() {
   };
   cfg.groups.push(g);
   markDirty();
-  toast.ok("已添加分组，接着填名称、暴露模型与模型配置");
+  toast.ok("已添加分组，接着填名称与模型配置（暴露模型由成员自动汇总）");
   openGroupDetail(g.id);
 }
 
@@ -514,9 +514,9 @@ function confirmRemoveGroup() {
               <span class="font-mono">{{ m }}</span>
             </Badge>
           </div>
-          <p v-else class="text-[12px] text-ink-3">未设置暴露模型</p>
+          <p v-else class="text-[12px] text-ink-3">还没有成员提供模型名</p>
           <p class="mt-2 text-[11.5px] leading-4 text-ink-3" data-test="group-exposed-hint">
-            分组名「{{ g.name }}」与 id「{{ g.id }}」也可以直接当模型名用：客户端用它们请求时，组内成员按上面的层级自动轮换。
+            由层级成员自动汇总，不用手动维护。分组名「{{ g.name }}」与 id「{{ g.id }}」也可以直接当模型名用：客户端用它们请求时，组内成员按上面的层级自动轮换。
           </p>
         </div>
 

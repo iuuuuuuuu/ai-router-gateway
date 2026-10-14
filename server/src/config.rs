@@ -201,7 +201,19 @@ pub struct GroupOverrides {
 pub struct Group {
     pub id: String,
     pub name: String,
-    /// Exposed model names this group answers for.
+    /// The exposed model names this group answers for.
+    ///
+    /// NOT hand-written input any more: the server RE-DERIVES this list from
+    /// the group's own members on every load and every save
+    /// (`Config::normalize_exposed_models`), so the console only displays it.
+    /// The field stays in the struct — and in the JSON — because the request
+    /// path reads exactly this vector: `router::is_wildcard` decides narrow
+    /// vs wildcard from it, `routes::list_models` lists it, and the 404 guard
+    /// matches against it. Right after normalization it IS the derived list.
+    ///
+    /// `#[serde(default)]` keeps hand-written config files (and any older
+    /// document) loadable without spelling the field out.
+    #[serde(default)]
     pub exposed_models: Vec<String>,
     pub tiers: Vec<Tier>,
     /// Optional per-group settings; everything absent follows `Config::retry`.
@@ -264,6 +276,67 @@ impl Config {
     pub fn find_model(&self, id: &str) -> Option<&ModelBinding> {
         self.models.iter().find(|m| m.id == id)
     }
+
+    /// Re-derive `exposed_models` for EVERY group from its own members.
+    /// Returns how many groups the derivation actually changed, so callers can
+    /// log/persist only when something moved.
+    ///
+    /// This is the single source of truth for "what does this group answer
+    /// for": a name is exposed because some member declares it, never because
+    /// somebody typed it into a text box. Both write paths call it —
+    /// `PUT /admin/api/config` (before saving, so a hand-edited or stale
+    /// client document cannot smuggle a list back in) and process start
+    /// (before publishing, so an old database converges on the way up).
+    ///
+    /// WILD-CARD NAMES ARE UNAFFECTED: `router::is_wildcard` answers `false`
+    /// for a name found here (EXACT WINS, narrow plan) and falls back to
+    /// `name`/`id` (wildcard plan) for everything else. Both of those keep
+    /// working whether or not the derivation runs, so no request that resolved
+    /// before this existed can start failing after it.
+    pub fn normalize_exposed_models(&mut self) -> usize {
+        let want: Vec<Vec<String>> = self
+            .groups
+            .iter()
+            .map(|g| derive_exposed_models(self, g))
+            .collect();
+        let mut changed = 0;
+        for (group, want) in self.groups.iter_mut().zip(want) {
+            if group.exposed_models != want {
+                group.exposed_models = want;
+                changed += 1;
+            }
+        }
+        changed
+    }
+}
+
+/// The exposed-model names ONE group answers for, derived from its own members.
+///
+/// Walk: tiers in ascending `level`, declared member order inside a tier,
+/// taking each member binding's `exposed` the first time that exact string is
+/// seen (so the list is ordered by "which tier introduces this name first" and
+/// free of duplicates). A member id with no binding contributes nothing — a
+/// dangling reference is a validation error, not a name.
+///
+/// Deliberately independent of `enabled`/weights on both the member and its
+/// channel: a name that is exposed stays exposed, and `router::plan_with`
+/// skips disabled members when it builds candidates. Deriving from "enabled
+/// right now" would make a toggle silently un-expose a name a client may
+/// still be calling, which is a routing change no text box ever implied.
+pub fn derive_exposed_models(cfg: &Config, group: &Group) -> Vec<String> {
+    let mut tiers: Vec<&Tier> = group.tiers.iter().collect();
+    tiers.sort_by_key(|t| t.level);
+    let mut out: Vec<String> = Vec::new();
+    for tier in tiers {
+        for member in &tier.members {
+            let Some(m) = cfg.find_model(&member.model_id) else { continue };
+            if out.iter().any(|x| x == &m.exposed) {
+                continue;
+            }
+            out.push(m.exposed.clone());
+        }
+    }
+    out
 }
 
 /// The retry settings that are in force for ONE group.

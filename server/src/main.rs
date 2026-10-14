@@ -27,7 +27,21 @@ async fn main() -> anyhow::Result<()> {
 
     // load persisted config (or default empty)
     let config = store.load_config().unwrap_or_default();
-    let config = config.unwrap_or_default();
+    let mut config = config.unwrap_or_default();
+
+    // Exposed models are DERIVED, so an existing database converges on start:
+    // whatever list it was saved with is replaced by one re-read from the
+    // group members themselves. Persisted immediately (best effort) so the
+    // first `GET /admin/api/config` of the new process cannot report a list
+    // that the running gateway no longer honours.
+    let exposed_synced = config.normalize_exposed_models();
+    if exposed_synced > 0 {
+        tracing::info!(groups = exposed_synced, "exposed models re-derived from group members");
+        match store.save_config(&config) {
+            Ok(()) => tracing::info!("derived exposed models persisted"),
+            Err(e) => tracing::warn!("could not persist the derived exposed models: {e}"),
+        }
+    }
 
     let health = Arc::new(health::HealthRegistry::new(Some(store.clone())));
     let holder = config::ConfigHolder::default();
