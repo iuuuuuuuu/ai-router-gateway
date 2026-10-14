@@ -8,7 +8,7 @@
 // 因此本页是只读的（除了删除分组），不再有编辑弹窗，也不再有 draft/校验/保存逻辑。
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ChevronDown, LayoutDashboard, Plus, RefreshCw, Trash2, Waypoints } from "@lucide/vue";
-import { Badge, Btn, Card, Empty, IconBtn } from "../components/ui";
+import { Badge, Btn, Card, Empty, IconBtn, Modal } from "../components/ui";
 import { openGroupDetail, openModelDetail } from "../nav";
 import { apiKeys, bindingLabel, channelName, groups, groupsUsingModel, markDirty, models, state, uid } from "../store";
 import { toast } from "../toast";

@@ -159,3 +159,15 @@ Desktop.ini
 /tools/_relbody-045.md
 /tools/_relbody-046.md
 /tools/_rel046/
+
+# ── v0.4.6 真机验收：删除分组确认框修复 + 运行时未解析组件兜底（本机证据，不入库）──
+/tools/_accept-delgroup.mjs
+/tools/_accept-tagscan.mjs
+/tools/_dbg-cmp.mjs
+/tools/_dbg-cmp2.mjs
+/tools/_dbg-cmp3.mjs
+/tools/_dbg-del.mjs
+/tools/_dbg-del2.mjs
+/tools/_dbg-del3.mjs
+/tools/_dbg-del4.mjs
+/tools/_dbg-del5.mjs
