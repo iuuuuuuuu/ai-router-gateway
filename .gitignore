@@ -97,3 +97,32 @@ Desktop.ini
 /tools/_cm_*.mjs
 /tools/ui-cm-*.png
 /tools/_red-baseline.txt
+
+# ── 内联「模型配置」卡验收产物 + SFC 模板标识符扫描器（本机工具，不入库）──
+/tools/ui-group-detail-inline-models.png
+/tools/_sfcscan.mjs
+/tools/_dbg-drag.mjs
+
+# ── v0.4.2 真机验收：in-flight / 清空日志 / task-43 三缺陷（本机证据，不入库）──
+/tools/_accept-inflight.mjs
+/tools/_accept-inflight-baseline.json
+/tools/_accept-inflight.result.json
+/tools/_purge-accept.mjs
+/tools/_stats-accept.mjs
+/tools/_stats-shape.mjs
+/tools/_cfg-shape.mjs
+/tools/_slow-upstream.mjs
+/tools/_verify-task43.mjs
+/tools/_verify-d2-cost.mjs
+/tools/_verify-d2-waste.mjs
+/tools/_db-schema.mjs
+/tools/_d3-probe.mjs
+/tools/_price-check.mjs
+/tools/_db-backup-before-d3.db
+/tools/_shots/
+/tools/_prove-inflight-total.mjs
+/tools/_e2e-cfg.mjs
+/tools/_e2e-db.mjs
+/tools/_e2e-driver.mjs
+/tools/_e2e-launch.mjs
+/tools/_e2e-up-b.mjs

@@ -10,6 +10,7 @@
 
 mod support;
 
+use gw_server::config::{ApiKey, Group, GroupOverrides, Protocol, Tier, TierMember};
 use gw_server::router::build_plan;
 use support::{gateway, spawn_fake_upstreams, test_config, test_retry, Behavior};
 use tower::util::ServiceExt;
@@ -45,6 +46,28 @@ async fn post_json(router: &axum::Router, uri: &str, body: serde_json::Value) ->
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status().as_u16();
     let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap().to_vec();
+    (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+}
+
+/// POST /v1/chat/completions carrying a SPECIFIC gateway key, so a test can
+/// drive two groups in one config without the shared "gw-test-key" alias.
+async fn post_chat_with_key(router: &axum::Router, key: &str, exposed: &str, stream: bool) -> (u16, serde_json::Value) {
+    let body = serde_json::json!({
+        "model": exposed,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 50
+    });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.unwrap();
+    let status = resp.status().as_u16();
+    let bytes = axum::body::to_bytes(resp.into_body(), 10 * 1024 * 1024).await.unwrap().to_vec();
     (status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
 }
 
@@ -187,6 +210,50 @@ async fn a_failed_attempt_releases_before_the_retry_takes_the_next_account() {
     assert_eq!(state.inflight.total(), 0);
     assert_eq!(state.inflight.member_count(&key("ch0", "up-model-0")), 0, "the failed account must not stay occupied");
     assert_eq!(state.inflight.member_count(&key("ch1", "up-model-1")), 0);
+}
+
+/// The header number is a GROUP fact, not a gateway fact.
+///
+/// Regression: `inflight_total` used to be `state.inflight.total()` — the whole
+/// gateway's load — while its own doc comment and the UI label ("当前并发 …
+/// 本分组此刻正在处理中的请求数") both promise the requested group's. The
+/// per-member `inflight` values were always correctly scoped, so a slow request
+/// on group B silently inflated group A's badge; on a quiet group A that is the
+/// difference between "空闲" and a phantom "N 个请求".
+#[tokio::test]
+async fn group_members_inflight_total_is_scoped_to_the_requested_group() {
+    let (base, prefixes) = spawn_fake_upstreams(&[Behavior::SlowJson, Behavior::SlowJson]).await;
+    let mut cfg = test_config(&base, &prefixes, &[Protocol::Openai, Protocol::Openai], 2, EXPOSED, test_retry());
+    // Split the two members across two groups so each has its own in-flight load.
+    cfg.groups[0].tiers = vec![Tier { level: 1, members: vec![TierMember { model_id: "m0".into(), weight: 1 }] }];
+    cfg.groups.push(Group {
+        id: "g2".into(),
+        name: "second-group".into(),
+        exposed_models: vec![EXPOSED.to_string()],
+        tiers: vec![Tier { level: 1, members: vec![TierMember { model_id: "m1".into(), weight: 1 }] }],
+        overrides: GroupOverrides::default(),
+    });
+    cfg.api_keys.push(ApiKey { key: "gw-test-key-2".into(), group_id: "g2".into(), name: "tester-2".into(), enabled: true });
+    let (state, router) = gateway(cfg).await;
+
+    // One slow request, on g2 only.
+    let runner = {
+        let router = router.clone();
+        tokio::spawn(async move { post_chat_with_key(&router, "gw-test-key-2", EXPOSED, false).await })
+    };
+    assert_eq!(wait_total(&state, 1).await, 1);
+
+    let (_, busy) = get_json(&router, "/admin/api/group-members?group_id=g2").await;
+    let (_, idle) = get_json(&router, "/admin/api/group-members?group_id=g1").await;
+    assert_eq!(busy["inflight_total"], 1, "the group actually serving the request must report 1");
+    assert_eq!(busy["members"][0]["inflight"], 1);
+    assert_eq!(idle["inflight_total"], 0, "a group with nothing in flight must NOT inherit another group's load");
+    assert_eq!(idle["members"][0]["inflight"], 0);
+
+    runner.await.unwrap();
+    assert_eq!(wait_total(&state, 0).await, 0);
+    let (_, after) = get_json(&router, "/admin/api/group-members?group_id=g2").await;
+    assert_eq!(after["inflight_total"], 0);
 }
 
 #[tokio::test]

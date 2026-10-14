@@ -112,6 +112,15 @@ impl Store {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS config_json (id INTEGER PRIMARY KEY CHECK (id = 1), json TEXT NOT NULL, updated_at TEXT NOT NULL);
+             -- Out-of-line secret material (channel api_key, gateway API keys).
+             -- `config_json` holds a placeholder wherever one of these used to
+             -- be written inline, so a plain file copy of the database no longer
+             -- hands out working credentials. SPLIT, NOT SCRAMBLED: the value is
+             -- stored verbatim and must round-trip byte-for-byte, because it is
+             -- sent to the upstream on every request. K exists so a rotated or
+             -- deleted secret can be told apart from a live one; migration is
+             -- CREATE IF NOT EXISTS, so an old database gains the table empty.
+             CREATE TABLE IF NOT EXISTS secrets (k TEXT PRIMARY KEY, v TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS request_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts TEXT NOT NULL, request_id TEXT NOT NULL, group_id TEXT NOT NULL,
@@ -183,17 +192,37 @@ impl Store {
         let json: Option<String> = conn
             .query_row("SELECT json FROM config_json WHERE id = 1", [], |r| r.get(0))
             .optional()?;
-        Ok(json.map(|j| serde_json::from_str(&j)).transpose()?)
+        let Some(json) = json else { return Ok(None) };
+        let mut value: serde_json::Value = serde_json::from_str(&json)?;
+        restore_secrets(&conn, &mut value)?;
+        Ok(Some(serde_json::from_value(value)?))
     }
 
     pub fn save_config(&self, cfg: &Config) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        let json = serde_json::to_string(cfg)?;
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let (json, secrets) = split_secrets(cfg)?;
+        // ONE transaction around BOTH halves of the same state. A crash in
+        // between would otherwise leave the placeholders on disk with the rows
+        // they stand for missing, and the next load would hand the gateway a
+        // channel with no credential at all. Committing both or neither is the
+        // only safe pairing.
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO config_json (id, json, updated_at) VALUES (1, ?1, ?2)
              ON CONFLICT(id) DO UPDATE SET json = ?1, updated_at = ?2",
             params![json, Utc::now().to_rfc3339()],
         )?;
+        // Rewrite the whole secret set instead of upserting one by one: a
+        // channel or API key the operator just deleted must not keep its
+        // credential alive in the table as an orphan row.
+        tx.execute("DELETE FROM secrets", [])?;
+        {
+            let mut stmt = tx.prepare("INSERT OR REPLACE INTO secrets (k, v) VALUES (?1, ?2)")?;
+            for (k, v) in &secrets {
+                stmt.execute(params![k, v])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -414,16 +443,29 @@ impl Store {
         Ok(rows.into_iter().map(|s| serde_json::from_str(&s).unwrap()).collect())
     }
 
-    /// One row per routing group: the "整体用了多少" overview that lets the
-    /// console show every group's totals side by side without N round trips.
-    pub fn stats_by_group(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+    /// One row per routing group: what the console renders when it needs
+    /// every group's totals side by side without N round trips.
+    ///
+    /// `None` (or an empty string) = the full cross-group overview, which is
+    /// what the group picker itself reads; `Some(g)` = ONLY that group's row.
+    /// The two scopes share one SQL template on purpose: a scoped call is the
+    /// same overview with a `WHERE`, so the picker and the selected group can
+    /// never disagree about what a column means.
+    pub fn stats_by_group(&self, group_id: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT json_object('group_id',group_id,'requests',COUNT(*),'success',SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'models',COUNT(DISTINCT exposed_model)) FROM request_logs GROUP BY group_id ORDER BY SUM(cost_usd) DESC LIMIT 200",
-        )?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
+        let scope = if group_id.map(|g| !g.is_empty()).unwrap_or(false) { " WHERE group_id = ?1" } else { "" };
+        let sql = format!(
+            "SELECT json_object('group_id',group_id,'requests',COUNT(*),'success',SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'models',COUNT(DISTINCT exposed_model)) FROM request_logs{scope} GROUP BY group_id ORDER BY SUM(cost_usd) DESC LIMIT 200"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = match group_id {
+            Some(g) if !g.is_empty() => stmt
+                .query_map(params![g], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
         Ok(rows.into_iter().map(|s| serde_json::from_str(&s).unwrap()).collect())
     }
 
@@ -446,6 +488,16 @@ impl Store {
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Raw read-back of one stored credential. Used by the tests to prove the
+    /// secret really left `config_json`, and available to any future caller that
+    /// needs a single value without loading the whole config.
+    pub fn secret(&self, k: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT v FROM secrets WHERE k = ?1")?;
+        let row: Option<String> = stmt.query_row(params![k], |r| r.get(0)).optional()?;
+        Ok(row)
     }
 
     /// Delete the traffic history the console displays: request logs, switch
@@ -477,4 +529,300 @@ impl Store {
     }
 }
 
+/// Where a credential used to sit inline, the JSON now says this instead. The
+/// literal is deliberately ugly so it can never be mistaken for a real key.
+const SECRET_PLACEHOLDER: &str = "__stored_in_secrets__";
 
+/// Split a config into (json with placeholders, credentials to store beside it).
+///
+/// A credential is identified by something that survives a reorder of the array
+/// it lives in, never by its position:
+///   - a channel, by its own id          -> `channel_key:<id>`
+///   - a gateway API key, by the group it serves plus its label
+///                                       -> `api_key:<group_id>:<name>`
+///
+/// `ApiKey` has no id field and the console is what creates those rows, so the
+/// `api_key:<api_keys[i].id>` shape named in the task is not reachable without
+/// a client change; group + name is the identity the console itself shows the
+/// operator. Two API keys sharing BOTH group and name are the one pair this
+/// cannot tell apart: they collapse onto a single secret row and both
+/// placeholders restore to the first one's value. PUT /admin/api/config accepts
+/// such a pair today, so the limit is written down here instead of being
+/// papered over with new validation that nothing asked for.
+///
+/// An EMPTY credential is left exactly as it was: there is nothing to hide, and
+/// a placeholder for it would turn "this channel has no key" into "this channel
+/// has a key that went missing".
+fn split_secrets(cfg: &Config) -> anyhow::Result<(String, Vec<(String, String)>)> {
+    let mut value = serde_json::to_value(cfg)?;
+    let mut secrets: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    if let Some(channels) = value.get_mut("channels").and_then(|v| v.as_array_mut()) {
+        for ch in channels.iter_mut() {
+            let Some(obj) = ch.as_object_mut() else { continue };
+            let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let key = obj.get("api_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if id.is_empty() || key.is_empty() || key == SECRET_PLACEHOLDER {
+                continue;
+            }
+            let k = format!("channel_key:{id}");
+            if seen.insert(k.clone()) {
+                secrets.push((k, key));
+            }
+            obj.insert("api_key".to_string(), serde_json::Value::String(SECRET_PLACEHOLDER.to_string()));
+        }
+    }
+
+    if let Some(keys) = value.get_mut("api_keys").and_then(|v| v.as_array_mut()) {
+        for entry in keys.iter_mut() {
+            let Some(obj) = entry.as_object_mut() else { continue };
+            let group = obj.get("group_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let key = obj.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if group.is_empty() || key.is_empty() || key == SECRET_PLACEHOLDER {
+                continue;
+            }
+            let k = format!("api_key:{group}:{name}");
+            if seen.insert(k.clone()) {
+                secrets.push((k, key));
+            }
+            obj.insert("key".to_string(), serde_json::Value::String(SECRET_PLACEHOLDER.to_string()));
+        }
+    }
+
+    Ok((serde_json::to_string(&value)?, secrets))
+}
+
+/// Put the real credentials back into a config that came off disk.
+///
+/// Only the exact placeholder is replaced. Anything else — a hand-written
+/// config, a row written before the split existed, or a key the operator
+/// literally typed as the placeholder — is left untouched, so an old database
+/// loads byte-for-byte as before. A placeholder whose secret row is missing is
+/// also left alone: a half-written pair is impossible (both halves commit in
+/// one transaction), and inventing an empty key would silently break upstream
+/// auth instead of failing loudly.
+fn restore_secrets(conn: &Connection, value: &mut serde_json::Value) -> anyhow::Result<()> {
+    let lookup = |k: &str| -> anyhow::Result<Option<String>> {
+        Ok(conn
+            .prepare("SELECT v FROM secrets WHERE k = ?1")?
+            .query_row(params![k], |r| r.get(0))
+            .optional()?)
+    };
+
+    if let Some(channels) = value.get_mut("channels").and_then(|v| v.as_array_mut()) {
+        for ch in channels.iter_mut() {
+            let Some(obj) = ch.as_object_mut() else { continue };
+            if obj.get("api_key").and_then(|v| v.as_str()) != Some(SECRET_PLACEHOLDER) {
+                continue;
+            }
+            let id = obj.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(v) = lookup(&format!("channel_key:{id}"))? {
+                obj.insert("api_key".to_string(), serde_json::Value::String(v));
+            }
+        }
+    }
+
+    if let Some(keys) = value.get_mut("api_keys").and_then(|v| v.as_array_mut()) {
+        for entry in keys.iter_mut() {
+            let Some(obj) = entry.as_object_mut() else { continue };
+            if obj.get("key").and_then(|v| v.as_str()) != Some(SECRET_PLACEHOLDER) {
+                continue;
+            }
+            let group = obj.get("group_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let name = obj.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            if group.is_empty() {
+                continue;
+            }
+            if let Some(v) = lookup(&format!("api_key:{group}:{name}"))? {
+                obj.insert("key".to_string(), serde_json::Value::String(v));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ApiKey, Channel, Protocol};
+
+    fn ts() -> String { "2026-01-01T00:00:00+00:00".to_string() }
+
+    fn req_log(group: &str, channel: &str, model: &str, cost: f64, wasted: f64) -> RequestLog {
+        RequestLog {
+            id: None,
+            ts: ts(),
+            request_id: format!("r-{group}-{channel}"),
+            group_id: group.to_string(),
+            exposed_model: "exp".to_string(),
+            entry_protocol: "openai".to_string(),
+            status: "success".to_string(),
+            final_channel: Some(channel.to_string()),
+            final_upstream_model: Some(model.to_string()),
+            attempts: 1,
+            loop_retries: 0,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost_usd: cost,
+            wasted_cost_usd: wasted,
+            duration_ms: 12,
+            ttft_ms: 3,
+        }
+    }
+
+    fn channel(id: &str, key: &str) -> Channel {
+        Channel {
+            id: id.to_string(),
+            name: id.to_string(),
+            base_url: "http://127.0.0.1:1".to_string(),
+            protocol: Protocol::Openai,
+            api_key: key.to_string(),
+            enabled: true,
+            weight: 1,
+            headers: Default::default(),
+        }
+    }
+
+    fn raw_json(st: &Store) -> String {
+        st.conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT json FROM config_json WHERE id = 1", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Two groups in the log, and the scope decides how many rows come back.
+    /// The whole point of the signature change: the group picker reads the
+    /// unscoped overview while a selected group must see ONLY its own totals.
+    #[test]
+    fn stats_by_group_scopes_to_one_group() {
+        let st = Store::open_memory().unwrap();
+        st.insert_request_log(&req_log("g1", "c1", "m1", 1.0, 0.5)).unwrap();
+        st.insert_request_log(&req_log("g2", "c2", "m2", 2.0, 0.25)).unwrap();
+
+        let all = st.stats_by_group(None).unwrap();
+        assert_eq!(all.len(), 2, "None must return every group: {all:?}");
+
+        let only = st.stats_by_group(Some("g1")).unwrap();
+        assert_eq!(only.len(), 1, "Some(g1) must return exactly one row: {only:?}");
+        assert_eq!(only[0]["group_id"], "g1");
+        assert_eq!(only[0]["requests"], 1);
+        assert_eq!(only[0]["cost_usd"].as_f64(), Some(1.0));
+
+        // An empty string is "no scope" (the picker sends it when nothing is
+        // selected), NOT a group whose id happens to be empty.
+        let blank = st.stats_by_group(Some("")).unwrap();
+        assert_eq!(blank.len(), 2, "an empty group_id is the global overview: {blank:?}");
+
+        // The other two blocks take the same scope; a fix that only touched
+        // by_group would leave the summary and by_model unscoped.
+        let sum = st.stats_summary(Some("g1")).unwrap();
+        assert_eq!(sum["requests"], 1);
+        assert_eq!(sum["cost_usd"].as_f64(), Some(1.0));
+        let by_model = st.stats_by_model(Some("g2")).unwrap();
+        assert_eq!(by_model.len(), 1);
+        assert_eq!(by_model[0]["channel_id"], "c2");
+    }
+
+    /// The credential must leave config_json and live in the secrets table.
+    #[test]
+    fn credentials_are_split_out_of_config_json() {
+        let st = Store::open_memory().unwrap();
+        let cfg = Config {
+            channels: vec![channel("c1", "sk-channel-secret")],
+            api_keys: vec![ApiKey {
+                key: "gw-gateway-secret".to_string(),
+                group_id: "g1".to_string(),
+                name: "main".to_string(),
+                enabled: true,
+            }],
+            ..Config::default()
+        };
+        st.save_config(&cfg).unwrap();
+
+        let raw = raw_json(&st);
+        assert!(raw.contains(SECRET_PLACEHOLDER), "config_json must carry the placeholder: {raw}");
+        assert!(!raw.contains("sk-channel-secret"), "the channel key is still plaintext in config_json: {raw}");
+        assert!(!raw.contains("gw-gateway-secret"), "the API key is still plaintext in config_json: {raw}");
+
+        assert_eq!(st.secret("channel_key:c1").unwrap().as_deref(), Some("sk-channel-secret"));
+        assert_eq!(st.secret("api_key:g1:main").unwrap().as_deref(), Some("gw-gateway-secret"));
+
+        // ...and the gateway still gets the REAL bytes back, or every upstream
+        // call would start failing with 401 on the next restart.
+        let back = st.load_config().unwrap().unwrap();
+        assert_eq!(back.channels[0].api_key, "sk-channel-secret");
+        assert_eq!(back.api_keys[0].key, "gw-gateway-secret");
+        assert_eq!(
+            serde_json::to_string(&back).unwrap(),
+            serde_json::to_string(&cfg).unwrap(),
+            "save then load must round-trip byte-for-byte"
+        );
+    }
+
+    /// A rotated key replaces its predecessor, and a deleted channel takes its
+    /// credential with it instead of leaving an orphan row behind.
+    #[test]
+    fn secrets_follow_their_owner_across_saves() {
+        let st = Store::open_memory().unwrap();
+        let one = Config { channels: vec![channel("c1", "sk-first")], ..Config::default() };
+        st.save_config(&one).unwrap();
+        assert_eq!(st.secret("channel_key:c1").unwrap().as_deref(), Some("sk-first"));
+
+        let rotated = Config { channels: vec![channel("c1", "sk-second")], ..Config::default() };
+        st.save_config(&rotated).unwrap();
+        assert_eq!(st.secret("channel_key:c1").unwrap().as_deref(), Some("sk-second"));
+        assert_eq!(st.load_config().unwrap().unwrap().channels[0].api_key, "sk-second");
+
+        let gone = Config { channels: vec![], ..Config::default() };
+        st.save_config(&gone).unwrap();
+        assert_eq!(st.secret("channel_key:c1").unwrap(), None, "a deleted channel must not keep its key");
+
+        // An empty credential means "no key yet" and is deliberately left
+        // inline: turning it into a placeholder would make load look for a
+        // secret that was never saved and silently blank the field.
+        let blank = Config { channels: vec![channel("c2", "")], ..Config::default() };
+        st.save_config(&blank).unwrap();
+        assert_eq!(st.secret("channel_key:c2").unwrap(), None);
+        assert_eq!(st.load_config().unwrap().unwrap().channels[0].api_key, "");
+    }
+
+    /// A database written by an older build has the keys inline, and there is
+    /// no secret row for them. Load must copy those through untouched.
+    #[test]
+    fn a_config_that_predates_the_split_still_loads() {
+        let st = Store::open_memory().unwrap();
+        let legacy = r#"{"channels":[{"id":"c9","name":"legacy","base_url":"http://127.0.0.1:9","protocol":"openai","api_key":"sk-legacy-inline","enabled":true,"weight":1}],"api_keys":[]}"#;
+        {
+            let conn = st.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO config_json (id, json, updated_at) VALUES (1, ?1, ?2)",
+                params![legacy, ts()],
+            )
+            .unwrap();
+        }
+        let got = st.load_config().unwrap().unwrap();
+        assert_eq!(got.channels[0].api_key, "sk-legacy-inline", "an inline key must survive verbatim");
+
+        // The mirror case: a placeholder whose secret row is missing (both
+        // halves commit together, so this only happens in a hand-edited file).
+        // Leaving it alone fails loudly later; replacing it with "" would look
+        // like a working channel that authenticates as nobody.
+        let orphan = format!(
+            r#"{{"channels":[{{"id":"c9","name":"legacy","base_url":"http://127.0.0.1:9","protocol":"openai","api_key":"{SECRET_PLACEHOLDER}","enabled":true,"weight":1}}],"api_keys":[]}}"#
+        );
+        {
+            let conn = st.conn.lock().unwrap();
+            conn.execute("UPDATE config_json SET json = ?1 WHERE id = 1", params![orphan]).unwrap();
+        }
+        assert_eq!(st.load_config().unwrap().unwrap().channels[0].api_key, SECRET_PLACEHOLDER);
+    }
+}

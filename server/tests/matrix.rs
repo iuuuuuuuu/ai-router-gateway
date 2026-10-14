@@ -432,7 +432,9 @@ async fn t20_group_scoped_logs_and_stats() {
     assert_eq!(st.store.stats_by_model(Some("g1")).unwrap().len(), 1);
 
     // the cross-group overview always lists every group that saw traffic
-    let by_group = st.store.stats_by_group().unwrap();
+    // Signature change (task-43 defect 1): `None` is the cross-group overview
+    // this assertion has always been about.
+    let by_group = st.store.stats_by_group(None).unwrap();
     let row = by_group.iter().find(|r| r["group_id"] == "g1").expect("g1 row present");
     assert_eq!(row["requests"], 1, "by_group counts g1: {by_group:?}");
     assert!(by_group.iter().all(|r| r["group_id"] != "g2"), "a group with no traffic has no row: {by_group:?}");

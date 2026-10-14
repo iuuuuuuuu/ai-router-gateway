@@ -1,15 +1,15 @@
 <script setup lang="ts">
 // 分组路由：分组列表 + 每组的概览统计与实时并发。
 //
-// 编辑去哪了（2026-10-13 重构）：
+// 编辑去哪了（2026-10-13 重构，同日二次调整）：
 //  · 分组本身的设置（名称 / 暴露模型 / 重试与超时）→ 分组详情页里内联改，看板与设置同屏；
-//  · 路由层级 / 成员 / 权重（也就是「模型配置」）→ 分组详情的「模型配置」子页；
+//  · 路由层级 / 成员 / 权重（也就是「模型配置」）→ 同样内联在分组详情页里，不再单独开子页；
 //  · 本页只剩两件事：把分组列出来、把每组的统计与「使用中」实时并发显示出来。
 // 因此本页是只读的（除了删除分组），不再有编辑弹窗，也不再有 draft/校验/保存逻辑。
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ChevronDown, LayoutDashboard, Plus, RefreshCw, Trash2, Waypoints } from "@lucide/vue";
 import { Badge, Btn, Card, Empty, IconBtn } from "../components/ui";
-import { openGroupDetail, openGroupModels, openModelDetail } from "../nav";
+import { openGroupDetail, openModelDetail } from "../nav";
 import { apiKeys, bindingLabel, channelName, groups, groupsUsingModel, markDirty, models, state, uid } from "../store";
 import { toast } from "../toast";
 import {
@@ -90,7 +90,7 @@ function groupInflight(groupId: string): number {
 function tierInflight(g: Group, t: Tier): number {
   return (t.members ?? []).reduce((n, m) => n + memberInflight(g.id, t.level, m.model_id), 0);
 }
-/** 点成员 chip → 模型详情页（在「模型配置」子视图里打开，回来仍停在那一页）。 */
+/** 点成员 chip → 模型详情页（返回时仍停在同一个分组详情页）。 */
 function openMember(g: Group, tierLevel: number, modelId: string) {
   const key = memberKey(g.id, tierLevel, modelId);
   if (!key) return;
@@ -279,7 +279,7 @@ function refreshAll() { void loadStats(); void loadGroupMembers(); }
 /* ------------------------------- 新建分组 ------------------------------- */
 // 新增分组不再开弹窗：直接建一个空壳塞进配置、进详情页填内容。
 // 只进内存（markDirty），要落库仍然得点顶栏「保存」—— 与其它页面同一套语义。
-// 起手给一个一级空层，用户到了「模型配置」子页就能直接加成员，不用先点「添加一级」。
+// 起手给一个一级空层，用户到了详情页的模型配置区就能直接加成员，不用先点「添加一级」。
 function createGroup() {
   const cfg = state.cfg;
   if (!cfg) return;
@@ -355,7 +355,7 @@ function confirmRemoveGroup() {
 </script>
 
 <!--
-  拖动排序的全局兜底：抓手在「模型配置」子页里，但指针会跑到 window 上。
+  拖动排序的全局兜底：抓手在分组详情页的模型配置区里，但指针会跑到 window 上。
   拖住时锁住整页文本选区与光标（否则划过文字会选中一片、光标变成 I 形），
   user-select:none 对 WebView2 里的子元素同样生效，松手立刻恢复。
 -->
@@ -434,11 +434,8 @@ function confirmRemoveGroup() {
             <div class="mt-0.5 truncate font-mono text-[11.5px] text-ink-3">{{ g.id }}</div>
           </div>
           <div class="flex shrink-0 items-center gap-0.5">
-            <IconBtn title="分组详情" data-test="group-detail-btn" @click="openGroupDetail(g.id)">
+            <IconBtn title="分组详情（含模型配置）" data-test="group-detail-btn" @click="openGroupDetail(g.id)">
               <LayoutDashboard :size="15" />
-            </IconBtn>
-            <IconBtn title="模型配置" data-test="group-models-btn" @click="openGroupModels(g.id)">
-              <Waypoints :size="15" />
             </IconBtn>
             <IconBtn title="删除分组" danger @click="removeGroup(g)"><Trash2 :size="15" /></IconBtn>
           </div>
@@ -508,7 +505,7 @@ function confirmRemoveGroup() {
         <div class="mt-3.5 border-t border-line-soft pt-3.5">
           <div class="mb-2.5 flex items-center justify-between gap-2">
             <div class="text-[11.5px] font-medium uppercase tracking-wide text-ink-3">故障转移层级</div>
-            <Btn size="sm" variant="ghost" data-test="group-models-inline-btn" @click="openGroupModels(g.id)">
+            <Btn size="sm" variant="ghost" data-test="group-models-inline-btn" @click="openGroupDetail(g.id)">
               <Waypoints :size="12" />模型配置
             </Btn>
           </div>
@@ -564,7 +561,7 @@ function confirmRemoveGroup() {
               ↑ 全部失败 → 回到一级（最多 {{ maxCyclesOf(g) }} 轮）
             </div>
           </div>
-          <p v-else class="text-[12px] text-ink-3">未配置层级，去「模型配置」加一层。</p>
+          <p v-else class="text-[12px] text-ink-3">未配置层级，进「分组详情」加一层。</p>
         </div>
       </Card>
     </div>

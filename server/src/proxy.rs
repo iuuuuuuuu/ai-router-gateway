@@ -112,6 +112,14 @@ pub struct SwitchRecord {
     pub http_status: Option<u16>,
     pub latency_ms: u64,
     pub message: String,
+    /// What THIS attempt had already billed upstream when it ended. A failed or
+    /// timed-out attempt can still have consumed real tokens (the upstream
+    /// streamed a usage frame, or our partial accumulator saw one), and those
+    /// tokens are money the user paid for an answer they never got — that is
+    /// exactly what `wasted_cost_usd` prices. Stays 0 when nothing was
+    /// observed: an unobserved count is not evidence of zero cost, it is
+    /// absence of evidence, and the normal path has no usage to price either.
+    pub usage: ir::Usage,
 }
 
 pub struct RunResult {
@@ -155,6 +163,9 @@ pub async fn run(ctx: &ProxyCtx<'_>) -> RunResult {
     let started = Instant::now();
     let mut records: Vec<SwitchRecord> = vec![];
     let mut usage_total = ir::Usage::default();
+    // The running maximum *before* the attempt in flight. attempt_once reports a
+    // monotonic running max, so the per-attempt usage is that max minus this.
+    let mut usage_baseline = ir::Usage::default();
     let mut ttft: Option<u64> = None;
 
     let Some(snap) = ctx.state.config.get() else {
@@ -195,6 +206,7 @@ pub async fn run(ctx: &ProxyCtx<'_>) -> RunResult {
                             upstream_model: candidate.upstream_model.clone(),
                             error_class: "committed", http_status: Some(200), latency_ms: latency,
                             message: String::new(),
+                            usage: resp.usage.clone(),
                         });
                         return RunResult {
                             terminal: Terminal::Exhausted,
@@ -216,6 +228,10 @@ pub async fn run(ctx: &ProxyCtx<'_>) -> RunResult {
                             upstream_model: candidate.upstream_model.clone(),
                             error_class: "committed", http_status: Some(200), latency_ms: latency,
                             message: String::new(),
+                            // A stream that commits here has not finished yet, so the
+                            // final usage does not exist at this point. It arrives later
+                            // via usage_rx and is priced into cost_usd by the caller.
+                            usage: ir::Usage::default(),
                         });
                         return RunResult {
                             terminal: Terminal::Exhausted,
@@ -229,6 +245,7 @@ pub async fn run(ctx: &ProxyCtx<'_>) -> RunResult {
                         };
                     }
                     Err((perr, partial)) => {
+                        let baseline = usage_baseline;
                         usage_total = ir::Usage {
                             input_tokens: usage_total.input_tokens.max(partial.input_tokens),
                             output_tokens: usage_total.output_tokens.max(partial.output_tokens),
@@ -244,7 +261,22 @@ pub async fn run(ctx: &ProxyCtx<'_>) -> RunResult {
                             http_status: match &perr { ProxyError::UpstreamStatus { status, .. } => Some(*status), _ => None },
                             latency_ms: latency,
                             message: proxy_err_message(&perr),
+                            // What THIS attempt burned before it failed. Deliberately
+                            // the per-attempt remainder, not the running maximum: a
+                            // failed attempt can only ever be priced when it observed
+                            // usage itself, and a monotonic running max would re-charge
+                            // an earlier attempt's tokens. `partial` holds the largest
+                            // accumulator THIS attempt reached, so subtracting the
+                            // pre-attempt high-water mark is safe (`saturating_sub`
+                            // clamps any stale baseline to 0 instead of wrapping).
+                            usage: ir::Usage {
+                                input_tokens: partial.input_tokens.saturating_sub(baseline.input_tokens),
+                                output_tokens: partial.output_tokens.saturating_sub(baseline.output_tokens),
+                                cache_read_tokens: partial.cache_read_tokens.saturating_sub(baseline.cache_read_tokens),
+                                cache_creation_tokens: partial.cache_creation_tokens.saturating_sub(baseline.cache_creation_tokens),
+                            },
                         });
+                        usage_baseline = usage_total;
                         ctx.state.health.apply(attribution);
                         if matches!(perr, ProxyError::ClientGone) {
                             return RunResult { terminal: Terminal::Exhausted, records, success: None, usage: usage_total, ttft_ms: ttft, duration_ms: started.elapsed().as_millis() as u64, final_channel: None, final_upstream_model: None };

@@ -229,7 +229,12 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
     // detached task never has to borrow `result`. This is the same predicate
     // the /admin/api/logs/switch endpoint shows, so the two agree by construction.
     let loop_retries_for_log = result.records.iter().filter(|r| r.error_class == "degenerate_output").count() as u32;
-    let wasted_cost = wasted_of(&snap, &result.records);
+    // Both figures below are priced from the SAME snapshot the walk ran against
+    // (the one grabbed at :122 for routing), never a fresh `state.config.get()`:
+    // a console save landing mid-request must not make one number come from one
+    // price table and the other from the next. `snap.config` is an Arc clone.
+    let price_snap = snap.clone();
+    let wasted_cost = wasted_of(&price_snap, &result.records);
 
     match result.success {
         Some(Outcome::Full(resp)) => {
@@ -284,8 +289,18 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
             let lr = loop_retries_for_log;
             let dur = duration_ms as i64;
             let ttft = result.ttft_ms.map(|t| t as i64);
+            // Moved into the detached logger so it can price the final usage with
+            // the SAME cost_of the non-stream path uses. Without this the stream
+            // row would carry a literal 0 and the console would show every
+            // streaming request as free.
+            let price_snap = price_snap.clone();
+            let wasted = wasted_cost;
             tokio::spawn(async move {
                 let usage = usage_rx.await.unwrap_or_default();
+                // Priced BEFORE the row below moves `fc`/`fum` into itself: a
+                // struct literal evaluates its fields in written order, so a
+                // borrowing call placed after them would not compile.
+                let cost = cost_of(&price_snap, &fc, &fum, &usage);
                 st.store.insert_request_log(&crate::store::RequestLog {
                     id: None, ts: iso_now(), request_id: rid, group_id: gid,
                     exposed_model: em, entry_protocol: format!("{entry:?}").to_lowercase(),
@@ -294,7 +309,7 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                     loop_retries: lr,
                     input_tokens: usage.input_tokens as i64, output_tokens: usage.output_tokens as i64,
                     cache_read_tokens: usage.cache_read_tokens as i64, cache_creation_tokens: usage.cache_creation_tokens as i64,
-                    cost_usd: 0.0, wasted_cost_usd: 0.0, duration_ms: dur, ttft_ms: ttft.unwrap_or(0),
+                    cost_usd: cost, wasted_cost_usd: wasted, duration_ms: dur, ttft_ms: ttft.unwrap_or(0),
                 });
             });
             response
@@ -339,15 +354,26 @@ fn cost_of(snap: &crate::config::ConfigSnapshot, final_channel: &Option<String>,
     p[0] * in_m + p[1] * out_m + p[2] * cr_m + p[3] * cc_m
 }
 
+/// What the attempts that were THROWN AWAY actually cost.
+///
+/// A committed attempt is skipped: its tokens are the answer the client got, so
+/// they are already counted in that request's `cost_usd`, and adding them here
+/// would bill the same tokens twice. Everything else is priced through the very
+/// same `cost_of` as the normal path — one pricing function, so the "what we
+/// paid" and the "what we wasted" columns can never drift apart.
+///
+/// A record with no observed usage contributes 0. That is not a fudge: nothing
+/// was ever parsed from that attempt, and inventing an estimate here would put
+/// a number in the console that no upstream ever confirmed. A record whose
+/// channel/model binding cannot be found (deleted between the attempt and the
+/// log write), or whose price is all zeroes, also contributes exactly 0.
 fn wasted_of(snap: &crate::config::ConfigSnapshot, records: &[crate::proxy::SwitchRecord]) -> f64 {
     let mut wasted = 0.0;
     for rec in records {
         if rec.error_class == "committed" { continue }
-        // failed attempts may still have billed tokens upstream; we do not
-        // know the count (no usage parsed) — charge a conservative estimate
-        // of zero and rely on upstream_billed reconciliation later.
-        let _ = (&rec.channel_id, &rec.upstream_model);
-        let _ = &snap;
+        let ch = Some(rec.channel_id.clone());
+        let up = Some(rec.upstream_model.clone());
+        wasted += cost_of(snap, &ch, &up, &rec.usage);
     }
     wasted
 }
@@ -398,4 +424,142 @@ async fn handle_anthropic(state: State<crate::proxy::AppState>, headers: HeaderM
 async fn handle_gemini_generic(state: State<crate::proxy::AppState>, headers: HeaderMap, axum::extract::Path(model_path): axum::extract::Path<String>, body: String) -> Response {
     let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
     handle_chat(state, headers, format!("/v1beta/models/{model_path}"), v).await
+}
+
+/// D2: the wasted-cost helpers. They are private to this module, so their tests
+/// sit next to them and call them exactly the way the request path does.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Channel, Config, ConfigSnapshot, ModelBinding, Protocol};
+
+    fn binding(channel_id: &str, upstream: &str, price: [f64; 4]) -> ModelBinding {
+        ModelBinding {
+            id: format!("{channel_id}-{upstream}"),
+            channel_id: channel_id.to_string(),
+            exposed: "exp".to_string(),
+            upstream: upstream.to_string(),
+            price_per_m: price,
+            enabled: true,
+        }
+    }
+
+    fn snapshot(models: Vec<ModelBinding>) -> ConfigSnapshot {
+        let channels = models
+            .iter()
+            .map(|m| Channel {
+                id: m.channel_id.clone(),
+                name: m.channel_id.clone(),
+                base_url: "http://127.0.0.1:1".to_string(),
+                protocol: Protocol::Openai,
+                api_key: "sk-x".to_string(),
+                enabled: true,
+                weight: 1,
+                headers: Default::default(),
+            })
+            .collect();
+        ConfigSnapshot {
+            config: std::sync::Arc::new(Config { channels, models, ..Config::default() }),
+            version: 1,
+        }
+    }
+
+    fn usage(input: u64, output: u64, cache_read: u64, cache_creation: u64) -> crate::protocol::ir::Usage {
+        crate::protocol::ir::Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: cache_creation,
+        }
+    }
+
+    fn record(channel: &str, upstream: &str, error_class: &'static str, u: crate::protocol::ir::Usage) -> crate::proxy::SwitchRecord {
+        crate::proxy::SwitchRecord {
+            attempt_no: 1,
+            tier: 1,
+            channel_id: channel.to_string(),
+            channel_name: channel.to_string(),
+            upstream_model: upstream.to_string(),
+            error_class,
+            http_status: Some(502),
+            latency_ms: 5,
+            message: String::new(),
+            usage: u,
+        }
+    }
+
+    fn approx(got: f64, want: f64) {
+        assert!((got - want).abs() < 1e-9, "expected {want}, got {got}");
+    }
+
+    /// The regression this whole defect is about: a failed attempt that really
+    /// did consume tokens used to be reported as 0, because the helper was an
+    /// empty body returning the literal 0.0.
+    #[test]
+    fn a_failed_attempt_with_usage_is_priced() {
+        let snap = snapshot(vec![binding("c1", "up1", [1.0, 2.0, 0.0, 0.0])]);
+        // 1M input at 1 USD per M, plus 1M output at 2 USD per M.
+        let recs = vec![record("c1", "up1", "http_5xx", usage(1_000_000, 1_000_000, 0, 0))];
+        let w = wasted_of(&snap, &recs);
+        assert!(w > 0.0, "a discarded attempt that observed usage must cost money, got {w}");
+        approx(w, 3.0);
+    }
+
+    /// Every price slot is read from its own index, so a cache-heavy attempt
+    /// cannot be silently billed at the input rate.
+    #[test]
+    fn cache_token_prices_use_their_own_slots() {
+        let snap = snapshot(vec![binding("c1", "up1", [0.0, 0.0, 3.0, 4.0])]);
+        let recs = vec![record("c1", "up1", "aborted", usage(0, 0, 1_000_000, 1_000_000))];
+        approx(wasted_of(&snap, &recs), 7.0);
+    }
+
+    /// The committed attempt is the answer the client actually received, and
+    /// its tokens are already counted in that request cost_usd. Pricing it here
+    /// again would bill the same tokens twice.
+    #[test]
+    fn a_committed_attempt_is_not_wasted() {
+        let snap = snapshot(vec![binding("c1", "up1", [1.0, 0.0, 0.0, 0.0])]);
+        let committed = vec![record("c1", "up1", "committed", usage(1_000_000, 0, 0, 0))];
+        assert_eq!(wasted_of(&snap, &committed), 0.0, "a committed attempt must not be counted as waste");
+
+        // The SAME usage under a non-committed class does cost 1.0, which proves
+        // the 0 above came from the skip and not from a failed binding lookup.
+        let failed = vec![record("c1", "up1", "http_5xx", usage(1_000_000, 0, 0, 0))];
+        approx(wasted_of(&snap, &failed), 1.0);
+    }
+
+    /// 0 is the honest answer for a free channel and for a record whose binding
+    /// disappeared, and it must be produced by pricing the record, not by
+    /// refusing to look at it.
+    #[test]
+    fn zero_price_and_unknown_bindings_contribute_zero() {
+        let free = snapshot(vec![binding("c1", "up1", [0.0; 4])]);
+        let recs = vec![record("c1", "up1", "http_5xx", usage(5_000_000, 5_000_000, 0, 0))];
+        assert_eq!(wasted_of(&free, &recs), 0.0, "an all-zero price table must stay 0");
+
+        let other = snapshot(vec![binding("c9", "up9", [1.0, 1.0, 1.0, 1.0])]);
+        assert_eq!(wasted_of(&other, &recs), 0.0, "a record with no matching binding must stay 0");
+        assert_eq!(cost_of(&other, &Some("c1".into()), &Some("up1".into()), &usage(1_000_000, 0, 0, 0)), 0.0);
+    }
+
+    /// Several discarded attempts add up, each priced on its own channel: the
+    /// retry that moved to a pricier channel is the expensive one.
+    #[test]
+    fn discarded_attempts_sum_across_channels() {
+        let snap = snapshot(vec![
+            binding("c1", "up1", [1.0, 0.0, 0.0, 0.0]),
+            binding("c2", "up2", [2.0, 0.0, 0.0, 0.0]),
+        ]);
+        let recs = vec![
+            record("c1", "up1", "http_5xx", usage(1_000_000, 0, 0, 0)),
+            record("c2", "up2", "timeout", usage(1_000_000, 0, 0, 0)),
+            record("c2", "up2", "committed", usage(1_000_000, 0, 0, 0)),
+        ];
+        approx(wasted_of(&snap, &recs), 3.0);
+        // The normal path keeps pricing the committed answer on its own channel.
+        approx(cost_of(&snap, &Some("c2".into()), &Some("up2".into()), &usage(1_000_000, 0, 0, 0)), 2.0);
+        // Nothing observed means nothing charged, rather than an invented estimate.
+        assert_eq!(cost_of(&snap, &Some("c1".into()), &Some("up1".into()), &usage(0, 0, 0, 0)), 0.0);
+    }
 }

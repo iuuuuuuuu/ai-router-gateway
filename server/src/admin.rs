@@ -79,11 +79,9 @@ pub async fn put_config(State(state): State<AppState>, headers: HeaderMap, Json(
         .map(|s| s.config.channels.clone())
         .unwrap_or_default();
 
-    let json = serde_json::to_value(&cfg).unwrap_or(Value::Null);
     if let Err(e) = state.store.save_config(&cfg) {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("save config: {e}")).into_response();
     }
-    let _ = json;
     let cleared = state.health.reconcile_config(&old_channels, &cfg);
     if cleared > 0 {
         tracing::info!(cleared, "cooldown state reconciled with the new config");
@@ -119,8 +117,11 @@ pub async fn request_logs(State(state): State<AppState>, headers: HeaderMap, Que
 
 #[derive(Deserialize)]
 pub struct StatsQuery {
-    /// Scopes summary + by_model to one routing group; by_group is always the
-    /// full cross-group overview so the console can show the picker.
+    /// Scopes ALL THREE blocks to one routing group when set. Omitted/empty is
+    /// the global overview: the group picker needs by_group to list every group
+    /// before the user has picked one, and it is exactly this empty query that
+    /// draws it. A non-empty value narrows summary, by_model AND by_group to
+    /// that one group.
     pub group_id: Option<String>,
 }
 
@@ -129,7 +130,7 @@ pub async fn stats(State(state): State<AppState>, headers: HeaderMap, Query(q): 
     let scope = q.group_id.as_deref().filter(|g| !g.is_empty());
     let summary = state.store.stats_summary(scope).unwrap_or_else(|_| json!({}));
     let by_model = state.store.stats_by_model(scope).unwrap_or_else(|_| vec![]);
-    let by_group = state.store.stats_by_group().unwrap_or_else(|_| vec![]);
+    let by_group = state.store.stats_by_group(scope).unwrap_or_else(|_| vec![]);
     let health: Vec<Value> = state.health.snapshot_summary().into_iter().map(cooldown_json).collect();
     Json(json!({ "summary": summary, "by_model": by_model, "by_group": by_group, "group_id": scope, "health": health })).into_response()
 }
@@ -467,6 +468,12 @@ pub async fn group_members(State(state): State<AppState>, headers: HeaderMap, Qu
 
     let mut members: Vec<Value> = vec![];
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Sum of the per-member counters BELOW, accumulated as the rows are built.
+    // It must be this group's own in-flight load, not the gateway's: a slow
+    // request that belongs to another group must never inflate this group's
+    // "当前并发" badge (the header label says 本分组, and the rows it sums are
+    // this group's members).
+    let mut inflight_total: i64 = 0;
     for tier in tiers {
         let mut slots: Vec<&crate::config::TierMember> = tier.members.iter().collect();
         if snap.config.auto_weight {
@@ -506,6 +513,7 @@ pub async fn group_members(State(state): State<AppState>, headers: HeaderMap, Qu
             // How many requests are using this account RIGHT NOW. 0 is the
             // normal state; anything above 0 is what "使用中" means.
             let inflight_n = state.inflight.member_count(&key) as i64;
+            inflight_total += inflight_n;
 
             members.push(json!({
                 "key": key,
@@ -554,8 +562,9 @@ pub async fn group_members(State(state): State<AppState>, headers: HeaderMap, Qu
         "group_name": group.name,
         "active_key": active_key,
         // Sum over the members above, so the header can say "本分组正在并发 N"
-        // without re-adding the rows.
-        "inflight_total": state.inflight.total(),
+        // without re-adding the rows. Group-scoped on purpose — see the
+        // accumulator's comment.
+        "inflight_total": inflight_total,
         "retry": rc,
         "retry_source": retry_source,
         "global_retry": snap.config.retry,
