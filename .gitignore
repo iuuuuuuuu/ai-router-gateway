@@ -171,3 +171,15 @@ Desktop.ini
 /tools/_dbg-del3.mjs
 /tools/_dbg-del4.mjs
 /tools/_dbg-del5.mjs
+
+# ── v0.4.7 真机验收：分组详情「模型配置」卡拖动排序 / 层级顺序（本机证据，不入库）──
+/tools/_accept-tieredit.mjs
+/tools/_accept-tieredit-baseline.json
+/tools/_accept-tieredit-autow.json
+/tools/_probe-grporder.mjs
+/tools/_probe-routing.mjs
+/tools/_probe-schema.mjs
+/tools/_probe-tier12.mjs
+/tools/_probe-aw.mjs
+/tools/_dbg-drag2.mjs
+/tools/_dbg-drag3.mjs
