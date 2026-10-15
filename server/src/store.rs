@@ -568,7 +568,8 @@ impl Store {
     /// console shows when a group is selected ("这个分组里具体模型用了多少").
     ///
     /// One row = one (`final_channel`, `final_upstream_model`) pair — the model
-    /// the request was ACTUALLY routed to.
+    /// the request was ACTUALLY routed to — PLUS one row per
+    /// (`channel`, `model`) pair that a request TRIED and failed on.
     ///
     /// It deliberately does NOT group by `exposed_model`. A group's name and id
     /// are themselves callable model names (see `router::is_wildcard`), so a
@@ -577,15 +578,79 @@ impl Store {
     /// if it were a model (measured: 43 of grp_main's 68 requests landed in such
     /// rows). The routed pair is the only identity that names a real model.
     ///
-    /// A request that never reached any upstream has NULL in both columns. GROUP
-    /// BY buckets those together into ONE row carrying `routed: 0`, which keeps
-    /// the invariant that the row sums still equal the group's request total —
-    /// failures stay visible instead of silently disappearing from the charts.
+    /// ## Why failures are attributed to the pair they were tried on
+    ///
+    /// A request that never reached any upstream has NULL in both `request_logs`
+    /// routing columns, so the old single-row bucket ("未路由（失败）") answered
+    /// "how many failed" but never "on which channel/model". Owner asked for the
+    /// latter: 失败也要显示出来，按「渠道 - 具体模型」. The tried pairs live in
+    /// `switch_logs`, so unrouted requests are re-attributed to the pair of each
+    /// failed attempt.
+    ///
+    /// `kind` tells the three shapes apart:
+    ///   * `routed`   — the request was committed to this pair (final_* columns).
+    ///   * `attempted`— the request tried this pair and failed (switch_logs).
+    ///   * `unrouted` — no candidate was ever tried (all cooling / no candidate);
+    ///                   there is no channel and no model, and none is invented.
+    ///
+    /// ★ Two honest caveats, both deliberate:
+    ///   1. `requests` sums to MORE than the request total whenever a request
+    ///      tried several candidates, because one request legitimately appears in
+    ///      several attempt rows. That is the semantics the owner chose
+    ///      ("按每次尝试展开"). Do NOT "fix" it by deduplicating — that would
+    ///      silently drop the very rows this exists to show.
+    ///   2. Cost/token columns are attributed to the `routed` row ONLY. A failed
+    ///      attempt's cost is already reported by `wasted_cost_usd`; adding it to
+    ///      the attempt row would double-count it against the group total. This is
+    ///      also why the unrouted/attempted rows carry 0 tokens.
     pub fn stats_by_model(&self, group_id: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
-        let scope = if group_id.map(|g| !g.is_empty()).unwrap_or(false) { " WHERE group_id = ?1" } else { "" };
+        // Appended after an explicit "WHERE 1=1" so the SAME fragment works for
+        // both scopes. (Emitting a bare " WHERE rl.group_id = ?1" and then
+        // appending " AND …" to it produced invalid SQL without a WHERE in the
+        // global case — caught by w06, which exercises both scopes.)
+        let scope = if group_id.map(|g| !g.is_empty()).unwrap_or(false) { " AND rl.group_id = ?1" } else { "" };
+        // Row shape is shared by all three branches so the console never has to
+        // guess which keys exist.
         let sql = format!(
-            "SELECT json_object('routed',CASE WHEN final_channel IS NULL THEN 0 ELSE 1 END,'upstream_model',final_upstream_model,'channel_id',final_channel,'requests',COUNT(*),'input_tokens',SUM(input_tokens),'output_tokens',SUM(output_tokens),'cache_read_tokens',SUM(cache_read_tokens),'cache_creation_tokens',SUM(cache_creation_tokens),'cost_usd',ROUND(SUM(cost_usd),6),'wasted_cost_usd',ROUND(SUM(wasted_cost_usd),6)) FROM request_logs{scope} GROUP BY final_channel, final_upstream_model ORDER BY SUM(cost_usd) DESC LIMIT 200"
+            "SELECT json_object(
+                'kind', kind, 'routed', CASE WHEN kind = 'unrouted' THEN 0 ELSE 1 END,
+                'upstream_model', upstream_model, 'channel_id', channel_id,
+                'requests', SUM(n),
+                'input_tokens', SUM(input_tokens), 'output_tokens', SUM(output_tokens),
+                'cache_read_tokens', SUM(cache_read_tokens), 'cache_creation_tokens', SUM(cache_creation_tokens),
+                'cost_usd', ROUND(SUM(cost_usd),6), 'wasted_cost_usd', ROUND(SUM(wasted_cost_usd),6),
+                'last_error_class', MAX(last_error_class)
+             ) FROM (
+                -- (a) committed requests: the model actually routed to
+                SELECT 'routed' AS kind, rl.final_channel AS channel_id, rl.final_upstream_model AS upstream_model,
+                       1 AS n, rl.input_tokens, rl.output_tokens, rl.cache_read_tokens, rl.cache_creation_tokens,
+                       rl.cost_usd, rl.wasted_cost_usd, '' AS last_error_class
+                FROM request_logs rl WHERE 1=1{scope} AND rl.final_channel IS NOT NULL
+                UNION ALL
+                -- (b) requests that TRIED a pair and failed (one row per request×pair).
+                --     GROUP BY is what collapses duplicate attempts on the same pair
+                --     (measured: 36 requests hit one pair more than once).
+                SELECT 'attempted', sl.channel_id, sl.upstream_model,
+                       1, 0, 0, 0, 0, 0.0, 0.0, MAX(sl.error_class)
+                FROM request_logs rl
+                JOIN switch_logs sl ON sl.request_id = rl.request_id{scope} AND rl.final_channel IS NULL
+                GROUP BY rl.request_id, sl.channel_id, sl.upstream_model
+                UNION ALL
+                -- (c) everything else: not routed, and no attempt row to attribute it to.
+                --     This is a FALLBACK, not an attempts=0 test, on purpose: the
+                --     console can purge switch_logs while request_logs survive, and a
+                --     predicate on attempts would then drop those requests out of the
+                --     stats entirely — silently breaking the row-sum reconciliation.
+                --     No channel and no model exists for them, and none is invented.
+                SELECT 'unrouted', NULL, NULL,
+                       1, 0, 0, 0, 0, 0.0, 0.0, rl.error_class
+                FROM request_logs rl WHERE 1=1{scope} AND rl.final_channel IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM switch_logs s WHERE s.request_id = rl.request_id)
+             )
+             GROUP BY kind, channel_id, upstream_model
+             ORDER BY SUM(cost_usd) DESC, SUM(n) DESC
+             LIMIT 200"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = match group_id {

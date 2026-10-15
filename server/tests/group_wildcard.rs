@@ -495,6 +495,122 @@ async fn w06_stats_are_keyed_on_the_routed_model_not_the_group_alias() {
     assert_eq!(chz["requests"].as_i64(), Some(1), "{chz}");
     assert_eq!(all.iter().filter(|r| r["channel_id"] == "ch0").count(), 1, "no duplicate ch0 rows: {all:?}");
 }
+/// w07 — 失败请求必须按「渠道 - 具体模型」显示出来，不能被藏进一个笼统的桶里。
+///
+/// Owner 的要求（原话）：「失败也要显示出来，渠道 - 具体模型」，并且裁决了多候选
+/// 失败**按每次尝试展开**、0 次尝试的失败**单独一行**。真机库实测 831 次请求里
+/// 498 次没路由成功，其中 385 次一次都没试（77%）—— 后者没有渠道也没有模型。
+///
+/// 每条断言在旧实现下都会失败：旧 SQL 只有 routed/unrouted 两态，失败请求要么
+/// 全部挤进一行（丢掉「在哪个渠道×模型上失败」），要么根本没有行。
+#[tokio::test]
+async fn w07_failed_requests_are_shown_per_attempted_channel_and_model() {
+    let store = Store::open_memory().unwrap();
+
+    // (A) 一次失败请求，试了 2 个候选，两个都失败 —— 必须出现 2 行 attempted。
+    insert_request_as(&store, GROUP_ID, EXPOSED, "exhausted", None, 1);
+    insert_switch_as(&store, GROUP_ID, "req-1", "chA", "up-a", "auth_error");
+    insert_switch_as(&store, GROUP_ID, "req-1", "chB", "up-b", "rate_limited");
+
+    // (B) 同一个候选被重试两次 —— 仍只算 1 行（按 request×pair 去重），不重复计数。
+    insert_request_as(&store, GROUP_ID, EXPOSED, "exhausted", None, 2);
+    insert_switch_as(&store, GROUP_ID, "req-2", "chA", "up-a", "http_500");
+    insert_switch_as(&store, GROUP_ID, "req-2", "chA", "up-a", "http_500");
+
+    // (C) 一次都没试的失败（全冷却）—— 没有渠道也没有模型，单独一行 unrouted。
+    insert_request_as(&store, GROUP_ID, EXPOSED, "cooldown", None, 3);
+
+    // (D) 成功请求照旧一行 routed，且带成本。
+    insert_request_as(&store, GROUP_ID, EXPOSED, "success", Some(("chC", "up-c")), 4);
+
+    let rows = store.stats_by_model(Some(GROUP_ID)).unwrap();
+    let kind_of = |ch: &str, up: &str| -> Option<String> {
+        rows.iter()
+            .find(|r| r["channel_id"] == ch && r["upstream_model"] == up)
+            .and_then(|r| r["kind"].as_str().map(|s| s.to_string()))
+    };
+
+    // 失败的候选各自成行，并标明是「试过但失败」。
+    assert_eq!(kind_of("chA", "up-a").as_deref(), Some("attempted"), "{rows:?}");
+    assert_eq!(kind_of("chB", "up-b").as_deref(), Some("attempted"), "{rows:?}");
+    assert_eq!(kind_of("chC", "up-c").as_deref(), Some("routed"), "{rows:?}");
+
+    // (A) 两个候选各 1 行；重试的同一 pair 不重复计数；加上 unrouted 与 routed。
+    let a = rows.iter().find(|r| r["channel_id"] == "chA").unwrap();
+    assert_eq!(a["requests"].as_i64(), Some(2), "chA 被两次请求试过（req-1 与 req-2 各一次）: {a}");
+    let b = rows.iter().find(|r| r["channel_id"] == "chB").unwrap();
+    assert_eq!(b["requests"].as_i64(), Some(1), "{b}");
+
+    // unrouted 行没有渠道、没有模型，不冒充任何模型名。
+    let un = rows.iter().find(|r| r["kind"] == "unrouted").expect("unrouted 行必须在");
+    assert!(un["channel_id"].is_null(), "unrouted 行没有渠道: {un}");
+    assert!(un["upstream_model"].is_null(), "unrouted 行没有模型: {un}");
+    assert_eq!(un["routed"].as_i64(), Some(0), "{un}");
+
+    // ★ 成本只记在 routed 行：失败尝试的 token 恒为 0，否则会与分组总额重复计价。
+    for r in rows.iter().filter(|r| r["kind"] != "routed") {
+        assert_eq!(r["input_tokens"].as_i64(), Some(0), "失败行不得带 token: {r}");
+        assert_eq!(r["cost_usd"].as_f64(), Some(0.0), "失败行不得带成本: {r}");
+    }
+
+    // ★ 分组总额按**请求**计一次，不按**尝试**计 —— 这正是「展开只发生在模型维度，
+    //    不得回流到分组维度」的判据。insert_request_as 给每次请求 10 input / 5 output，
+    //    本测试共 4 次请求、5 条 switch_log 尝试（req-1 有 2 条）。
+    //    按尝试计会得到 50；正确值是 40。
+    let by_group = store.stats_by_group(Some(GROUP_ID)).unwrap();
+    assert_eq!(
+        by_group[0]["input_tokens"].as_i64(),
+        Some(40),
+        "分组总额 = 4 次请求 × 10，绝不能按 5 条尝试去计（那会得到 50）: {:?}",
+        by_group[0]
+    );
+    assert_eq!(by_group[0]["requests"].as_i64(), Some(4), "{:?}", by_group[0]);
+
+    // 三个失败请求各自可见：2 个 attempted 行 + 1 个 unrouted 行，另加 1 个 routed 行。
+    assert_eq!(rows.len(), 4, "2 attempted + 1 unrouted + 1 routed: {rows:?}");
+}
+
+/// w07 的反向对照：**按每次尝试展开**是刻意的 —— 行请求数之和**允许**大于请求总数。
+/// 这条断言把该语义钉住，防止将来有人为了「和等于总数」把失败行去重掉。
+#[tokio::test]
+async fn w07b_per_attempt_expansion_may_exceed_the_request_total_by_design() {
+    let store = Store::open_memory().unwrap();
+
+    // 一次请求试 3 个候选全失败 → 3 行 attempted。
+    insert_request_as(&store, GROUP_ID, EXPOSED, "exhausted", None, 1);
+    insert_switch_as(&store, GROUP_ID, "req-1", "chA", "up-a", "auth_error");
+    insert_switch_as(&store, GROUP_ID, "req-1", "chB", "up-b", "auth_error");
+    insert_switch_as(&store, GROUP_ID, "req-1", "chC", "up-c", "auth_error");
+
+    let rows = store.stats_by_model(Some(GROUP_ID)).unwrap();
+    let sum: i64 = rows.iter().map(|r| r["requests"].as_i64().unwrap()).sum();
+    let total = store.stats_by_group(Some(GROUP_ID)).unwrap()[0]["requests"].as_i64().unwrap();
+
+    assert_eq!(total, 1, "真机只有 1 次请求");
+    assert_eq!(sum, 3, "但展开成 3 行尝试 —— 这是 Owner 选定的语义，不是 bug: {rows:?}");
+    assert!(sum > total, "「按每次尝试展开」必然让行和大于总数");
+}
+
+fn insert_switch_as(store: &Store, group: &str, request_id: &str, channel: &str, upstream: &str, class: &str) {
+    store
+        .insert_switch_log(&SwitchLog {
+            ts: ts_for(1),
+            request_id: request_id.into(),
+            group_id: group.into(),
+            attempt_no: 1,
+            tier: 1,
+            channel_id: channel.into(),
+            channel_name: format!("{channel}-name"),
+            upstream_model: upstream.into(),
+            outcome: "failed".into(),
+            error_class: class.into(),
+            http_status: None,
+            latency_ms: 12,
+            message: String::new(),
+        })
+        .unwrap();
+}
+
 fn insert_switch(store: &Store, group: &str, channel: &str, upstream: &str, outcome: &str, class: &str, seq: usize) {
     store
         .insert_switch_log(&SwitchLog {

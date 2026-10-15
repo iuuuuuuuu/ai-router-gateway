@@ -560,8 +560,18 @@ function firstText(row: Row, keys: string[]): string {
 function modelRouted(row: Row): boolean {
   return firstNum(row, ["routed"]) !== 0;
 }
-/** 未路由（失败）那一行的名字：它不是模型，所以不冒充任何模型名。 */
-const UNROUTED_LABEL = "未路由（失败）";
+/** 行种类（后端 stats_by_model 的 kind）：routed=提交成功 / attempted=试过但失败 / unrouted=一次都没试。 */
+function modelKind(row: Row): string {
+  const k = firstText(row, ["kind"]);
+  if (k) return k;
+  // 兼容旧后端：没有 kind 时按 routed 推断。
+  return modelRouted(row) ? "routed" : "unrouted";
+}
+/**
+ * 没走到任何渠道时那一行的名字。
+ * 它没有渠道、也没有模型，所以**不冒充**任何模型名 —— 如实说明「一次都没试」。
+ */
+const UNROUTED_LABEL = "未尝试任何渠道（全冷却 / 无候选）";
 /**
  * 本行的模型身份 = **真实路由到的上游模型**。
  * 后端按 final_channel × final_upstream_model 聚合（server/src/store.rs 的 stats_by_model）。
@@ -570,9 +580,27 @@ const UNROUTED_LABEL = "未路由（失败）";
  * （实测 grp_main 的 68 次请求里有 43 次落在这种别名行上）。
  */
 function modelLabel(row: Row): string {
-  if (!modelRouted(row)) return UNROUTED_LABEL;
+  if (modelKind(row) === "unrouted") return UNROUTED_LABEL;
   const up = modelUpstream(row);
-  return up === "—" ? "未知模型" : up;
+  const name = up === "—" ? "未知模型" : up;
+  // 试过但失败的行：模型名后标注「未成功」，否则图上会与成功行同名、无法分辨。
+  return modelKind(row) === "attempted" ? name + "（未成功）" : name;
+}
+/**
+ * 状态列文案。三态必须一眼可分：
+ *   成功 = 请求提交到了这个 渠道×模型；
+ *   未成功 = 试过这个 渠道×模型 但失败了（请求最终失败）；
+ *   未尝试 = 一次候选都没试（全冷却 / 无候选），这一行没有渠道也没有模型。
+ */
+function modelStatusText(row: Row): string {
+  const k = modelKind(row);
+  if (k === "routed") return "成功";
+  if (k === "attempted") return "未成功";
+  return "未尝试";
+}
+function modelStatusClass(row: Row): string {
+  // 只有 -700 档是真实存在的主题 token（style.css 的 --color-ok-700 / --color-warn-700）。
+  return modelKind(row) === "routed" ? "text-ok-700" : "text-warn-700";
 }
 /**
  * 图表标签。同一个上游模型可能同时经由多个渠道出现（实测 deepseek-v4.1-flash 落在 7 个
@@ -1970,7 +1998,7 @@ function saveTiers() {
           <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
             <Coins :size="15" class="text-ink-3" />
             <h2 class="text-[13.5px] font-semibold text-ink">按模型用量</h2>
-            <span class="ml-auto text-[12px] text-ink-3">{{ byModel.length }} 个模型 · 按成本降序 · 按 上游模型 × 渠道 聚合</span>
+            <span class="ml-auto text-[12px] text-ink-3">{{ byModel.length }} 行 · 按成本降序 · 按 上游模型 × 渠道 聚合（失败请求按「试过的渠道×模型」展开）</span>
           </div>
 
           <Empty v-if="!byModel.length" title="暂无用量数据" hint="本分组产生请求并成功计费后，这里会按模型列出 token 与花费">
@@ -1981,6 +2009,7 @@ function saveTiers() {
             <table class="w-full text-[12.5px]">
               <thead>
                 <tr>
+                  <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">状态</th>
                   <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">模型</th>
                   <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">渠道</th>
                   <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">请求数</th>
@@ -1990,6 +2019,7 @@ function saveTiers() {
               </thead>
               <tbody>
                 <tr v-for="(row, i) in byModel" :key="i" class="border-t border-line-soft hover:bg-app">
+                  <td class="whitespace-nowrap px-3 py-2 text-[11.5px]" :class="modelStatusClass(row)" data-test="gd-model-status">{{ modelStatusText(row) }}</td>
                   <td class="whitespace-nowrap px-3 py-2 font-mono text-[11.5px]" :class="modelRouted(row) ? 'text-ink' : 'text-ink-3'">{{ modelLabel(row) }}</td>
                   <td class="whitespace-nowrap px-3 py-2">{{ modelChannel(row) }}</td>
                   <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums">
