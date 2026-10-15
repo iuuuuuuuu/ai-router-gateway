@@ -10,8 +10,8 @@
 // 页面由 App.vue 按 nav.groupId 挂载，group 一定非空；Esc 等价于点顶栏「返回」。
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import {
-  Activity, ArrowDown, ArrowRight, ArrowUp, Coins, Copy, GripVertical, Info, KeyRound, Pencil,
-  Plus, RefreshCw, RotateCcw, Save, ScrollText, ShieldAlert, Trash2, Waypoints,
+  Activity, ArrowDown, ArrowRight, ArrowUp, BarChart3, Coins, Copy, GripVertical, Info, KeyRound,
+  Layers, Pencil, PieChart, Plus, RefreshCw, RotateCcw, Save, ScrollText, ShieldAlert, Trash2, Waypoints,
 } from "@lucide/vue";
 import {
   api, type CooldownRow as ApiCooldownRow, type Group, type GroupMember, type GroupMembersPayload,
@@ -20,7 +20,11 @@ import {
 import { apiKeys, bindingLabel, channelName, markDirty, models, state } from "../store";
 import { closeGroupDetail, openModelDetail } from "../nav";
 import { toast } from "../toast";
+import type { EChartsCoreOption } from "echarts/core";
 import { fmtSec, fmtTps, tpsOf } from "../format";
+import { RETRY_PRESETS, matchRetryPreset, retryPresetOptions } from "../retry-presets";
+import { chartPalette, chartTheme } from "../chart-theme";
+import EChart from "../components/EChart.vue";
 import {
   Alert, Badge, Btn, Card, Empty, Field, IconBtn, PageHeader, SecInput, Spinner, TInput, TPager,
   TSelect, TToggle,
@@ -545,6 +549,148 @@ function shareText(row: Row): string {
   return `${((c / total) * 100).toFixed(1)}%`;
 }
 
+/* ------------------------------ 用量图表 ------------------------------ */
+// 用 ECharts（../components/EChart.vue，与统计页同一个封装），不自己画 SVG：
+// canvas 渲染拿不到 CSS 变量，所以颜色每次现取一遍设计 token，保证跟页面一致。
+const chartPaletteRef = ref<string[]>(chartPalette(chartTheme()));
+// 数据拉回来后重取一次 —— 侧栏折叠 / 主题切换后 token 可能变，图表得跟着变。
+watch(stats, () => { chartPaletteRef.value = chartPalette(chartTheme()); });
+
+/** 横轴/饼图标签太长会把图挤扁，统一截断。 */
+function chartLabel(s: string, max = 16): string {
+  const t = s && s !== "—" ? s : "未知";
+  return t.length > max ? t.slice(0, max - 1) + "…" : t;
+}
+function modelRequests(row: Row): number {
+  return firstNum(row, ["requests", "request_count", "count", "total_requests"]) ?? 0;
+}
+function modelTokens(row: Row): number {
+  return (firstNum(row, ["input_tokens", "prompt_tokens", "input"]) ?? 0)
+    + (firstNum(row, ["output_tokens", "completion_tokens", "output"]) ?? 0);
+}
+
+/** 每个图表的空态判断：没有任何可用数字就不画，交给卡片里的空态文案。 */
+const hasUsageRows = computed(() => byModel.value.length > 0);
+const tokenTotal = computed(() => byModel.value.reduce((s, r) => s + modelTokens(r), 0));
+const hasTokens = computed(() => tokenTotal.value > 0);
+
+/** 横向条形图：按模型请求数排行（前 8 名），品牌橙。 */
+const usageReqOption = computed<EChartsCoreOption>(() => {
+  const t = chartTheme();
+  const rows = byModel.value.slice().sort((a, b) => modelRequests(b) - modelRequests(a)).slice(0, 8).reverse();
+  return {
+    animationDuration: 320,
+    grid: { left: 4, right: 28, top: 8, bottom: 4, containLabel: true },
+    tooltip: {
+      trigger: "axis", axisPointer: { type: "shadow" },
+      backgroundColor: t.surface, borderColor: t.line, borderWidth: 1,
+      textStyle: { color: t.ink, fontSize: 12, fontFamily: t.mono },
+      formatter: (p: any) => {
+        const it = Array.isArray(p) ? p[0] : p;
+        return it.name + "<br/>请求 <b>" + it.value + "</b>";
+      },
+    },
+    xAxis: {
+      type: "value", minInterval: 1,
+      axisLine: { show: false }, axisTick: { show: false },
+      splitLine: { lineStyle: { color: t.line, type: "dashed" } },
+      axisLabel: { color: t.ink3, fontSize: 11 },
+    },
+    yAxis: {
+      type: "category",
+      data: rows.map(r => chartLabel(modelExposed(r))),
+      axisLine: { lineStyle: { color: t.line } }, axisTick: { show: false },
+      axisLabel: { color: t.ink2, fontSize: 11 },
+    },
+    series: [{
+      type: "bar", barMaxWidth: 18,
+      data: rows.map(modelRequests),
+      itemStyle: { color: t.brand, borderRadius: [0, 4, 4, 0] },
+      label: { show: true, position: "right", color: t.ink2, fontSize: 11, fontFamily: t.mono },
+    }],
+  };
+});
+
+/** 环形图：按模型 token 占比（输入 + 输出），第 6 名以后合并成「其他」。 */
+const usageTokenOption = computed<EChartsCoreOption>(() => {
+  const t = chartTheme();
+  const rows = byModel.value.slice().sort((a, b) => modelTokens(b) - modelTokens(a));
+  const items = rows.slice(0, 6).map(r => ({ name: chartLabel(modelExposed(r)), value: modelTokens(r) }));
+  const rest = rows.slice(6);
+  const restSum = rest.reduce((s, r) => s + modelTokens(r), 0);
+  if (restSum > 0) items.push({ name: "其他 " + rest.length + " 个", value: restSum });
+  return {
+    animationDuration: 320,
+    color: chartPaletteRef.value,
+    tooltip: {
+      trigger: "item",
+      backgroundColor: t.surface, borderColor: t.line, borderWidth: 1,
+      textStyle: { color: t.ink, fontSize: 12, fontFamily: t.mono },
+      formatter: (p: any) => p.name + "<br/>" + fmtInt(p.value) + " tokens（" + p.percent + "%）",
+    },
+    legend: {
+      type: "scroll", orient: "vertical", right: 0, top: "center",
+      itemWidth: 8, itemHeight: 8, icon: "circle",
+      textStyle: { color: t.ink2, fontSize: 11 },
+    },
+    series: [{
+      type: "pie", radius: ["46%", "70%"], center: ["34%", "50%"],
+      avoidLabelOverlap: true,
+      itemStyle: { borderColor: t.surface, borderWidth: 2 },
+      label: { show: false }, labelLine: { show: false },
+      data: items,
+    }],
+  };
+});
+
+/** 堆叠柱状图：每个模型的输入/输出 tokens 构成。 */
+const usageStackOption = computed<EChartsCoreOption>(() => {
+  const t = chartTheme();
+  const rows = byModel.value.slice()
+    .sort((a, b) => modelTokens(b) - modelTokens(a))
+    .slice(0, 8).reverse();
+  const inp = rows.map(r => firstNum(r, ["input_tokens", "prompt_tokens", "input"]) ?? 0);
+  const out = rows.map(r => firstNum(r, ["output_tokens", "completion_tokens", "output"]) ?? 0);
+  return {
+    animationDuration: 320,
+    color: [t.brand, t.teal],
+    grid: { left: 4, right: 28, top: 28, bottom: 4, containLabel: true },
+    tooltip: {
+      trigger: "axis", axisPointer: { type: "shadow" },
+      backgroundColor: t.surface, borderColor: t.line, borderWidth: 1,
+      textStyle: { color: t.ink, fontSize: 12, fontFamily: t.mono },
+      formatter: (ps: any) => {
+        const arr = Array.isArray(ps) ? ps : [ps];
+        const total = arr.reduce((s: number, x: any) => s + Number(x.value || 0), 0);
+        return arr[0].name + "<br/>" + arr.map((x: any) => x.marker + x.seriesName + " " + fmtInt(x.value)).join("<br/>")
+          + "<br/>合计 <b>" + fmtInt(total) + "</b>";
+      },
+    },
+    legend: {
+      top: 0, right: 0, itemWidth: 8, itemHeight: 8, icon: "circle",
+      textStyle: { color: t.ink2, fontSize: 11 },
+    },
+    xAxis: {
+      type: "value", minInterval: 1,
+      axisLine: { show: false }, axisTick: { show: false },
+      splitLine: { lineStyle: { color: t.line, type: "dashed" } },
+      axisLabel: { color: t.ink3, fontSize: 11 },
+    },
+    yAxis: {
+      type: "category",
+      data: rows.map(r => chartLabel(modelExposed(r))),
+      axisLine: { lineStyle: { color: t.line } }, axisTick: { show: false },
+      axisLabel: { color: t.ink2, fontSize: 11 },
+    },
+    series: [
+      { name: "输入", type: "bar", stack: "tok", barMaxWidth: 16, data: inp,
+        itemStyle: { color: t.brand, borderRadius: [0, 0, 0, 0] } },
+      { name: "输出", type: "bar", stack: "tok", barMaxWidth: 16, data: out,
+        itemStyle: { color: t.teal, borderRadius: [0, 4, 4, 0] } },
+    ],
+  };
+});
+
 /* ---------------------------- 分组设置（内联编辑） ---------------------------- */
 // 2026-10-13 起，分组自己的设置不再走「编辑分组」弹窗，而是在这一页直接改：
 //  · 名称            —— 分组对客户端暴露的身份之一；
@@ -612,20 +758,65 @@ function retrySrc(): "global" | "group" {
   return sRetry.value ? "group" : "global";
 }
 
-/** 切到「使用自己的配置」：从当前生效值克隆一份，之后改的就是这份独立副本。 */
+/**
+ * 「切回跟随全局」时把改动过的那份自己的配置存起来的地方。
+ *
+ * 2026-10-15 用户要求：自己配置 → 改动 → 切回跟随全局 → 再切回自己配置，
+ * 之前改的数字必须还在（原来 followGlobal() 直接写 null，那份草稿就没了）。
+ * 所以切回跟随全局前先把它抄进这里，下次 useOwn() 优先从这里恢复。
+ *
+ * 只活在本次组件实例里（分组详情页按 nav.groupId 挂载，换分组即重建），
+ * 且只有「放弃修改」（resetSettings）会显式清它 —— 那是用户明说不要这份改动了。
+ * syncSettings() 故意**不**清：它也会在本卡自己保存后被触发，若在那里清，
+ * 「跟随全局 → 保存 → 再切回自己配置」正好把要保住的改动丢掉。
+ * 它**不是**配置的一部分：不写进 state.cfg，不参与 markDirty()，落库的始终只有
+ * sRetry 本身（null = 跟随全局）。
+ */
+const sRetryStash = ref<RetryConfig | null>(null);
+
+/** 切到「使用自己的配置」：优先恢复上次留的存档，没有才从当前生效值克隆一份。 */
 function useOwn() {
   if (sRetry.value) return;
-  sRetry.value = normRetry(effRetry());
+  sRetry.value = sRetryStash.value ? normRetry(sRetryStash.value) : normRetry(effRetry());
 }
-/** 切回「跟随全局配置」：写 null，绝不去复制全局值。 */
+/** 切回「跟随全局配置」：先把这份改动存档，再写 null（绝不去复制全局值）。 */
 function followGlobal() {
   if (!sRetry.value) return;
+  sRetryStash.value = normRetry(sRetry.value);
   sRetry.value = null;
 }
 /** 把当前全局配置整份复制到这个分组，之后它就和全局解耦、可以单独改了。 */
 function copyGlobal() {
   sRetry.value = normRetry(globalRetry());
 }
+/** 丢弃存档：只在「放弃修改」调用（别挪进 syncSettings，理由见上面的说明）。 */
+function dropRetryStash() {
+  sRetryStash.value = null;
+}
+
+/* ---------------------- 重试档位（与设置页同一份定义） ---------------------- */
+// 定义在 ../retry-presets.ts，全局设置页与本卡共用 —— 同一个档位名在两处必须是同一组数字。
+const retryPresetChoice = computed({
+  get: () => matchRetryPreset(sRetry.value),
+  set: (v: string) => applyRetryPreset(v),
+});
+const retryPresetOpts = computed(() => retryPresetOptions());
+
+/** 套用一个档位：只覆盖档位包含的那些数字字段，然后照常走本卡的「保存设置」。 */
+function applyRetryPreset(v: string) {
+  const p = RETRY_PRESETS.find(x => x.value === v);
+  if (!p) return; // custom 只是状态，不写值
+  if (!sRetry.value) return; // 跟随全局时没有可套用的对象（按钮也只在自己的配置里出现）
+  Object.assign(sRetry.value, p.patch);
+  toast.ok(`已套用「${p.label}」档位，记得点本卡「保存设置」`);
+}
+
+/** 有存档时的提示语：告诉用户上次改的那份还在，切回去就能拿回来。 */
+const retryStashNote = computed(() =>
+  sRetryStash.value
+    ? `上次「使用自己的配置」改过的 ${sRetryStash.value.max_attempts} 次 / 总超时 ${fmtSec(sRetryStash.value.total_deadline_ms)} 还留着，切回去就能接着改。`
+    : "",
+);
 
 /** 该分组自己的配置里的预算校验 —— 与设置页「重试与超时」同一套公式。 */
 const sBudget = computed(() => {
@@ -685,9 +876,16 @@ function saveSettings() {
   toast.ok(`已更新分组「${clean.name || clean.id}」的设置`);
 }
 
-/** 放弃本卡的改动：从当前分组重新灌一遍草稿。 */
+/**
+ * 放弃本卡的改动：从当前分组重新灌一遍草稿。
+ * 这里要**显式**丢掉存档 —— 放弃是用户明说「不要这份改动了」，
+ * 若还留着，下一次点「使用自己的配置」又把它捞回来，等于没放弃。
+ * （注意 syncSettings() 本身不清：它也会在本卡自己保存后被触发，
+ *   那种情况存档得留着，否则「跟随全局 → 保存 → 再切回自己配置」会丢改动。）
+ */
 function resetSettings() {
   syncSettings();
+  dropRetryStash();
   toast.ok("已放弃未保存的分组设置改动");
 }
 
@@ -1160,19 +1358,43 @@ function saveTiers() {
             </div>
           </div>
 
-          <p
-            v-if="!sRetry"
-            class="rounded-lg border border-line-soft bg-app/40 px-3 py-2 text-[12px] leading-5 text-ink-2"
-            data-test="group-retry-following"
-          >
-            {{ followLine }}
-          </p>
+          <div v-if="!sRetry" class="space-y-2">
+            <p
+              class="rounded-lg border border-line-soft bg-app/40 px-3 py-2 text-[12px] leading-5 text-ink-2"
+              data-test="group-retry-following"
+            >
+              {{ followLine }}
+            </p>
+            <!-- 切回跟随全局时，改动过的那份没有被丢掉，这里明说一声，免得以为白改了。 -->
+            <p
+              v-if="retryStashNote"
+              class="flex items-start gap-1.5 rounded-lg border border-brand-200 bg-brand-50/60 px-3 py-2 text-[11.5px] leading-4 text-ink-2"
+              data-test="group-retry-stash-note"
+            >
+              <Info :size="13" class="mt-px shrink-0 text-brand-500" />
+              <span>{{ retryStashNote }}</span>
+            </p>
+          </div>
 
           <div v-else>
-            <div class="mb-2.5 flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+            <div class="mb-2.5 flex flex-wrap items-center gap-x-4 gap-y-2">
               <span class="text-[11.5px] font-medium uppercase tracking-wide text-ink-3">独立配置</span>
+              <!-- 档位：与设置页同一份定义（../retry-presets.ts），套用后仍可逐项微调 -->
+              <div class="flex items-center gap-2">
+                <span class="text-[12px] text-ink-3">档位</span>
+                <div class="w-[176px]" data-test="group-retry-preset">
+                  <TSelect
+                    v-model="retryPresetChoice"
+                    size="sm"
+                    searchable
+                    placeholder="选择档位"
+                    :options="retryPresetOpts"
+                    empty-text="无档位"
+                  />
+                </div>
+              </div>
               <Btn
-                size="sm" variant="subtle"
+                size="sm" variant="subtle" class="ml-auto"
                 data-test="group-retry-copy-global"
                 @click="copyGlobal"
               >
@@ -1622,6 +1844,45 @@ function saveTiers() {
             <div class="mt-1.5 font-mono text-[20px] font-semibold leading-7 tabular-nums text-ink">{{ fmtSec(avgDuration) }}</div>
           </Card>
         </div>
+
+        <!-- 图表：ECharts（与统计页同一个组件），不自己画 SVG -->
+        <div class="grid grid-cols-1 gap-3 xl:grid-cols-2">
+          <Card :pad="false" class="overflow-hidden">
+            <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+              <BarChart3 :size="15" class="text-ink-3" />
+              <h2 class="text-[13.5px] font-semibold text-ink">按模型请求数</h2>
+              <span class="ml-auto text-[12px] text-ink-3">前 8 名</span>
+            </div>
+            <div v-if="!hasUsageRows" class="px-4 py-8 text-center text-[12.5px] text-ink-3">暂无用量数据</div>
+            <div v-else class="px-3 py-3" data-test="gd-chart-req">
+              <EChart :option="usageReqOption" :height="Math.max(150, Math.min(8, byModel.length) * 32 + 46)" />
+            </div>
+          </Card>
+
+          <Card :pad="false" class="overflow-hidden">
+            <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+              <PieChart :size="15" class="text-ink-3" />
+              <h2 class="text-[13.5px] font-semibold text-ink">按模型 token 占比</h2>
+              <span class="ml-auto text-[12px] text-ink-3">输入 + 输出</span>
+            </div>
+            <div v-if="!hasTokens" class="px-4 py-8 text-center text-[12.5px] text-ink-3">暂无 token 数据</div>
+            <div v-else class="px-3 py-3" data-test="gd-chart-token">
+              <EChart :option="usageTokenOption" :height="260" />
+            </div>
+          </Card>
+        </div>
+
+        <Card :pad="false" class="overflow-hidden">
+          <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
+            <Layers :size="15" class="text-ink-3" />
+            <h2 class="text-[13.5px] font-semibold text-ink">按模型 token 构成</h2>
+            <span class="ml-auto text-[12px] text-ink-3">输入 / 输出堆叠 · 前 8 名</span>
+          </div>
+          <div v-if="!hasTokens" class="px-4 py-8 text-center text-[12.5px] text-ink-3">暂无 token 数据</div>
+          <div v-else class="px-3 py-3" data-test="gd-chart-stack">
+            <EChart :option="usageStackOption" :height="Math.max(150, Math.min(8, byModel.length) * 32 + 66)" />
+          </div>
+        </Card>
 
         <Card :pad="false" class="overflow-hidden">
           <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">

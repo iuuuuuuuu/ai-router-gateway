@@ -7,7 +7,8 @@ import { Check, CircleAlert, Database, Eye, EyeOff, LoaderCircle, Power, Repeat,
 import {
   Alert, Btn, Card, Field, IconBtn, Modal, SecInput, TInput, TSelect, TToggle,
 } from "../components/ui";
-import { api, getBase, getKey, setBase, setKey, type RetryConfig } from "../api";
+import { api, getBase, getKey, setBase, setKey } from "../api";
+import { RETRY_PRESETS, matchRetryPreset, retryPresetOptions } from "../retry-presets";
 import { markDirty, state } from "../store";
 import { fmtSec } from "../format";
 import { toast } from "../toast";
@@ -38,74 +39,12 @@ const budgetLine = computed(
 const loopHold = computed(() => Number(retry.value.loop_guard_min_chars) || 64);
 
 /* --------------------------- 重试档位（快捷预设） --------------------------- */
-// 9 个数字字段互相约束（预算公式一旦不成立服务端会拒保存），手改很容易打架，
-// 所以给几个常用档位一键套用；套用后仍可逐项微调，只要有一项对不上就显示「自定义」。
-// 只写这些数字/开关字段，不碰监听与管理面配置；同样只 markDirty()，由顶栏统一保存。
-type RetryNumbers = Pick<
-  RetryConfig,
-  | "max_attempts" | "max_cycles" | "total_deadline_ms" | "attempt_deadline_ms"
-  | "connect_timeout_ms" | "ttfb_timeout_ms" | "first_event_timeout_ms"
-  | "chunk_idle_timeout_ms" | "reserve_ms" | "cooldown_wait"
-  // 死循环拦截的 5 个数字字段：档位一并套用（开关 loop_guard_enabled 故意不在这里，
-  // 它不参与预算公式，也不该被「档位」这种纯超时/重试预设顺手改掉）。
-  | "loop_guard_min_chars" | "loop_guard_repeat_min_chars" | "loop_guard_repeat_ratio"
-  | "loop_guard_max_repeats" | "loop_guard_window_chars"
->;
+// 定义搬到了 ../retry-presets.ts —— 分组详情页的「重试与超时」也能套用同一批档位，
+// 两处必须给出完全一样的数字，所以只留一份定义（否则两边各自漂移最难查）。
+// 这里只负责把它接到本页的 retry 上；同样只 markDirty()，由顶栏统一保存。
 
-const RETRY_PRESETS: { value: string; label: string; hint: string; patch: RetryNumbers }[] = [
-  {
-    value: "default", label: "服务端默认", hint: "6×25s",
-    patch: {
-      max_attempts: 6, max_cycles: 2, total_deadline_ms: 180000, attempt_deadline_ms: 25000,
-      connect_timeout_ms: 5000, ttfb_timeout_ms: 15000, first_event_timeout_ms: 8000,
-      chunk_idle_timeout_ms: 15000, reserve_ms: 3000, cooldown_wait: true,
-      loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
-      loop_guard_max_repeats: 4, loop_guard_window_chars: 4000,
-    },
-  },
-  {
-    value: "fast", label: "快速失败", hint: "4×12s",
-    patch: {
-      max_attempts: 4, max_cycles: 1, total_deadline_ms: 60000, attempt_deadline_ms: 12000,
-      connect_timeout_ms: 5000, ttfb_timeout_ms: 8000, first_event_timeout_ms: 8000,
-      chunk_idle_timeout_ms: 10000, reserve_ms: 5000, cooldown_wait: false,
-      loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
-      loop_guard_max_repeats: 4, loop_guard_window_chars: 4000,
-    },
-  },
-  {
-    value: "stream", label: "长流式输出", hint: "6×120s",
-    patch: {
-      max_attempts: 6, max_cycles: 2, total_deadline_ms: 900000, attempt_deadline_ms: 120000,
-      connect_timeout_ms: 10000, ttfb_timeout_ms: 60000, first_event_timeout_ms: 60000,
-      chunk_idle_timeout_ms: 120000, reserve_ms: 10000, cooldown_wait: true,
-      loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
-      loop_guard_max_repeats: 4, loop_guard_window_chars: 4000,
-    },
-  },
-  {
-    value: "resilient", label: "多级降级", hint: "16×45s",
-    patch: {
-      max_attempts: 16, max_cycles: 3, total_deadline_ms: 900000, attempt_deadline_ms: 45000,
-      connect_timeout_ms: 10000, ttfb_timeout_ms: 30000, first_event_timeout_ms: 10000,
-      chunk_idle_timeout_ms: 20000, reserve_ms: 10000, cooldown_wait: true,
-      loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
-      loop_guard_max_repeats: 4, loop_guard_window_chars: 4000,
-    },
-  },
-];
-
-/** 当前值精确匹配某个档位时返回它的 value，否则是 custom。 */
-const activePreset = computed(() => {
-  const r = retry.value;
-  const hit = RETRY_PRESETS.find(p => Object.entries(p.patch).every(([k, v]) => (r as any)[k] === v));
-  return hit?.value ?? "custom";
-});
-
-const presetOptions = computed(() => [
-  ...RETRY_PRESETS.map(p => ({ value: p.value, label: p.label, hint: p.hint })),
-  { value: "custom", label: "自定义（已微调）", disabled: true },
-]);
+const activePreset = computed(() => matchRetryPreset(retry.value));
+const presetOptions = computed(() => retryPresetOptions());
 
 function applyPreset(v: string) {
   const p = RETRY_PRESETS.find(x => x.value === v);

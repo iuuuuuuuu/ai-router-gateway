@@ -200,3 +200,7 @@ Desktop.ini
 
 # ── 「获取模型列表 / 连通测试」成功却报错（缺 fmtSec import）修复的真机验收（本机证据，不入库）──
 /tools/_accept-fetch-fix.mjs
+
+# ── 分组详情：自己的配置草稿可恢复 + 档位套用 + 用量 ECharts 图表真机验收（本机证据，不入库）──
+/tools/_accept-gdsettings.mjs
+/tools/_accept-gdcharts.mjs
