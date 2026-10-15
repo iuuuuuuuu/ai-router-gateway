@@ -122,6 +122,8 @@ Desktop.ini
 /tools/_diag-shapes.mjs
 /tools/_diag-continue.mjs
 /tools/_diag-ui-columns.mjs
+/tools/_diag-real-loop.mjs
+/tools/_diag-unit-sweep.mjs
 /tools/_diag-r4.mjs
 /tools/_build-client.sh
 /tools/_accept-looptail.mjs

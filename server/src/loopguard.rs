@@ -1014,4 +1014,91 @@ mod tests {
         assert!(g.push_tail("新的内容").is_none(), "the cut loop must not be re-detected");
         assert!(g.window_len() <= cfg().tail_chars, "the window keeps only a bounded tail");
     }
+
+    // ---- the real loop the user pasted from another session ----
+
+    /// The user reported a REAL repetition from another session:
+    ///
+    /// ```text
+    /// OK.
+    ///
+    /// ...
+    ///
+    /// ...
+    ///
+    /// OK.
+    /// ...
+    /// ```
+    ///
+    /// Two readings of that paste are indistinguishable in a chat diff, so BOTH
+    /// are pinned. They are different rule interactions: reading A exercises the
+    /// R6 blank-line fallback, reading B the strict R1-R5 path, and getting one
+    /// right says nothing about the other.
+    #[test]
+    fn t29_reported_loop_blank_line_reading_is_caught() {
+        // Reading A: blank lines between every line -> unit is 15 chars.
+        let text = "OK.\n\n...\n\n...\n\n".repeat(100);
+        let hit = hit(&text).expect("the reported loop must be detected");
+        assert!(hit.repeats >= 4, "{hit:?}");
+        assert!(hit.real_span >= 24, "{hit:?}");
+    }
+
+    #[test]
+    fn t30_reported_loop_single_newline_reading_is_caught() {
+        // Reading B: single newlines, no blank line -> unit is 13 chars, so R6
+        // (which REQUIRES a blank line) cannot help and R1-R5 must do the work.
+        let text = "OK.\n...\n...\n".repeat(200);
+        let hit = hit(&text).expect("must be detected");
+        assert!(hit.repeats >= 4, "{hit:?}");
+    }
+
+    #[test]
+    fn t31_reported_loop_is_caught_post_commit_too() {
+        // Post-commit the only remedy is to stop emitting, so the blank-line
+        // reading must also be seen by the tail judge.
+        let mut g = LoopGuard::new(&cfg());
+        let text = "OK.\n\n...\n\n...\n\n".repeat(100);
+        let h = g.push_tail(&text).expect("must be detected post-commit");
+        assert!(h.repeats >= 4, "{h:?}");
+    }
+
+    /// The MEASURED post-commit unit-length boundary, pinned so it cannot
+    /// silently shrink. This documents a LIMITATION, not a feature.
+    ///
+    /// Post-commit judging looks at only `tail_chars` (128) characters, and R2
+    /// needs `max_repeats` (4) whole units inside the span that `match_span` can
+    /// extend to (`n - unit_len`). So a unit longer than
+    /// `tail_chars / (max_repeats + 1)` = 25 cannot reach 4 matches within 128
+    /// characters, and a repetition of longer units that starts AFTER the commit
+    /// point is not detected. R3 (`covered >= repeat_min_chars`) closes the other
+    /// end, so the detectable band post-commit is roughly 24..=25 chars.
+    ///
+    /// Measured on the deployed gateway with 12-char frames: units of 8/16/24/25
+    /// were cut; 22, 23, 26, 27, 28 and larger leaked the full 4000 characters.
+    #[test]
+    fn t32_post_commit_unit_length_boundary_is_pinned() {
+        let tail = cfg().tail_chars;
+        let bound = tail / (cfg().max_repeats as usize + 1);
+        assert_eq!(bound, 25, "the documented boundary moved");
+
+        // The unit must be DISTINCT characters. A unit of one repeated character
+        // has a length-1 sub-unit that also matches, and R2 then trivially passes
+        // -- which would make this test assert nothing about the boundary.
+        let short = distinct_chars(24, 1);
+        let mut g = LoopGuard::new(&cfg());
+        assert!(g.push_tail(&short.repeat(40)).is_some(), "24 distinct chars is inside the band");
+
+        // Above the bound: not detectable post-commit, by construction.
+        let long = distinct_chars(bound + 8, 1);
+        let mut g2 = LoopGuard::new(&cfg());
+        assert!(
+            g2.push_tail(&long.repeat(40)).is_none(),
+            "units longer than {bound} cannot reach R2 inside {tail} chars"
+        );
+
+        // The SAME long unit IS caught before commit, where the whole window is
+        // judged. That asymmetry is why this gap is post-commit only.
+        let mut g3 = LoopGuard::new(&cfg());
+        assert!(g3.push(&long.repeat(40)).is_some(), "pre-commit judges the whole window");
+    }
 }
