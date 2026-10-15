@@ -556,8 +556,34 @@ function firstText(row: Row, keys: string[]): string {
   }
   return "";
 }
-function modelExposed(row: Row): string {
-  return fmtText(firstText(row, ["exposed_model", "model_name", "exposed"]));
+/** 这一行是否真的路由到了上游。0 = 从未落到任何上游（全渠道失败/耗尽）。 */
+function modelRouted(row: Row): boolean {
+  return firstNum(row, ["routed"]) !== 0;
+}
+/** 未路由（失败）那一行的名字：它不是模型，所以不冒充任何模型名。 */
+const UNROUTED_LABEL = "未路由（失败）";
+/**
+ * 本行的模型身份 = **真实路由到的上游模型**。
+ * 后端按 final_channel × final_upstream_model 聚合（server/src/store.rs 的 stats_by_model）。
+ * 这里曾经用 exposed_model，但分组名/分组 id 本身就是可调用的模型名（router::is_wildcard 的
+ * 通配路径），于是「grp_main」「主力分组」这种别名会各自成行，把分组名当成模型画进图里
+ * （实测 grp_main 的 68 次请求里有 43 次落在这种别名行上）。
+ */
+function modelLabel(row: Row): string {
+  if (!modelRouted(row)) return UNROUTED_LABEL;
+  const up = modelUpstream(row);
+  return up === "—" ? "未知模型" : up;
+}
+/**
+ * 图表标签。同一个上游模型可能同时经由多个渠道出现（实测 deepseek-v4.1-flash 落在 7 个
+ * 渠道上），此时补上渠道名，否则图上会出现多根同名柱子、无法分辨。
+ */
+function modelLabels(rows: Row[]): string[] {
+  const base = rows.map(modelLabel);
+  const dup = new Set<string>();
+  const seen = new Set<string>();
+  for (const b of base) { if (seen.has(b)) dup.add(b); else seen.add(b); }
+  return base.map((b, i) => dup.has(b) ? chartLabel(b, 12) + " · " + chartLabel(modelChannel(rows[i]), 10) : chartLabel(b));
 }
 function modelChannel(row: Row): string {
   const id = firstText(row, ["channel_id", "final_channel"]);
@@ -636,7 +662,7 @@ const usageReqOption = computed<EChartsCoreOption>(() => {
     },
     yAxis: {
       type: "category",
-      data: rows.map(r => chartLabel(modelExposed(r))),
+      data: modelLabels(rows),
       axisLine: { lineStyle: { color: t.line } }, axisTick: { show: false },
       axisLabel: { color: t.ink2, fontSize: 11 },
     },
@@ -653,7 +679,8 @@ const usageReqOption = computed<EChartsCoreOption>(() => {
 const usageTokenOption = computed<EChartsCoreOption>(() => {
   const t = chartTheme();
   const rows = byModel.value.slice().sort((a, b) => modelTokens(b) - modelTokens(a));
-  const items = rows.slice(0, 6).map(r => ({ name: chartLabel(modelExposed(r)), value: modelTokens(r) }));
+  const labels = modelLabels(rows);
+  const items = rows.slice(0, 6).map((r, i) => ({ name: labels[i], value: modelTokens(r) }));
   const rest = rows.slice(6);
   const restSum = rest.reduce((s, r) => s + modelTokens(r), 0);
   if (restSum > 0) items.push({ name: "其他 " + rest.length + " 个", value: restSum });
@@ -716,7 +743,7 @@ const usageStackOption = computed<EChartsCoreOption>(() => {
     },
     yAxis: {
       type: "category",
-      data: rows.map(r => chartLabel(modelExposed(r))),
+      data: modelLabels(rows),
       axisLine: { lineStyle: { color: t.line } }, axisTick: { show: false },
       axisLabel: { color: t.ink2, fontSize: 11 },
     },
@@ -1943,7 +1970,7 @@ function saveTiers() {
           <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
             <Coins :size="15" class="text-ink-3" />
             <h2 class="text-[13.5px] font-semibold text-ink">按模型用量</h2>
-            <span class="ml-auto text-[12px] text-ink-3">{{ byModel.length }} 个模型 · 按成本降序 · 按 暴露模型 × 上游 × 渠道 聚合</span>
+            <span class="ml-auto text-[12px] text-ink-3">{{ byModel.length }} 个模型 · 按成本降序 · 按 上游模型 × 渠道 聚合</span>
           </div>
 
           <Empty v-if="!byModel.length" title="暂无用量数据" hint="本分组产生请求并成功计费后，这里会按模型列出 token 与花费">
@@ -1954,9 +1981,8 @@ function saveTiers() {
             <table class="w-full text-[12.5px]">
               <thead>
                 <tr>
-                  <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">暴露模型</th>
+                  <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">模型</th>
                   <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">渠道</th>
-                  <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">上游模型</th>
                   <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">请求数</th>
                   <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">tokens 输入 / 输出</th>
                   <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">成本 / 占比</th>
@@ -1964,9 +1990,8 @@ function saveTiers() {
               </thead>
               <tbody>
                 <tr v-for="(row, i) in byModel" :key="i" class="border-t border-line-soft hover:bg-app">
-                  <td class="whitespace-nowrap px-3 py-2 text-ink">{{ modelExposed(row) }}</td>
+                  <td class="whitespace-nowrap px-3 py-2 font-mono text-[11.5px]" :class="modelRouted(row) ? 'text-ink' : 'text-ink-3'">{{ modelLabel(row) }}</td>
                   <td class="whitespace-nowrap px-3 py-2">{{ modelChannel(row) }}</td>
-                  <td class="whitespace-nowrap px-3 py-2 font-mono text-[11.5px] text-ink-2">{{ modelUpstream(row) }}</td>
                   <td class="whitespace-nowrap px-3 py-2 text-right font-mono tabular-nums">
                     {{ fmtInt(firstNum(row, ["requests", "request_count", "count", "total_requests"])) }}
                   </td>

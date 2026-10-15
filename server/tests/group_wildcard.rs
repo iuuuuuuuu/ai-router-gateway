@@ -367,6 +367,134 @@ fn insert_request(store: &Store, group: &str, status: &str, fin: Option<(&str, &
         .unwrap();
 }
 
+/// One request row with an explicit CLIENT-FACING model name, so a test can
+/// put a group name/id into `exposed_model` exactly the way the wildcard path
+/// does when a client asks for the group instead of one of its models.
+fn insert_request_as(
+    store: &Store,
+    group: &str,
+    exposed: &str,
+    status: &str,
+    fin: Option<(&str, &str)>,
+    seq: usize,
+) {
+    store
+        .insert_request_log(&RequestLog {
+            id: None,
+            ts: ts_for(seq),
+            request_id: format!("req-{seq}"),
+            group_id: group.into(),
+            exposed_model: exposed.into(),
+            entry_protocol: "openai".into(),
+            status: status.into(),
+            final_channel: fin.map(|f| f.0.to_string()),
+            final_upstream_model: fin.map(|f| f.1.to_string()),
+            attempts: 1,
+            loop_retries: 0,
+            loop_truncated: 0,
+            loop_continues: 0,
+            error_class: String::new(),
+            error_message: String::new(),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            cost_usd: 0.001,
+            wasted_cost_usd: 0.0,
+            duration_ms: 100,
+            ttft_ms: 10,
+        })
+        .unwrap();
+}
+
+/// w06 — 模型统计必须按「真实路由到的模型」聚合，绝不能把分组名当成模型。
+///
+/// The defect this pins down (owner-reported, seen in 分组详情·主力分组·用量):
+/// a group's name and id are themselves callable model names, so clients that
+/// ask for the group put "grp_main" / "主力分组" into `exposed_model`. The old
+/// `stats_by_model` grouped by that column, so ONE group's traffic was split
+/// across alias rows and the console charted a GROUP NAME as if it were a
+/// model. Measured on the live database: 43 of grp_main's 68 requests were in
+/// such rows, and `by_group` claimed 4 models for a group with 3 exposed ones.
+///
+/// Every assertion below FAILS on the old SQL:
+///   * the alias rows are absent (they used to be the whole point)
+///   * the alias traffic is MERGED into its routed model (old: separate row)
+///   * `routed` is present on every row (old: the key did not exist)
+///   * row sums still equal the group total, failures included
+///   * `by_group.models` counts routed pairs, not request aliases
+#[tokio::test]
+async fn w06_stats_are_keyed_on_the_routed_model_not_the_group_alias() {
+    let store = Store::open_memory().unwrap();
+
+    // One group whose clients asked for it by NAME, by ID, and by its real
+    // exposed model — all three land on the SAME routed pair.
+    insert_request_as(&store, GROUP_ID, EXPOSED, "success", Some(("ch0", "up-model-0")), 1);
+    insert_request_as(&store, GROUP_ID, GROUP_NAME, "success", Some(("ch0", "up-model-0")), 2);
+    insert_request_as(&store, GROUP_ID, GROUP_ID, "success", Some(("ch0", "up-model-0")), 3);
+    // A second routed model on another channel: it must stay its OWN row.
+    insert_request_as(&store, GROUP_ID, GROUP_NAME, "success", Some(("ch2", "up-model-2")), 4);
+    // And a request that never reached any upstream (all candidates failed).
+    insert_request_as(&store, GROUP_ID, GROUP_NAME, "exhausted", None, 5);
+    // Another group must never leak into a scoped call.
+    insert_request_as(&store, "gB", EXPOSED, "success", Some(("chZ", "upZ")), 6);
+
+    let rows = store.stats_by_model(Some(GROUP_ID)).unwrap();
+
+    // (1) The group alias must NOT be a model identity any more. This is the
+    //     assertion the old code failed hardest: it produced 3 alias rows here.
+    assert!(
+        rows.iter().all(|r| r.get("exposed_model").is_none()),
+        "stats_by_model must not hand the console a request alias to chart as a model: {rows:?}"
+    );
+
+    // (2) Every row states whether it was routed, so the console can label the
+    //     unrouted bucket honestly instead of inventing a model name for it.
+    for r in &rows {
+        assert!(r.get("routed").is_some(), "every row carries `routed`: {r}");
+    }
+
+    // (3) The three alias requests MERGE into their one routed pair (3 requests,
+    //     not three rows). Old SQL: three rows of 1 request each.
+    let a = rows.iter().find(|r| r["channel_id"] == "ch0").expect("routed ch0 row");
+    assert_eq!(a["upstream_model"].as_str(), Some("up-model-0"), "{a}");
+    assert_eq!(a["routed"].as_i64(), Some(1), "{a}");
+    assert_eq!(a["requests"].as_i64(), Some(3), "all three aliases collapse into the routed pair: {rows:?}");
+
+    // (4) A different routed pair stays a different row.
+    let b = rows.iter().find(|r| r["channel_id"] == "ch2").expect("routed ch2 row");
+    assert_eq!(b["requests"].as_i64(), Some(1), "{b}");
+
+    // (5) The never-routed request is ONE row flagged routed=0 with a null
+    //     identity — never a model name, and never silently dropped, so the
+    //     row sums still reconcile with the group total.
+    let unrouted = rows.iter().find(|r| r["routed"].as_i64() == Some(0)).expect("unrouted row present");
+    assert!(unrouted["channel_id"].is_null(), "an unrouted row has no channel: {unrouted}");
+    assert!(unrouted["upstream_model"].is_null(), "an unrouted row has no model: {unrouted}");
+    assert_eq!(unrouted["requests"].as_i64(), Some(1), "{unrouted}");
+
+    let total: i64 = rows.iter().map(|r| r["requests"].as_i64().unwrap()).sum();
+    assert_eq!(total, 5, "row sums must still equal the group's request total (4 routed + 1 not): {rows:?}");
+    assert_eq!(rows.len(), 3, "exactly 2 routed pairs + 1 unrouted bucket: {rows:?}");
+
+    // (6) by_group's 模型数 must count ROUTED pairs, not request aliases. The
+    //     old COUNT(DISTINCT exposed_model) said 3 here for 2 real models.
+    let by_group = store.stats_by_group(Some(GROUP_ID)).unwrap();
+    let row = &by_group[0];
+    assert_eq!(row["group_id"].as_str(), Some(GROUP_ID), "{row}");
+    assert_eq!(row["requests"].as_i64(), Some(5), "{row}");
+    assert_eq!(
+        row["models"].as_i64(),
+        Some(2),
+        "模型数 = distinct ROUTED pairs (ch0::up-model-0, ch2::up-model-2); the unrouted bucket is not a model: {row}"
+    );
+
+    // (7) The global scope aggregates the same way and keeps groups apart.
+    let all = store.stats_by_model(None).unwrap();
+    let chz = all.iter().find(|r| r["channel_id"] == "chZ").expect("gB row present globally");
+    assert_eq!(chz["requests"].as_i64(), Some(1), "{chz}");
+    assert_eq!(all.iter().filter(|r| r["channel_id"] == "ch0").count(), 1, "no duplicate ch0 rows: {all:?}");
+}
 fn insert_switch(store: &Store, group: &str, channel: &str, upstream: &str, outcome: &str, class: &str, seq: usize) {
     store
         .insert_switch_log(&SwitchLog {

@@ -242,7 +242,9 @@ async fn t13_switch_logs_recorded() {
     // 成本必须能回答"落到哪个渠道的哪个模型"
     let by_model = st.store.stats_by_model(None).unwrap();
     assert!(!by_model.is_empty(), "stats_by_model empty");
-    for k in ["exposed_model", "upstream_model", "channel_id", "cost_usd"] {
+    // `routed` replaced `exposed_model`: a row is keyed on the ROUTED model, and
+    // a group alias must never be charted as one (see w06 in group_wildcard.rs).
+    for k in ["routed", "upstream_model", "channel_id", "cost_usd"] {
         assert!(by_model[0].get(k).is_some(), "stats_by_model missing {k}: {}", by_model[0]);
     }
     // 统计页顶部卡片直接读 summary 的这些键；缺键会静默退化成 "—"，

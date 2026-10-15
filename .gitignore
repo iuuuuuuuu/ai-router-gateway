@@ -231,3 +231,14 @@ Desktop.ini
 
 # ── 文档门禁：链接可达性 + 编码（U+FFFD）扫描（本机工具，不入库）──
 /tools/_doccheck.mjs
+
+# ── 模型统计按「真实路由到的模型」聚合（分组名不再当模型）真机验收（本机证据，不入库）──
+/tools/_diag-modelstats.mjs
+/tools/_diag-modelstats-ui.mjs
+/tools/_diag-stats-ui.mjs
+/tools/_diag-chart-labels.mjs
+/tools/_chk-json.cjs
+/tools/_chk-routed.cjs
+/tools/_chk-routed.mjs
+/tools/_modelstats-ui.png
+/tools/_stats-ui.png

@@ -566,11 +566,26 @@ impl Store {
 
     /// Per-model usage. `group_id` narrows it to one group, which is what the
     /// console shows when a group is selected ("这个分组里具体模型用了多少").
+    ///
+    /// One row = one (`final_channel`, `final_upstream_model`) pair — the model
+    /// the request was ACTUALLY routed to.
+    ///
+    /// It deliberately does NOT group by `exposed_model`. A group's name and id
+    /// are themselves callable model names (see `router::is_wildcard`), so a
+    /// client may ask for "grp_main" or "主力分组"; grouping by that string
+    /// splits one group's traffic across alias rows and charts a GROUP NAME as
+    /// if it were a model (measured: 43 of grp_main's 68 requests landed in such
+    /// rows). The routed pair is the only identity that names a real model.
+    ///
+    /// A request that never reached any upstream has NULL in both columns. GROUP
+    /// BY buckets those together into ONE row carrying `routed: 0`, which keeps
+    /// the invariant that the row sums still equal the group's request total —
+    /// failures stay visible instead of silently disappearing from the charts.
     pub fn stats_by_model(&self, group_id: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         let scope = if group_id.map(|g| !g.is_empty()).unwrap_or(false) { " WHERE group_id = ?1" } else { "" };
         let sql = format!(
-            "SELECT json_object('exposed_model',exposed_model,'upstream_model',COALESCE(final_upstream_model,'-'),'channel_id',COALESCE(final_channel,'-'),'requests',COUNT(*),'input_tokens',SUM(input_tokens),'output_tokens',SUM(output_tokens),'cache_read_tokens',SUM(cache_read_tokens),'cache_creation_tokens',SUM(cache_creation_tokens),'cost_usd',ROUND(SUM(cost_usd),6),'wasted_cost_usd',ROUND(SUM(wasted_cost_usd),6)) FROM request_logs{scope} GROUP BY exposed_model, final_upstream_model, final_channel ORDER BY SUM(cost_usd) DESC LIMIT 200"
+            "SELECT json_object('routed',CASE WHEN final_channel IS NULL THEN 0 ELSE 1 END,'upstream_model',final_upstream_model,'channel_id',final_channel,'requests',COUNT(*),'input_tokens',SUM(input_tokens),'output_tokens',SUM(output_tokens),'cache_read_tokens',SUM(cache_read_tokens),'cache_creation_tokens',SUM(cache_creation_tokens),'cost_usd',ROUND(SUM(cost_usd),6),'wasted_cost_usd',ROUND(SUM(wasted_cost_usd),6)) FROM request_logs{scope} GROUP BY final_channel, final_upstream_model ORDER BY SUM(cost_usd) DESC LIMIT 200"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = match group_id {
@@ -596,7 +611,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let scope = if group_id.map(|g| !g.is_empty()).unwrap_or(false) { " WHERE group_id = ?1" } else { "" };
         let sql = format!(
-            "SELECT json_object('group_id',group_id,'requests',COUNT(*),'success',SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'models',COUNT(DISTINCT exposed_model)) FROM request_logs{scope} GROUP BY group_id ORDER BY SUM(cost_usd) DESC LIMIT 200"
+            "SELECT json_object('group_id',group_id,'requests',COUNT(*),'success',SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'models',COUNT(DISTINCT final_channel || '::' || final_upstream_model)) FROM request_logs{scope} GROUP BY group_id ORDER BY SUM(cost_usd) DESC LIMIT 200"
         );
         let mut stmt = conn.prepare(&sql)?;
         let rows = match group_id {
