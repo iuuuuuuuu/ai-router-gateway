@@ -7,7 +7,7 @@
 //  · 本页只剩两件事：把分组列出来、把每组的统计与「使用中」实时并发显示出来。
 // 因此本页是只读的（除了删除分组），不再有编辑弹窗，也不再有 draft/校验/保存逻辑。
 import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { ChevronDown, LayoutDashboard, Plus, RefreshCw, Trash2, Waypoints } from "@lucide/vue";
+import { ChevronDown, Copy, LayoutDashboard, Plus, RefreshCw, Trash2, Waypoints } from "@lucide/vue";
 import { Badge, Btn, Card, Empty, IconBtn, Modal } from "../components/ui";
 import { openGroupDetail, openModelDetail } from "../nav";
 import { apiKeys, bindingLabel, channelName, groups, groupsUsingModel, markDirty, models, state, uid } from "../store";
@@ -27,6 +27,48 @@ function tierName(level: number): string {
 }
 function tierTone(level: number): "brand" | "gray" {
   return level === 1 ? "brand" : "gray";
+}
+/** 密钥脱敏：卡片上只渲染前 8 位，完整值不写进 DOM 文本、也不写进 title。 */
+function maskKey(v: unknown): string {
+  const s = String(v ?? "");
+  if (!s) return "—";
+  return s.slice(0, 8) + "…";
+}
+function fmtKeyName(v: unknown): string {
+  const s = String(v ?? "").trim();
+  return s === "" ? "未命名" : s;
+}
+/**
+ * 复制完整密钥（看板卡片上的取回入口）。
+ *
+ * 完整密钥本来就在前端 state 里（`/admin/api/config` 下发时就带着），卡片上的脱敏只是
+ * 渲染选择 —— 所以「能复制」没有让密钥多暴露一分，只是把本来就有的值取出来。
+ * 取值只在点击这一刻发生，卡片上（含 title/tooltip）始终只有脱敏串。
+ */
+async function copyKey(v: unknown) {
+  const s = String(v ?? "");
+  if (!s) return;
+  try {
+    await navigator.clipboard.writeText(s);
+    toast.ok("已复制完整密钥");
+    return;
+  } catch {
+    /* 非安全上下文（Tauri/无权限）时回退 */
+  }
+  try {
+    const el = document.createElement("textarea");
+    el.value = s;
+    el.style.position = "fixed";
+    el.style.opacity = "0";
+    document.body.appendChild(el);
+    el.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(el);
+    if (ok) toast.ok("已复制完整密钥");
+    else toast.err("复制失败");
+  } catch {
+    toast.err("复制失败");
+  }
 }
 // 两种「在用」口径并存，别混：
 //  · 成员 chip 的背景色是**静态**口径 —— level===1 表示声明上优先级最高的一层（模板里内联成 t.level === 1），
@@ -327,6 +369,10 @@ function removeGroup(g: Group) {
   confirming.value = true;
 }
 
+/** 该分组里已启用的密钥条数：卡片上要和总数分开说（停用的不影响访问）。 */
+function keysEnabledOf(groupId: string): number {
+  return keysOf(groupId).filter(k => k.enabled).length;
+}
 /** 该分组下的密钥数量（删除确认里要如实告知会连带移除多少条）。 */
 const pendingKeys = computed(() => {
   const g = pendingDelete.value;
@@ -518,6 +564,37 @@ function confirmRemoveGroup() {
           <p class="mt-2 text-[11.5px] leading-4 text-ink-3" data-test="group-exposed-hint">
             由层级成员自动汇总，不用手动维护。分组名「{{ g.name }}」与 id「{{ g.id }}」也可以直接当模型名用：客户端用它们请求时，组内成员按上面的层级自动轮换。
           </p>
+        </div>
+
+        <!-- 密钥：卡片上直接可取回完整值（只显示前 8 位，点「复制」拿完整串） -->
+        <div class="mt-3.5 border-t border-line-soft pt-3.5" data-test="group-keys">
+          <div class="mb-2 flex items-center justify-between gap-2">
+            <div class="text-[11.5px] font-medium uppercase tracking-wide text-ink-3">密钥</div>
+            <!-- 卡片头已有「密钥 N 个」徽章，这里不重复总数，只在存在停用密钥时补一句 -->
+            <span
+              v-if="keysEnabledOf(g.id) !== keysOf(g.id).length"
+              class="text-[11.5px] text-ink-3"
+            >已启用 {{ keysEnabledOf(g.id) }} / {{ keysOf(g.id).length }}</span>
+          </div>
+          <div v-if="keysOf(g.id).length" class="space-y-1">
+            <div
+              v-for="(k, i) in keysOf(g.id)" :key="k.key + i"
+              class="flex items-center gap-2 rounded-md border border-line-soft px-2 py-1.5"
+              :data-test="'group-key-row-' + i"
+            >
+              <span class="truncate text-[12px] text-ink-2">{{ fmtKeyName(k.name) }}</span>
+              <span class="shrink-0 font-mono text-[11.5px] text-ink-3">{{ maskKey(k.key) }}</span>
+              <Badge v-if="!k.enabled" tone="gray">已停用</Badge>
+              <span class="ml-auto shrink-0">
+                <IconBtn
+                  :data-test="'group-key-copy-' + i"
+                  title="复制完整密钥"
+                  @click="copyKey(k.key)"
+                ><Copy :size="13" /></IconBtn>
+              </span>
+            </div>
+          </div>
+          <p v-else class="text-[12px] text-ink-3">该分组还没有密钥。</p>
         </div>
 
         <!-- 故障转移层级 -->

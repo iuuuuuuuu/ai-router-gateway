@@ -253,11 +253,46 @@ function fmtRemain(ms: number | null): string {
 function healthKey(row: CooldownRow, i: number): string {
   return `${row?.channel_id ?? "c"}|${row?.upstream_model ?? ""}|${row?.kind ?? ""}|${i}`;
 }
-/** 密钥脱敏：只展示前 8 位，完整密钥永远不进 DOM。 */
+/** 密钥脱敏：表格里只渲染前 8 位，完整值不写进 DOM 文本、也不写进 title。 */
 function maskKey(v: unknown): string {
   const s = String(v ?? "");
   if (!s) return "—";
   return s.slice(0, 8) + "…";
+}
+/**
+ * 复制完整密钥（看板里唯一的取回入口）。
+ *
+ * 完整密钥本来就在前端 state 里（`/admin/api/config` 下发时就带着），脱敏只是这一列的
+ * 渲染选择 —— 所以「能复制」并没有让密钥多暴露一分，只是把本来就有的值取出来。
+ * 取值只在点击这一刻发生，页面上（含 title/tooltip）始终只有脱敏串。
+ *
+ * 优先 navigator.clipboard；失败（非安全上下文 / 无权限）时退回临时 textarea ——
+ * 那条路径会让完整密钥短暂进一次 DOM，但随即移除。与 Logs.vue 的复制实现同一份语义。
+ */
+async function copyKey(v: unknown) {
+  const s = String(v ?? "");
+  if (!s) return;
+  try {
+    await navigator.clipboard.writeText(s);
+    toast.ok("已复制完整密钥");
+    return;
+  } catch {
+    /* 回退见下 */
+  }
+  try {
+    const el = document.createElement("textarea");
+    el.value = s;
+    el.style.position = "fixed";
+    el.style.opacity = "0";
+    document.body.appendChild(el);
+    el.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(el);
+    if (ok) toast.ok("已复制完整密钥");
+    else toast.err("复制失败");
+  } catch {
+    toast.err("复制失败");
+  }
 }
 
 /* --------------------------------- 状态 --------------------------------- */
@@ -1787,7 +1822,7 @@ function saveTiers() {
           <div class="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3">
             <KeyRound :size="15" class="text-ink-3" />
             <h2 class="text-[13.5px] font-semibold text-ink">密钥</h2>
-            <span class="ml-auto text-[12px] text-ink-3">只显示前 8 位，完整密钥不会出现在看板里</span>
+            <span class="ml-auto text-[12px] text-ink-3">列表只显示前 8 位；点「复制」取完整密钥</span>
           </div>
           <div v-if="groupKeys.length" class="overflow-x-auto">
             <table class="w-full text-[12.5px]">
@@ -1796,6 +1831,7 @@ function saveTiers() {
                   <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">名称</th>
                   <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">密钥（脱敏）</th>
                   <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">状态</th>
+                  <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">操作</th>
                 </tr>
               </thead>
               <tbody>
@@ -1804,6 +1840,14 @@ function saveTiers() {
                   <td class="whitespace-nowrap px-3 py-2 font-mono text-[11.5px] text-ink-2">{{ maskKey(k.key) }}</td>
                   <td class="whitespace-nowrap px-3 py-2">
                     <Badge :tone="k.enabled ? 'ok' : 'gray'">{{ k.enabled ? "已启用" : "已停用" }}</Badge>
+                  </td>
+                  <td class="whitespace-nowrap px-3 py-2">
+                    <!-- 复制按钮是唯一取回完整密钥的入口；:title 里也绝不放完整值。 -->
+                    <IconBtn
+                      :data-test="'key-copy-' + i"
+                      title="复制完整密钥"
+                      @click="copyKey(k.key)"
+                    ><Copy :size="14" /></IconBtn>
                   </td>
                 </tr>
               </tbody>

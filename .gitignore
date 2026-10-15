@@ -115,6 +115,12 @@ Desktop.ini
 /tools/_midloop-upstream.mjs
 /tools/_build-client.sh
 /tools/_accept-looptail.mjs
+/tools/_accept-keycopy.mjs
+/tools/_clip.tmp
+/tools/_clip.tmp.in
+/tools/_clip-test.mjs
+/tools/_diag-404.mjs
+/tools/_diag-key.mjs
 /tools/_client-build.log
 /tools/_accept-midloop.mjs
 /tools/_verify-task43.mjs
