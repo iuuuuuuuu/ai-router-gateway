@@ -58,6 +58,11 @@ pub enum Behavior {
     /// detection is pre-commit only, so this repetition must reach the client
     /// unchanged (the honest boundary).
     NormalThenDegenerate,
+    /// Same, but the loop runs for 400 frames so a truncation that failed to
+    /// actually stop the stream is unmistakable.
+    NormalThenDegenerateLong,
+    /// Control: a committed answer that continues normally — must never be cut.
+    NormalOnlyStream,
     /// B1 regression: text shorter than the holdback, then a tool call. The
     /// buffered text must be committed WITH the tool call, never dropped.
     ToolAfterShortText,
@@ -300,14 +305,55 @@ async fn handle_beh(beh: Behavior, body: String, hdrs: axum::http::HeaderMap, pr
         }
         Behavior::NormalThenDegenerate => {
             // 120 characters of normal text (past the 64-char holdback, so the
-            // answer COMMITS) followed by a degenerate repetition. Detection is
-            // pre-commit only: this repetition must reach the client unchanged.
+            // answer COMMITS) followed by a degenerate repetition. The
+            // repetition must be CUT OFF by the post-commit guard: the client
+            // keeps the normal prefix and a clean finish, and only a bounded
+            // number of the repeated frames may escape.
             let mut sse = String::new();
             for i in 0..10usize {
                 let frame: String = (0..12).map(|k| (b'a' + ((i * 12 + k) % 26) as u8) as char).collect();
                 sse.push_str(&openai_text_chunk(&frame));
             }
             for _ in 0..40 { sse.push_str(&openai_text_chunk("好问题。")); }
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::NormalThenDegenerateLong => {
+            // The same shape, but the upstream keeps emitting the loop for FAR
+            // more frames than any tail can justify. Used to prove the cut
+            // really stops the stream instead of merely bounding one frame: a
+            // truncation that still relayed all 400 repetitions would leave the
+            // client with the whole loop.
+            let mut sse = String::new();
+            for i in 0..10usize {
+                let frame: String = (0..12).map(|k| (b'a' + ((i * 12 + k) % 26) as u8) as char).collect();
+                sse.push_str(&openai_text_chunk(&frame));
+            }
+            for _ in 0..400 { sse.push_str(&openai_text_chunk("好问题。")); }
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::NormalOnlyStream => {
+            // Control: normal text long enough to commit, then a NORMAL
+            // continuation that must never be truncated. A false positive here
+            // would cut a healthy answer short, which is worse than the loop.
+            //
+            // The text must be genuinely non-repeating: a repeating alphabet
+            // ("abc...z" over and over) is a REAL period-26 loop and the guard
+            // would rightly cut it. The generated prose below uses a per-index
+            // stride so no short period can appear.
+            let mut sse = String::new();
+            for i in 0..40usize {
+                let frame: String = (0..12)
+                    .map(|k| {
+                        let n = i * 12 + k;
+                        // Distinct CJK block, strided so consecutive frames never
+                        // line up into a period.
+                        char::from_u32(0x4E00 + ((n * 37) % 2000) as u32).unwrap()
+                    })
+                    .collect();
+                sse.push_str(&openai_text_chunk(&frame));
+            }
             sse.push_str(&openai_tail_sse("stop"));
             ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
         }

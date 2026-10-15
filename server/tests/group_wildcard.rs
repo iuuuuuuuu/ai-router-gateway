@@ -351,6 +351,7 @@ fn insert_request(store: &Store, group: &str, status: &str, fin: Option<(&str, &
             final_upstream_model: fin.map(|f| f.1.to_string()),
             attempts: 1,
             loop_retries: 0,
+            loop_truncated: 0,
             input_tokens: 10,
             output_tokens: 5,
             cache_read_tokens: 0,

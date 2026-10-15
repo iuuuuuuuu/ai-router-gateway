@@ -59,6 +59,13 @@ pub struct RetryConfig {
     /// Rolling character window the detector keeps.
     #[serde(default = "d_loop_guard_window_chars")]
     pub loop_guard_window_chars: usize,
+    /// How much of the answer's tail is judged once the answer has ALREADY been
+    /// committed. A post-commit hit cannot be retried (the bytes are gone), so
+    /// the only remedy is to stop; this bounds how long a mid-answer loop may
+    /// run before that happens. Smaller catches loops sooner but needs the
+    /// repetition to be more complete.
+    #[serde(default = "d_loop_guard_tail_chars")]
+    pub loop_guard_tail_chars: usize,
 }
 
 fn d_max_attempts() -> u32 { 6 }
@@ -77,6 +84,7 @@ fn d_loop_guard_repeat_min_chars() -> usize { 24 }
 fn d_loop_guard_repeat_ratio() -> f64 { 0.75 }
 fn d_loop_guard_max_repeats() -> u32 { 4 }
 fn d_loop_guard_window_chars() -> usize { 4000 }
+fn d_loop_guard_tail_chars() -> usize { 128 }
 
 impl Default for RetryConfig {
     fn default() -> Self {
@@ -97,6 +105,7 @@ impl Default for RetryConfig {
             loop_guard_repeat_ratio: d_loop_guard_repeat_ratio(),
             loop_guard_max_repeats: d_loop_guard_max_repeats(),
             loop_guard_window_chars: d_loop_guard_window_chars(),
+            loop_guard_tail_chars: d_loop_guard_tail_chars(),
         }
     }
 }

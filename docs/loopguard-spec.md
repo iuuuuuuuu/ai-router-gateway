@@ -21,6 +21,7 @@
 | I3 | 每轮循环每个 (channel, model) 至多尝试一次 |
 | I4 | `max_attempts × attempt_deadline_ms + reserve_ms ≤ total_deadline_ms`（全局与组级都校验） |
 | I5 | 全冷却时必须等待，绝不零尝试失败 |
+| I6 | 提交后命中退化：客户端已收到的字节绝不撤回、绝不重发，只就地截断 + 正常收尾；截断必须落库可见（`loop_truncated`），不得伪装成完好回答 |
 
 ---
 
@@ -38,6 +39,19 @@
 | R4 | `covered ≥ repeat_ratio × n` | 重复占窗口的比例够高 |
 | R5 | 单元不能整个落在窗口尾部的空白串里 | 排除缩进/填充空白造成的误判；扫描从 `trailing_whitespace + 1` 起 |
 
+**两套判定，同一套规则**（`detect_span(n, min_span)` 是唯一实现）：
+
+| 判定 | 判定的范围 `n` | R1 的阈值 | 命中后的处置 |
+|---|---|---|---|
+| 提交前 `push()` | 整个窗口 `len` | `min_chars` | 丢弃整段尝试，内部换候选重试（I1：客户端零字节） |
+| 提交后 `push_tail()` | 只判末尾 `tail_chars` | 尾部必须已饱和（`len ≥ tail_chars`） | 就地截断 + 正常收尾（I6：字节已发出，无法重试） |
+
+★**为什么提交后必须只判尾部**：R4 要求 `covered ≥ repeat_ratio × n`，即 `covered ≥ 0.75n`。
+若提交后仍判整个 4000 字符窗口，则`n = W₀ + covered`（`W₀` = 循环开始前已有的正常文本）代入得
+`covered ≥ 3 × W₀`——循环开始前已有 1024 字符时，模型要复读 **3000 字**才被抓到，用户的回答早已毁掉。
+（实测：`W=4000, W₀=1024` → 泄漏 3004 字符。）把判定范围收紧到末尾 `tail_chars` 后，
+R4 的语义变成「**最近这段输出就是循环**」，泄漏量被 `tail_chars` 直接约束。
+
 多解时取**覆盖字符最多**者，并列取**单元最短**者（`detect()` 按 `unit_len` 升序扫描，仅在严格更大时替换）。
 `LoopHit { unit, repeats, chars }`：`unit` 最多截取 `UNIT_SNIPPET_CHARS = 120` 个字符（诊断用，按字符边界安全截断）。
 
@@ -52,6 +66,12 @@
 - ★`LoopCfg::from_retry` 在 `enabled == false` 时**强制 `min_chars = 0`**：关闭功能 = 不缓冲 = 第一帧立即提交（等于本功能不存在时的行为）。
   保持缓冲却不检测等于「白白推迟首字节」，是欺骗。
 - 代价（必须如实写进 README）：开启时首字节推迟约 `min_chars` 个字符（默认 64）。
+- **提交后**（I6）：字节已在客户端手里，**不能重试**——重试等于把前缀再发一遍。此时命中退化只会：
+  1. 先把已装配但未发出的 tool call 冲出去（避免把参数截半）；
+  2. 发一个 `FinishReason::Length` 的结束帧（客户端看到的是一条**正常结束**的回答）；
+  3. `feed_close_clean` 正常收尾（`[DONE]` / 终止符 + Close）；
+  4. 请求日志写 `loop_truncated = 1`（`status` 仍是 `success`，因为客户端确实收到了一条完整合法的流）。
+- 代价：中段复读**无法避免**已发出的那部分（这是物理限制），只能把泄漏量约束到 `tail_chars` 决定的量级。
 
 ---
 
@@ -59,16 +79,23 @@
 
 ```rust
 pub struct LoopCfg { pub enabled: bool, pub min_chars: usize, pub repeat_min_chars: usize,
-                     pub repeat_ratio: f64, pub max_repeats: u32, pub window_chars: usize }
+                     pub repeat_ratio: f64, pub max_repeats: u32, pub window_chars: usize,
+                     pub tail_chars: usize }
 impl LoopCfg { pub fn from_retry(rc: &RetryConfig) -> Self }
 pub struct LoopHit { pub unit: String, pub repeats: u32, pub chars: usize }
 pub struct LoopGuard { /* cfg + VecDeque<char> 窗口 */ }
 impl LoopGuard {
     pub fn new(cfg: &LoopCfg) -> Self;
     pub fn window_len(&self) -> usize;
-    pub fn push(&mut self, delta: &str) -> Option<LoopHit>;
-    fn detect(&self) -> Option<LoopHit>;
+    pub fn push(&mut self, delta: &str) -> Option<LoopHit>;      // 提交前：判整个窗口
+    pub fn push_tail(&mut self, delta: &str) -> Option<LoopHit>; // 提交后：只判末尾 tail_chars
+    fn append(&mut self, delta: &str);
+    fn detect(&self) -> Option<LoopHit>;                         // = detect_span(len, min_chars)
+    pub fn judge_tail(&self) -> Option<LoopHit>;                 // = detect_span(tail_chars, 2)
+    fn detect_span(&self, n: usize, min_span: usize) -> Option<LoopHit>;
     fn trailing_whitespace(&self) -> usize;
+    fn trailing_whitespace_within(&self, within: usize) -> usize;
+    fn match_span(&self, unit_len: usize, n: usize, len: usize) -> usize;
 }
 ```
 
@@ -81,6 +108,7 @@ impl LoopGuard {
 | `repeat_min_chars` | `[1, window_chars]` | 取边界值 |
 | `max_repeats` | `≥ 2` | 取 2 |
 | `repeat_ratio` | 必须 `is_finite()` 且 `(0, 1]` | 取 0.75 |
+| `tail_chars` | `[16, window_chars]` | 取边界值 |
 
 `push()`：`enabled == false` 立即 `None` 且**不累积**任何字符；否则把 `delta` 逐字符入队，超窗口用 `drain(..excess)` 丢弃最老的字符，然后 `detect()`。
 
@@ -104,7 +132,7 @@ impl LoopGuard {
 
 ---
 
-## 4. `server/src/config.rs`（`RetryConfig` 新增 6 个字段）
+## 4. `server/src/config.rs`（`RetryConfig` 新增 7 个字段）
 
 | 字段 | 默认 | `#[serde(default = ...)]` |
 |---|---|---|
@@ -114,6 +142,7 @@ impl LoopGuard {
 | `loop_guard_repeat_ratio` | `0.75` | `d_loop_guard_repeat_ratio` |
 | `loop_guard_max_repeats` | `4` | `d_loop_guard_max_repeats` |
 | `loop_guard_window_chars` | `4000` | `d_loop_guard_window_chars` |
+| `loop_guard_tail_chars` | `128` | `d_loop_guard_tail_chars` |
 
 **三处同步**：字段声明 + `fn d_xxx()` + 手写 `impl Default for RetryConfig`。缺任何一处都会让老配置文件与默认配置走岔。
 
@@ -140,7 +169,9 @@ impl LoopGuard {
   4. **流结束返回 None**：按空响应/正常收尾处理（与既有语义一致）。
 - `proxy_err_message` 增加 `DegenerateOutput` 分支，文案形如
   `degenerate output: repeated {unit_len}-char unit {repeats} times`（用于日志与 `switch_logs.message`）。
-- **POST-COMMIT pump 一行不改**；**非流式路径不改**（见 §8）。
+- POST-COMMIT pump：同一个 `guard` 被 move 进 pump 任务（跨提交点保持窗口，因此**横跨提交点的循环**也判得准），
+  `FrameClass::Text` 分支改为 `guard.push_tail(&t)`；命中即按 §2 的提交后流程截断收尾并 `return`。
+- 非流式路径不改（见 §8.1）。
 
 ---
 
@@ -150,14 +181,20 @@ impl LoopGuard {
 - 落库口径：`loop_retries` = 本次客户端请求的 `records` 里 `error_class == "degenerate_output"` 的条数（= 内部被拦下的次数）。
 - `switch_logs` 每条退化尝试单独一行：`outcome = "failed"`、`error_class = "degenerate_output"`、`channel_id` 是被丢弃的那个候选。
 - `list_request_logs` / `stats_*` / `group_member_stats` 都要带出 `loop_retries`（按 `final_channel::final_upstream_model` 聚合）。
+- `request_logs` 另有 `loop_truncated INTEGER NOT NULL DEFAULT 0`（同样含老库 ALTER 迁移兜底），口径是**提交后截断**：
+  `1` = 这条回答被 loop guard 截断过。★与 `loop_retries` **语义相反**，不可混用：
+  `loop_retries` 那些尝试客户端**一个字节都没看到**（提交前丢弃），而 `loop_truncated` 的回答客户端**已经收到了**（只是没给完）。
+  两者都进 `/admin/api/stats` 的 `summary`，控制台分别渲染（「死循环拦截 N 次」/「截断收尾 N 次」）。
 
 ---
 
 ## 8. 诚实边界（必须写进 README，不含糊）
 
 1. **只有流式路径检测退化**。非流式（`stream: false`）一次拿完整 JSON，没有增量帧，本版本不检测。
-2. **只有提交前能内部重试**。已经向客户端写了首字节之后再出现的退化**无法**内部换候选（换了就等于往同一条回答里塞第二次回答，违反 I2）。
-   这种情况沿用既有 `feed_repair` 语义：补一个错误帧 + 正常终止符，客户端拿到结构完整但带 `finish_reason=error` 的响应。
+2. **提交后能检测，但不能重试**。已经向客户端写了首字节之后再出现的退化**无法**内部换候选（换了就等于往同一条回答里塞第二次回答，违反 I2），
+   所以处置是**就地截断 + 正常收尾**（§2）。★因此提交后命中**一定**会泄漏一段已发出的复读文本，泄漏量由 `tail_chars` 决定（默认 128 字符量级，实测 24 个重复单元 ≈ 96 字符）。
+   这是物理限制（字节已在客户端手里），不是实现缺陷；把它说成"客户端看不到"是错的。
+   注意这与旧行为不同：旧版本对提交后的复读**完全不检测**（只有把整段尝试丢掉才安全，所以当时干脆不看）。
 3. 开启 loop guard 的代价是首字节推迟约 `min_chars` 个字符；关掉它首字节立即返回，但退化不再被拦截。
 4. 误判是可能的（长文里恰好出现高比例重复，例如代码里连续空行/重复分隔线）。阈值可配；命中只影响该次尝试，会被内部重试吸收。
 
@@ -165,9 +202,12 @@ impl LoopGuard {
 
 ## 9. 客户端
 
-- 设置页：死循环拦截开关 + 5 个阈值输入（`loop-guard-enabled` / `-min-chars` / `-repeat-min-chars` / `-repeat-ratio` / `-max-repeats` / `-window-chars`）。
-- 日志页：`error_class == "degenerate_output"` 显示为「输出退化」（warn 色）。
-- 统计页：死循环拦截次数（`loop_retries`）；分组详情/模型详情同样展示。
+- 设置页：死循环拦截开关 + **6** 个阈值输入（`loop-guard-enabled` / `-min-chars` / `-repeat-min-chars` / `-repeat-ratio` / `-max-repeats` / `-window-chars` / `-tail-chars`），
+  并把「提交前 5 项 / 提交后 1 项」的差别写在页面上。
+- 日志页：`error_class == "degenerate_output"` 显示为「输出退化」（warn 色）；`loop_truncated > 0` 的行状态显示为
+  **「成功（已截断）」**（warn 色 + tooltip 说明），不得只写「成功」——那是把截断过的回答当成完好回答。
+- 统计页：死循环拦截次数（`loop_retries`）与截断收尾次数（`loop_truncated`）**分两个徽章**，
+  因为前者「客户端看不到」、后者「客户端收到了」；分组详情/模型详情同样展示。
 
 ---
 

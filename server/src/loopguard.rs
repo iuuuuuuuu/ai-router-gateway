@@ -27,6 +27,15 @@ pub struct LoopCfg {
     pub repeat_ratio: f64,
     pub max_repeats: u32,
     pub window_chars: usize,
+    /// How much of the answer's TAIL is judged once the answer has already been
+    /// committed. Pre-commit a hit is free (the whole attempt is discarded), so
+    /// the guard may consider its entire window; post-commit the bytes are gone
+    /// and the only remedy is truncation, so the evidence must be recent and
+    /// overwhelming. Bounding the judged span is what makes R4 read as "the
+    /// recent tail is dominated by one repetition" instead of "the repetition
+    /// has taken over a 4000-character window", which would let the loop run for
+    /// thousands of characters before it is caught.
+    pub tail_chars: usize,
 }
 
 impl LoopCfg {
@@ -68,7 +77,15 @@ impl LoopCfg {
             configured_ratio
         };
 
-        Self { enabled, min_chars, repeat_min_chars, repeat_ratio, max_repeats, window_chars }
+        // The judged tail is clamped against the window it slices: a tail wider
+        // than the window would be meaningless, and one so narrow that no unit
+        // fits (2 characters) could never satisfy R2.
+        let tail_chars = rc.loop_guard_tail_chars.clamp(16, window_chars);
+        if tail_chars != rc.loop_guard_tail_chars {
+            tracing::warn!(configured = rc.loop_guard_tail_chars, used = tail_chars, "loop_guard_tail_chars out of range; clamped");
+        }
+
+        Self { enabled, min_chars, repeat_min_chars, repeat_ratio, max_repeats, window_chars, tail_chars }
     }
 }
 
@@ -106,6 +123,24 @@ impl LoopGuard {
         if !self.cfg.enabled {
             return None;
         }
+        self.append(delta);
+        self.detect()
+    }
+
+    /// Post-commit counterpart of `push`: accumulate the delta and judge only
+    /// the recent tail. The bytes are already on the wire by the time this is
+    /// called, so the caller's only remedy is to stop emitting — which is why
+    /// the evidence must be recent and overwhelming rather than merely present.
+    pub fn push_tail(&mut self, delta: &str) -> Option<LoopHit> {
+        if !self.cfg.enabled {
+            return None;
+        }
+        self.append(delta);
+        self.judge_tail()
+    }
+
+    /// Append characters and trim the window from the head to `window_chars`.
+    fn append(&mut self, delta: &str) {
         for ch in delta.chars() {
             self.window.push_back(ch);
         }
@@ -114,14 +149,52 @@ impl LoopGuard {
             let excess = self.window.len() - cap;
             self.window.drain(..excess);
         }
-        self.detect()
     }
 
-    /// R1-R5 over every candidate `unit_len`. Returns the best hit: the largest
-    /// covered span, ties broken by the smallest unit length.
+    /// Judge only the recent tail. Unlike `push`, which reports a hit the
+    /// moment ANY suffix of the window degenerates, this fires only once the
+    /// last `tail_chars` characters are dominated by one repetition: the span
+    /// is the tail itself, so R4 reads "the recent output is a loop" rather
+    /// than "the loop has swallowed the whole trailing window".
+    ///
+    /// That distinction is the whole point. R4 scales with the judged span, so
+    /// judging a 4000-character window lets a loop run for ~0.75 * 4000 = 3000
+    /// characters before it is caught — by which time the answer is ruined. A
+    /// short span catches it in a few dozen characters instead, at the cost of
+    /// needing the repetition to be *recent and total* rather than merely
+    /// present.
+    ///
+    /// Returns `None` until the tail is saturated: a half-filled tail cannot be
+    /// "dominated" by anything yet.
+    pub fn judge_tail(&self) -> Option<LoopHit> {
+        if !self.cfg.enabled {
+            return None;
+        }
+        if self.window.len() < self.cfg.tail_chars {
+            return None;
+        }
+        // R1 is deliberately NOT `min_chars` here: that threshold exists to
+        // avoid judging before the PRE-COMMIT holdback has filled, and a
+        // saturated tail is already the evidence. Reusing it would make a
+        // `tail_chars` smaller than `min_chars` (e.g. 32 vs 64) silently
+        // impossible to satisfy.
+        self.detect_span(self.cfg.tail_chars, 2)
+    }
+
+    /// R1-R5 over every candidate `unit_len` of the LAST `n` characters.
+    /// Returns the best hit: the largest covered span, ties broken by the
+    /// smallest unit length.
     fn detect(&self) -> Option<LoopHit> {
-        let n = self.window.len();
-        if n < 2 || n < self.cfg.min_chars {
+        self.detect_span(self.window.len(), self.cfg.min_chars)
+    }
+
+    /// The rules themselves, end-relative: every index below counts backwards
+    /// from the window tail, so `n` is how many trailing characters are judged
+    /// and `len` is how many the window actually holds (`n <= len`).
+    fn detect_span(&self, n: usize, min_span: usize) -> Option<LoopHit> {
+        let len = self.window.len();
+        debug_assert!(n <= len, "judged span {n} exceeds the window {len}");
+        if n < 2 || n < min_span {
             return None; // R1
         }
         let max_unit = n / 2;
@@ -129,15 +202,18 @@ impl LoopGuard {
         // run cannot contain a non-whitespace character, so the scan can start
         // above that run. Without this, a long run of blanks (indentation,
         // padding) would make every push rescan the whole window for nothing.
-        let first_unit_len = self.trailing_whitespace() + 1;
+        // Only the judged span's own trailing whitespace matters, so a tail
+        // that ends inside a blank run is skipped for the same reason the
+        // whole-window scan skips it.
+        let first_unit_len = self.trailing_whitespace_within(n) + 1;
         let mut best: Option<(usize, usize)> = None; // (characters covered, unit_len)
         for unit_len in first_unit_len..=max_unit {
             // Cheap pre-filter: the unit must repeat at the very tail, otherwise
             // the span is 0 and no rule can pass.
-            if self.window[n - 1] != self.window[n - 1 - unit_len] {
+            if self.window[len - 1] != self.window[len - 1 - unit_len] {
                 continue;
             }
-            let span = self.match_span(unit_len, n);
+            let span = self.match_span(unit_len, n, len);
             let repeats = span / unit_len;
             if repeats < 2 {
                 continue; // max_repeats is clamped to >= 2, so R2 cannot pass
@@ -161,7 +237,7 @@ impl LoopGuard {
             }
         }
         best.map(|(covered, unit_len)| LoopHit {
-            unit: self.window.range(n - unit_len..n).take(UNIT_SNIPPET_CHARS).collect(),
+            unit: self.window.range(len - unit_len..len).take(UNIT_SNIPPET_CHARS).collect(),
             repeats: (covered / unit_len) as u32,
             chars: covered,
         })
@@ -169,19 +245,28 @@ impl LoopGuard {
 
     /// Number of characters at the window tail that are all whitespace.
     fn trailing_whitespace(&self) -> usize {
-        let n = self.window.len();
+        self.trailing_whitespace_within(self.window.len())
+    }
+
+    /// Same, but counting at most `within` characters: the judged span may be
+    /// shorter than the window, and whitespace further back is irrelevant.
+    fn trailing_whitespace_within(&self, within: usize) -> usize {
+        let n = self.window.len().min(within);
         let mut k = 0usize;
-        while k < n && self.window[n - 1 - k].is_whitespace() {
+        while k < n && self.window[self.window.len() - 1 - k].is_whitespace() {
             k += 1;
         }
         k
     }
 
     /// Longest suffix that matches "shift back by `unit_len`", i.e. the span
-    /// definition: compare `W[n-1-j]` with `W[n-1-unit_len-j]`.
-    fn match_span(&self, unit_len: usize, n: usize) -> usize {
+    /// definition: compare `W[len-1-j]` with `W[len-1-unit_len-j]`. The scan is
+    /// bounded by the JUDGED span (`n`), so a short tail judges a short
+    /// repetition even when a much longer identical run precedes it: the
+    /// question is "is the recent output a loop", not "how long is the run".
+    fn match_span(&self, unit_len: usize, n: usize, len: usize) -> usize {
         let mut j = 0usize;
-        while j < n - unit_len && self.window[n - 1 - j] == self.window[n - 1 - unit_len - j] {
+        while j < n - unit_len && self.window[len - 1 - j] == self.window[len - 1 - unit_len - j] {
             j += 1;
         }
         j
@@ -193,7 +278,7 @@ mod tests {
     use super::*;
 
     fn cfg() -> LoopCfg {
-        LoopCfg { enabled: true, min_chars: 64, repeat_min_chars: 24, repeat_ratio: 0.75, max_repeats: 4, window_chars: 4000 }
+        LoopCfg { enabled: true, min_chars: 64, repeat_min_chars: 24, repeat_ratio: 0.75, max_repeats: 4, window_chars: 4000, tail_chars: 128 }
     }
 
     fn hit(text: &str) -> Option<LoopHit> {

@@ -93,12 +93,26 @@ pub enum EntryProtocol {
     Gemini,
 }
 
+/// What the post-commit pump finally delivered. Sent over the oneshot because
+/// the truncation decision is made AFTER the request row's other fields are
+/// already fixed by the caller: a mid-stream loop hit can only be known once
+/// the answer is being relayed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StreamOutcome {
+    pub usage: ir::Usage,
+    /// The post-commit loop guard cut the answer short. The client received a
+    /// valid, complete-looking stream — that is the point of truncation — so
+    /// this flag is the ONLY record that the answer is not what the model meant
+    /// to write. It must reach the request log.
+    pub loop_truncated: bool,
+}
+
 pub enum Outcome {
     /// non-stream: full parsed response (usage included)
     Full(Box<ChatResponse>),
-    /// stream committed: usage arrives via oneshot when the pump ends
+    /// stream committed: outcome arrives via oneshot when the pump ends
     Stream {
-        usage_rx: tokio::sync::oneshot::Receiver<ir::Usage>,
+        outcome_rx: tokio::sync::oneshot::Receiver<StreamOutcome>,
     },
 }
 
@@ -219,7 +233,7 @@ pub async fn run(ctx: &ProxyCtx<'_>) -> RunResult {
                             final_upstream_model: Some(candidate.upstream_model),
                         };
                     }
-                    Ok(Outcome::Stream { usage_rx }) => {
+                    Ok(Outcome::Stream { outcome_rx }) => {
                         ctx.state.health.record_success(&CooldownKey::scoped(&candidate.channel_id, &candidate.upstream_model));
                         if ttft.is_none() { ttft = Some(latency); }
                         records.push(SwitchRecord {
@@ -236,7 +250,7 @@ pub async fn run(ctx: &ProxyCtx<'_>) -> RunResult {
                         return RunResult {
                             terminal: Terminal::Exhausted,
                             records,
-                            success: Some(Outcome::Stream { usage_rx }),
+                            success: Some(Outcome::Stream { outcome_rx }),
                             usage: usage_total,
                             ttft_ms: ttft,
                             duration_ms: started.elapsed().as_millis() as u64,
@@ -536,6 +550,12 @@ async fn attempt_stream(
     // entirely inside the PRE-COMMIT window, so a hit costs the client zero
     // bytes. `hold == 0` (guard disabled, or a config that clamped it away)
     // commits the very first text frame, i.e. exactly the old behaviour.
+    // One guard for the whole attempt: it keeps the rolling window across the
+    // commit point and is moved into the pump task below, so a loop that
+    // STRADDLES the commit is judged on the text that actually surrounds it.
+    // The pre-commit window is the evidence that the tail is a loop rather than
+    // an ordinary short answer, and every text frame reaches the guard before
+    // it reaches `pending`, so no committed character is missing from it.
     let mut guard = crate::loopguard::LoopGuard::new(&budget.loop_guard);
     let mut pending = String::new();
     let hold = budget.loop_guard.min_chars;
@@ -711,7 +731,7 @@ async fn attempt_stream(
     };
 
     // COMMITTED (or empty-but-valid). Client still received zero bytes.
-    let (usage_tx, usage_rx) = tokio::sync::oneshot::channel::<ir::Usage>();
+    let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel::<StreamOutcome>();
     let entry = ctx.entry;
     let exposed_name = ctx.exposed_model.clone();
     let idle = budget.chunk_idle_timeout;
@@ -723,15 +743,18 @@ async fn attempt_stream(
         // the response headers arrived: `inflight` is moved in here and only
         // released when this task ends, on every exit path below.
         let _inflight = inflight;
-        let mut tx = Some(usage_tx);
+        let mut tx = Some(outcome_tx);
         let mut final_usage = usage_acc;
+        // Set only by the post-commit loop guard below. It is the sole record
+        // that the answer the client just received is a truncated one.
+        let mut loop_truncated = false;
         let feed = feed_tx.clone();
 
         // POST-COMMIT pump: convert frames to IR events, render in client protocol.
         let mut finished = committed.is_empty();
         if finished {
             feed_close_clean(&feed, entry).await;
-            if let Some(tx) = tx.take() { let _ = tx.send(final_usage); }
+            if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
             return;
         }
 
@@ -772,17 +795,17 @@ async fn attempt_stream(
                 ev = es.next() => ev,
                 _ = sleep_until_std(Instant::now() + idle) => {
                     feed_repair(&feed, entry, "upstream chunk idle timeout").await;
-                    if let Some(tx) = tx.take() { let _ = tx.send(final_usage); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
                     return;
                 }
                 _ = sleep_until_std(deadline_total) => {
                     feed_repair(&feed, entry, "total deadline exceeded").await;
-                    if let Some(tx) = tx.take() { let _ = tx.send(final_usage); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
                     return;
                 }
                 _ = client_gone.cancelled() => {
                     // client vanished: stop pumping; drop closes upstream conn
-                    if let Some(tx) = tx.take() { let _ = tx.send(final_usage); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
                     return;
                 }
             };
@@ -801,7 +824,7 @@ async fn attempt_stream(
                 } else {
                     feed_close_clean(&feed, entry).await;
                 }
-                if let Some(tx) = tx.take() { let _ = tx.send(final_usage); }
+                if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
                 return;
             };
             let Ok(ev) = ev else { continue };
@@ -845,10 +868,42 @@ async fn attempt_stream(
                 FrameClass::Error(m) => {
                     // mid-stream upstream error AFTER commit: repair, never leak
                     feed_repair(&feed, entry, &m).await;
-                    if let Some(tx) = tx.take() { let _ = tx.send(final_usage); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
                     return;
                 }
-                FrameClass::Text(t) => feed_emit(&feed, entry, &StreamEvent::TextDelta { text: t, finish: None }, &exposed_name).await,
+                FrameClass::Text(t) => {
+                    // POST-COMMIT detection. The bytes already sent cannot be
+                    // recalled, so unlike a pre-commit hit (which discards the
+                    // whole attempt and retries another candidate) the only
+                    // honest remedy here is to STOP: emit a normal finish and
+                    // close, so the client keeps a valid stream and stops
+                    // receiving the loop instead of being fed thousands more
+                    // characters of it. A retry is impossible — it would
+                    // duplicate the prefix the client already has.
+                    if let Some(hit) = guard.push_tail(&t) {
+                        tracing::warn!(
+                            unit_chars = hit.unit.chars().count(),
+                            repeats = hit.repeats,
+                            covered = hit.chars,
+                            "degenerate output detected AFTER commit; truncating the answer"
+                        );
+                        loop_truncated = true;
+                        // A tool call already assembled but not yet emitted is
+                        // released first: truncating mid-call would hand the
+                        // client an argument list cut in half.
+                        flush_tool(&feed, entry, &exposed_name, &mut pending_tool).await;
+                        finished = true;
+                        feed_emit(
+                            &feed, entry,
+                            &StreamEvent::Finish { reason: ir::FinishReason::Length, usage: final_usage.clone() },
+                            &exposed_name,
+                        ).await;
+                        feed_close_clean(&feed, entry).await;
+                        if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
+                        return;
+                    }
+                    feed_emit(&feed, entry, &StreamEvent::TextDelta { text: t, finish: None }, &exposed_name).await
+                }
                 FrameClass::ToolUseStart { index, id, name, args } => {
                     // Incremental upstream call: hold it back until the args
                     // are complete so the client sees ONE well-formed call.
@@ -895,14 +950,14 @@ async fn attempt_stream(
                     } else {
                         feed_repair(&feed, entry, "upstream closed without finish").await;
                     }
-                    if let Some(tx) = tx.take() { let _ = tx.send(final_usage); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
                     return;
                 }
             }
         }
     });
 
-    Ok(Outcome::Stream { usage_rx })
+    Ok(Outcome::Stream { outcome_rx })
 }
 
 pub fn merge_usage_max(a: ir::Usage, b: ir::Usage) -> ir::Usage {

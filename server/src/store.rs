@@ -47,6 +47,10 @@ pub struct RequestLog {
     /// a committed answer (i.e. attempts whose `error_class` was
     /// `degenerate_output`). 0 means no degenerate output was ever detected.
     pub loop_retries: u32,
+    /// 1 when the post-commit loop guard cut this answer short. Distinct from
+    /// `loop_retries`: those attempts were discarded before the client saw a
+    /// byte, whereas a truncated answer WAS delivered — just not in full.
+    pub loop_truncated: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
@@ -166,7 +170,8 @@ impl Store {
                 cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_usd REAL NOT NULL DEFAULT 0, wasted_cost_usd REAL NOT NULL DEFAULT 0,
                 duration_ms INTEGER NOT NULL DEFAULT 0, ttft_ms INTEGER NOT NULL DEFAULT 0,
-                loop_retries INTEGER NOT NULL DEFAULT 0);
+                loop_retries INTEGER NOT NULL DEFAULT 0,
+                loop_truncated INTEGER NOT NULL DEFAULT 0);
              CREATE INDEX IF NOT EXISTS idx_rl_ts ON request_logs(ts);
              CREATE INDEX IF NOT EXISTS idx_rl_model ON request_logs(exposed_model);
              CREATE INDEX IF NOT EXISTS idx_rl_status ON request_logs(status);
@@ -219,6 +224,17 @@ impl Store {
             .any(|c| c == "loop_retries");
         if !has_loop_retries {
             conn.execute_batch("ALTER TABLE request_logs ADD COLUMN loop_retries INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        // Same again for the post-commit truncation flag: historical rows have
+        // no truncation to report, so the 0 default is the honest backfill.
+        let has_loop_truncated: bool = conn
+            .prepare("PRAGMA table_info(request_logs)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .any(|c| c == "loop_truncated");
+        if !has_loop_truncated {
+            conn.execute_batch("ALTER TABLE request_logs ADD COLUMN loop_truncated INTEGER NOT NULL DEFAULT 0;")?;
         }
         Ok(())
     }
@@ -276,9 +292,9 @@ impl Store {
     pub fn insert_request_log(&self, l: &RequestLog) -> anyhow::Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO request_logs (ts, request_id, group_id, exposed_model, entry_protocol, status, final_channel, final_upstream_model, attempts, loop_retries, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, wasted_cost_usd, duration_ms, ttft_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-            params![l.ts, l.request_id, l.group_id, l.exposed_model, l.entry_protocol, l.status, l.final_channel, l.final_upstream_model, l.attempts, l.loop_retries, l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens, l.cost_usd, l.wasted_cost_usd, l.duration_ms, l.ttft_ms],
+            "INSERT INTO request_logs (ts, request_id, group_id, exposed_model, entry_protocol, status, final_channel, final_upstream_model, attempts, loop_retries, loop_truncated, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, wasted_cost_usd, duration_ms, ttft_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
+            params![l.ts, l.request_id, l.group_id, l.exposed_model, l.entry_protocol, l.status, l.final_channel, l.final_upstream_model, l.attempts, l.loop_retries, l.loop_truncated, l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens, l.cost_usd, l.wasted_cost_usd, l.duration_ms, l.ttft_ms],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -322,7 +338,7 @@ impl Store {
     pub fn list_request_logs_page(&self, limit: i64, offset: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<LogPage> {
         let (limit, offset) = page_bounds(limit, offset);
         let conn = self.conn.lock().unwrap();
-        let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'exposed_model',exposed_model,'entry_protocol',entry_protocol,'status',status,'final_channel',final_channel,'final_upstream_model',final_upstream_model,'attempts',attempts,'loop_retries',loop_retries,'input_tokens',input_tokens,'output_tokens',output_tokens,'cache_read_tokens',cache_read_tokens,'cache_creation_tokens',cache_creation_tokens,'cost_usd',cost_usd,'wasted_cost_usd',wasted_cost_usd,'duration_ms',duration_ms,'ttft_ms',ttft_ms)";
+        let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'exposed_model',exposed_model,'entry_protocol',entry_protocol,'status',status,'final_channel',final_channel,'final_upstream_model',final_upstream_model,'attempts',attempts,'loop_retries',loop_retries,'loop_truncated',loop_truncated,'input_tokens',input_tokens,'output_tokens',output_tokens,'cache_read_tokens',cache_read_tokens,'cache_creation_tokens',cache_creation_tokens,'cost_usd',cost_usd,'wasted_cost_usd',wasted_cost_usd,'duration_ms',duration_ms,'ttft_ms',ttft_ms)";
         let total = count_rows(&conn, "request_logs", request_id, group_id)?;
         let (where_sql, mut binds) = build_filters(request_id, group_id);
         let n = binds.len();
@@ -368,7 +384,7 @@ impl Store {
         let mut out: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
 
         let mut stmt = conn.prepare(&format!(
-            "SELECT {key}, json_object('requests',COUNT(*),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'avg_duration_ms',ROUND(AVG(duration_ms)),'avg_ttft_ms',ROUND(AVG(ttft_ms)),'last_success_ts',MAX(ts)) \
+            "SELECT {key}, json_object('requests',COUNT(*),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'avg_duration_ms',ROUND(AVG(duration_ms)),'avg_ttft_ms',ROUND(AVG(ttft_ms)),'loop_truncated',COALESCE(SUM(loop_truncated),0),'last_success_ts',MAX(ts)) \
              FROM request_logs WHERE group_id = ?1 AND status = 'success' AND final_channel IS NOT NULL AND final_upstream_model IS NOT NULL \
              GROUP BY {key}"
         ))?;
@@ -477,7 +493,7 @@ impl Store {
             // requests (a failed attempt's duration is dominated by timeouts and
             // would misrepresent latency), and with no successes at all they stay
             // NULL so the console shows "—" instead of a bogus 0ms.
-            "SELECT json_object('requests',COUNT(*),'success',COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),'exhausted',COALESCE(SUM(CASE WHEN status='exhausted' THEN 1 ELSE 0 END),0),'aborted',COALESCE(SUM(CASE WHEN status='aborted' THEN 1 ELSE 0 END),0),'loop_retries',COALESCE(SUM(loop_retries),0),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cache_read_tokens',COALESCE(SUM(cache_read_tokens),0),'cache_creation_tokens',COALESCE(SUM(cache_creation_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'avg_ttft_ms',ROUND(AVG(CASE WHEN status='success' THEN ttft_ms END))) FROM request_logs{scope}"
+            "SELECT json_object('requests',COUNT(*),'success',COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),'exhausted',COALESCE(SUM(CASE WHEN status='exhausted' THEN 1 ELSE 0 END),0),'aborted',COALESCE(SUM(CASE WHEN status='aborted' THEN 1 ELSE 0 END),0),'loop_retries',COALESCE(SUM(loop_retries),0),'loop_truncated',COALESCE(SUM(loop_truncated),0),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cache_read_tokens',COALESCE(SUM(cache_read_tokens),0),'cache_creation_tokens',COALESCE(SUM(cache_creation_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'avg_ttft_ms',ROUND(AVG(CASE WHEN status='success' THEN ttft_ms END))) FROM request_logs{scope}"
         ))?;
         let v: String = match group_id {
             Some(g) if !g.is_empty() => stmt.query_row(params![g], |r| r.get(0))?,
@@ -730,6 +746,7 @@ mod tests {
             final_upstream_model: Some(model.to_string()),
             attempts: 1,
             loop_retries: 0,
+            loop_truncated: 0,
             input_tokens: 10,
             output_tokens: 5,
             cache_read_tokens: 0,

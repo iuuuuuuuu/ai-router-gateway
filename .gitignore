@@ -112,6 +112,11 @@ Desktop.ini
 /tools/_stats-shape.mjs
 /tools/_cfg-shape.mjs
 /tools/_slow-upstream.mjs
+/tools/_midloop-upstream.mjs
+/tools/_build-client.sh
+/tools/_accept-looptail.mjs
+/tools/_client-build.log
+/tools/_accept-midloop.mjs
 /tools/_verify-task43.mjs
 /tools/_verify-d2-cost.mjs
 /tools/_verify-d2-waste.mjs

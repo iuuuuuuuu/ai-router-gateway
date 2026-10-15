@@ -183,6 +183,7 @@ onMounted(() => {
     if (typeof r.loop_guard_repeat_ratio !== "number") r.loop_guard_repeat_ratio = 0.75;
     if (typeof r.loop_guard_max_repeats !== "number") r.loop_guard_max_repeats = 4;
     if (typeof r.loop_guard_window_chars !== "number") r.loop_guard_window_chars = 4000;
+    if (typeof r.loop_guard_tail_chars !== "number") r.loop_guard_tail_chars = 128;
   }
   void loadAutostart();
 });
@@ -313,8 +314,10 @@ onMounted(() => {
       </Card>
 
       <!-- ------------------------------ 死循环拦截 ------------------------------ -->
-      <!-- 服务端在「提交前窗口」里检测退化输出：命中就整次尝试丢弃并换下一个候选，
-           客户端只会拿到一次正常回答（提交前零字节，外部对话不会被中断）。 -->
+      <!-- 服务端在两个窗口里检测退化输出：
+           ① 提交前：命中就整次尝试丢弃并换下一个候选，客户端零字节、只拿到一次正常回答；
+           ② 提交后：字节已在客户端手里，无法换候选，只能就地截断 + 正常收尾（会泄漏一小段已发出的复读）。
+           两段文案必须分开写，不能拿 ① 的说法盖住 ②，否则就是在骗用户。 -->
       <Card>
         <div class="mb-3.5">
           <h2 class="flex items-center gap-1.5 text-[13.5px] font-semibold text-ink">
@@ -322,7 +325,8 @@ onMounted(() => {
             死循环拦截
           </h2>
           <p class="mt-0.5 text-[12.5px] text-ink-3">
-            检测模型是否在反复输出同一段内容；命中就丢弃这次尝试并自动换下一个候选，客户端只会拿到一次正常回答。
+            检测模型是否在反复输出同一段内容。回答<span class="font-medium text-ink-2">开始发送之前</span>命中：丢弃这次尝试并自动换下一个候选，客户端只会拿到一次正常回答；
+            回答<span class="font-medium text-ink-2">已经开始发送之后</span>命中：无法重试（字节已经发出去了），只能就地截断并正常收尾。
           </p>
         </div>
 
@@ -381,9 +385,25 @@ onMounted(() => {
                 />
               </div>
             </Field>
+            <Field
+              label="已提交后的判定尾部 (字符)"
+              hint="回答已经开始发给客户端之后，只看末尾这么多字符判断是否复读。这时无法重试，只能就地截断收尾，所以这个值同时决定「中段复读最多还能泄漏多少字」：越小拦得越早，但要求重复更完整"
+            >
+              <div data-test="loop-guard-tail-chars">
+                <TInput
+                  v-model.number="retry.loop_guard_tail_chars" type="number" min="16"
+                  data-test="loop-guard-tail-chars" @input="markDirty()"
+                />
+              </div>
+            </Field>
           </div>
           <p class="mt-2 text-[11.5px] leading-4 text-ink-3">
-            以上 5 项只影响退化判定，<span class="font-medium text-ink-2">不参与上面的预算校验</span>（预算公式只看重试次数与超时）。
+            以上 6 项只影响退化判定，<span class="font-medium text-ink-2">不参与上面的预算校验</span>（预算公式只看重试次数与超时）。
+          </p>
+          <p class="mt-1.5 text-[11.5px] leading-4 text-ink-3">
+            前 5 项作用于<span class="font-medium text-ink-2">提交前</span>：命中即丢弃整段、内部换候选重试，客户端零字节可见。
+            第 6 项作用于<span class="font-medium text-ink-2">提交后</span>：内容已经发出去无法收回，命中只会
+            <span class="font-medium text-ink-2">就地截断并正常收尾</span>，不再重试。
           </p>
         </div>
 

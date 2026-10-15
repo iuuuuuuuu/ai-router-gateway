@@ -362,24 +362,84 @@ async fn l12_buffered_text_before_a_tool_call_is_not_dropped() {
     assert_eq!(req["loop_retries"], 0);
 }
 
-// ---- 8. the declared boundary: post-commit repetition is not detected ----
+// ---- 8. post-commit repetition IS detected, and the answer is truncated ----
 
 #[tokio::test]
-async fn l13_post_commit_repetition_is_not_detected() {
-    // Detection lives entirely in the pre-commit window. Once the answer has
-    // committed, a repetition that follows is passed through unchanged — this is
-    // the honest boundary the spec records, and it must not silently expand.
+async fn l13_post_commit_repetition_truncates_the_answer() {
+    // The answer commits on 120 characters of normal text; the loop that
+    // follows must be CUT, not relayed. Before this, a model that answered
+    // normally and THEN started repeating was never caught at all.
     let (st, router) = harness(&[Behavior::NormalThenDegenerate], 1, test_retry()).await;
     let (status, sse) = post_chat_stream(&router, EXPOSED).await;
     assert_eq!(status, 200, "sse={sse}");
-    assert!(sse.contains(UNIT), "the post-commit repetition must pass through: {sse}");
     assert_stream_clean(&sse);
 
+    let text = client_text(&sse);
+    // The normal prefix survives: truncation must not eat real content.
+    assert!(text.starts_with("abcdefghijklmnopqrstuvwxyz"), "prefix lost: {text:?}");
+    // The loop is cut short. Without the guard all 40 repetitions arrive
+    // (160 chars of the unit); the tail bound must stop it far sooner.
+    let leaked = text.matches(UNIT).count();
+    assert!(leaked < 40, "the loop was relayed in full ({leaked} repetitions): {text:?}");
+
     let req = newest_request_row(&st).await;
-    assert_eq!(req["status"], "success");
+    assert_eq!(req["status"], "success", "the client still got a valid answer: {req}");
+    assert_eq!(req["loop_truncated"], 1, "the cut must be recorded: {req}");
     assert_eq!(req["attempts"], 1, "no retry may happen after commit");
-    assert_eq!(req["loop_retries"], 0);
     assert_eq!(req["final_channel"], "ch0");
+}
+
+#[tokio::test]
+async fn l13b_the_cut_really_stops_a_long_loop() {
+    // 400 repetitions upstream. A guard that only bounded one frame would still
+    // relay ~1600 characters of the loop, so this pins the STRONG property:
+    // the stream is abandoned early.
+    let (st, router) = harness(&[Behavior::NormalThenDegenerateLong], 1, test_retry()).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200);
+    assert_stream_clean(&sse);
+
+    let text = client_text(&sse);
+    let leaked = text.matches(UNIT).count();
+    assert!(leaked < 100, "only a bounded prefix of the loop may escape, got {leaked}");
+
+    let req = newest_request_row(&st).await;
+    assert_eq!(req["loop_truncated"], 1, "{req}");
+}
+
+#[tokio::test]
+async fn l13c_a_normal_committed_answer_is_never_truncated() {
+    // False-positive control for the POST-COMMIT path. A normal continuation
+    // after commit must survive untouched — cutting a healthy answer short is
+    // worse than the loop this feature exists to stop.
+    let (st, router) = harness(&[Behavior::NormalOnlyStream], 1, test_retry()).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200);
+    assert_stream_clean(&sse);
+
+    // 480 characters of ordinary, non-repeating prose: nothing may be dropped.
+    assert_eq!(client_text(&sse).chars().count(), 480, "a healthy answer was cut: {sse}");
+    // And it really is the whole answer, not a cut that happens to land on 480.
+    assert!(sse.contains("\"finish_reason\":\"stop\""), "the answer must end normally: {sse}");
+
+    let req = newest_request_row(&st).await;
+    assert_eq!(req["loop_truncated"], 0, "no truncation on a healthy answer: {req}");
+}
+
+#[tokio::test]
+async fn l13d_truncation_can_be_disabled() {
+    // The switch governs BOTH windows: turning the guard off must restore the
+    // old pass-through behaviour for a mid-stream loop, not just the
+    // pre-commit one.
+    let (st, router) = harness(&[Behavior::NormalThenDegenerate], 1,
+        retry_with(|r| { r.loop_guard_enabled = false; })).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200);
+    assert_stream_clean(&sse);
+    assert_eq!(client_text(&sse).matches(UNIT).count(), 40, "with the guard off the loop must pass through");
+
+    let req = newest_request_row(&st).await;
+    assert_eq!(req["loop_truncated"], 0, "{req}");
 }
 
 // ---- 9. migration of a database created before loop_retries existed ----
@@ -421,14 +481,16 @@ async fn l14_legacy_database_gains_the_loop_retries_column() {
         id: None, ts: "2026-01-01T00:00:01Z".into(), request_id: "new-req".into(), group_id: "g1".into(),
         exposed_model: "my-model".into(), entry_protocol: "openai".into(), status: "success".into(),
         final_channel: Some("ch0".into()), final_upstream_model: Some("up-model-0".into()),
-        attempts: 2, loop_retries: 3,
+        attempts: 2, loop_retries: 3, loop_truncated: 1,
         input_tokens: 1, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0,
         cost_usd: 0.0, wasted_cost_usd: 0.0, duration_ms: 5, ttft_ms: 5,
     }).unwrap();
     let rows = store.list_request_logs(10, None, None).unwrap();
     assert_eq!(rows[0]["loop_retries"], 3, "{rows:?}");
     assert_eq!(rows[0]["attempts"], 2, "{rows:?}");
+    assert_eq!(rows[0]["loop_truncated"], 1, "the truncation flag must round-trip: {rows:?}");
     assert_eq!(store.stats_summary(None).unwrap()["loop_retries"], 3);
+    assert_eq!(store.stats_summary(None).unwrap()["loop_truncated"], 1);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(dir.join("legacy.db-wal"));

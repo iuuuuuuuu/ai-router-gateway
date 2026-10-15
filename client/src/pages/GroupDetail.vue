@@ -179,8 +179,11 @@ function errorClass(v: unknown): { text: string; tone: Tone } {
   if (low === "degenerate_output") return { text: "输出退化", tone: "warn" };
   return { text: s, tone: "warn" };
 }
-function statusInfo(status: unknown): { label: string; tone: Tone } {
-  switch (String(status ?? "").toLowerCase()) {
+function statusInfo(row: { status?: unknown; loop_truncated?: unknown }): { label: string; tone: Tone } {
+  // 与 Logs.vue 同一份判定：提交后截断的回答 status 仍是 success（客户端确实收到了完整合法的
+  // 流，I2 终态互斥），但内容被截掉了 —— 直接写「成功」等于把退化回答说成好回答。
+  if (Number(row?.loop_truncated) > 0) return { label: "成功（已截断）", tone: "warn" };
+  switch (String(row?.status ?? "").toLowerCase()) {
     case "success": return { label: "成功", tone: "ok" };
     case "exhausted": return { label: "全部失败", tone: "err" };
     // router::Terminal::NoCandidate：网关返回 404 no_route_for_model 的终态
@@ -1484,6 +1487,14 @@ function saveTiers() {
                     <TInput v-model.number="sRetry.loop_guard_window_chars" type="number" min="1" data-test="group-retry-loop-guard-window-chars" />
                   </div>
                 </Field>
+                <Field
+                  label="已提交后的判定尾部 (字符)"
+                  hint="回答已开始发给客户端之后，只看末尾这么多字符判断是否复读。此时无法重试，只能就地截断收尾，所以它也决定「中段复读最多还能泄漏多少字」"
+                >
+                  <div data-test="group-retry-loop-guard-tail-chars">
+                    <TInput v-model.number="sRetry.loop_guard_tail_chars" type="number" min="16" data-test="group-retry-loop-guard-tail-chars" />
+                  </div>
+                </Field>
               </div>
             </div>
 
@@ -1966,7 +1977,12 @@ function saveTiers() {
                 <td class="whitespace-nowrap px-3 py-2 font-mono text-[11.5px] text-ink-2">{{ fmtTs(row.ts) }}</td>
                 <td class="whitespace-nowrap px-3 py-2 font-mono text-[11.5px] text-ink-2 min-w-[200px]">{{ fmtText(row.exposed_model) }}</td>
                 <td class="whitespace-nowrap px-3 py-2">
-                  <Badge :tone="statusInfo(row.status).tone">{{ statusInfo(row.status).label }}</Badge>
+                  <Badge
+                :tone="statusInfo(row).tone"
+                :title="Number(row.loop_truncated) > 0
+                  ? '回答已经开始发送后检测到输出退化（死循环），网关就地截断并正常收尾：客户端收到的是截断后的内容'
+                  : undefined"
+              >{{ statusInfo(row).label }}</Badge>
                 </td>
                 <td class="whitespace-nowrap px-3 py-2">{{ finalChannel(row.final_channel) }}</td>
                 <td class="whitespace-nowrap px-3 py-2 font-mono text-[11.5px] text-ink-2 min-w-[200px]">{{ fmtText(row.final_upstream_model) }}</td>

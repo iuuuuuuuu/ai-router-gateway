@@ -78,8 +78,12 @@ function errorClass(v: unknown): { text: string; tone: Tone } {
   if (low === "degenerate_output") return { text: "输出退化", tone: "warn" };
   return { text: s, tone: "warn" };
 }
-function statusInfo(status: unknown): { label: string; tone: Tone } {
-  switch (String(status ?? "").toLowerCase()) {
+function statusInfo(row: { status?: unknown; loop_truncated?: unknown }): { label: string; tone: Tone } {
+  // 提交后截断（server/src/proxy.rs）：客户端确实收到了一条完整合法的流，所以 status 仍是
+  // success（I2 终态互斥），但内容是被截掉的 —— 直接显示「成功」会把一次退化回答说成好回答，
+  // 所以这里单独标出来。loop_retries 不参与：那是提交前拦截，客户端根本没看到。
+  if (Number(row?.loop_truncated) > 0) return { label: "成功（已截断）", tone: "warn" };
+  switch (String(row?.status ?? "").toLowerCase()) {
     case "success": return { label: "成功", tone: "ok" };
     case "exhausted": return { label: "全部失败", tone: "err" };
     // router::Terminal::NoCandidate（server/src/routes.rs:198）：网关返回 404 no_route_for_model 的终态
@@ -405,7 +409,12 @@ onUnmounted(() => {
               <td class="whitespace-nowrap px-3 py-2">{{ groupName(row.group_id) }}</td>
               <td class="whitespace-nowrap px-3 py-2 font-mono text-[11.5px] text-ink-2 min-w-[200px]">{{ fmtText(row.exposed_model) }}</td>
               <td class="whitespace-nowrap px-3 py-2">
-                <Badge :tone="statusInfo(row.status).tone">{{ statusInfo(row.status).label }}</Badge>
+                <Badge
+                  :tone="statusInfo(row).tone"
+                  :title="Number(row.loop_truncated) > 0
+                    ? '回答已经开始发送后检测到输出退化（死循环），网关就地截断并正常收尾：客户端收到的是截断后的内容'
+                    : undefined"
+                >{{ statusInfo(row).label }}</Badge>
               </td>
               <td class="whitespace-nowrap px-3 py-2">{{ finalChannel(row.final_channel) }}</td>
               <td class="whitespace-nowrap px-3 py-2 font-mono text-[11.5px] text-ink-2 min-w-[200px]">{{ fmtText(row.final_upstream_model) }}</td>

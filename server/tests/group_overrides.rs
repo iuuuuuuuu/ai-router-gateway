@@ -441,13 +441,14 @@ async fn g09_group_members_reports_retry_source_and_both_configs() {
     assert_eq!(a["retry_source"], "group", "{a}");
     assert_eq!(a["retry"]["max_attempts"], 3, "{a}");
     assert_eq!(a["retry"]["loop_guard_min_chars"], 128, "{a}");
-    // The full shape, including all six loop-guard knobs.
+    // The full shape, including all seven loop-guard knobs.
     for k in [
         "max_attempts", "max_cycles", "total_deadline_ms", "attempt_deadline_ms",
         "connect_timeout_ms", "ttfb_timeout_ms", "first_event_timeout_ms",
         "chunk_idle_timeout_ms", "reserve_ms", "cooldown_wait",
         "loop_guard_enabled", "loop_guard_min_chars", "loop_guard_repeat_min_chars",
         "loop_guard_repeat_ratio", "loop_guard_max_repeats", "loop_guard_window_chars",
+        "loop_guard_tail_chars",
     ] {
         assert!(a["retry"].get(k).is_some(), "effective retry lost {k}: {a}");
     }

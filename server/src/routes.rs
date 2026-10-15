@@ -251,6 +251,9 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                 final_upstream_model: final_model_for_log.clone(),
                 attempts: attempts_for_log,
                 loop_retries: loop_retries_for_log,
+                // Non-stream: there is no pump, so nothing can be truncated
+                // after delivery — the whole answer arrives in one piece.
+                loop_truncated: 0,
                 input_tokens: usage.input_tokens as i64,
                 output_tokens: usage.output_tokens as i64,
                 cache_read_tokens: usage.cache_read_tokens as i64,
@@ -270,7 +273,7 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
             };
             (StatusCode::OK, axum::Json(rendered)).into_response()
         }
-        Some(Outcome::Stream { usage_rx }) => {
+        Some(Outcome::Stream { outcome_rx }) => {
             // Hand over the receiver created before the walk (see above); it
             // already holds the preamble plus every frame the pump produced.
             let body_stream = tokio_stream_from_channel(feed_rx, client_gone);
@@ -296,7 +299,8 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
             let price_snap = price_snap.clone();
             let wasted = wasted_cost;
             tokio::spawn(async move {
-                let usage = usage_rx.await.unwrap_or_default();
+                let outcome = outcome_rx.await.unwrap_or_default();
+                let usage = outcome.usage;
                 // Priced BEFORE the row below moves `fc`/`fum` into itself: a
                 // struct literal evaluates its fields in written order, so a
                 // borrowing call placed after them would not compile.
@@ -304,9 +308,16 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                 st.store.insert_request_log(&crate::store::RequestLog {
                     id: None, ts: iso_now(), request_id: rid, group_id: gid,
                     exposed_model: em, entry_protocol: format!("{entry:?}").to_lowercase(),
-                    status: "success".into(), final_channel: fc, final_upstream_model: fum,
+                    // The client received a complete, valid stream, so this is
+                    // a success by I2 — but a truncated answer must not be
+                    // reported as a clean one, so the cut is counted separately
+                    // (a pre-commit hit is invisible to the client; a
+                    // post-commit truncation is not).
+                    status: "success".into(),
+                    final_channel: fc, final_upstream_model: fum,
                     attempts: recs,
                     loop_retries: lr,
+                    loop_truncated: outcome.loop_truncated as i64,
                     input_tokens: usage.input_tokens as i64, output_tokens: usage.output_tokens as i64,
                     cache_read_tokens: usage.cache_read_tokens as i64, cache_creation_tokens: usage.cache_creation_tokens as i64,
                     cost_usd: cost, wasted_cost_usd: wasted, duration_ms: dur, ttft_ms: ttft.unwrap_or(0),
@@ -322,6 +333,7 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                 status: status.into(), final_channel: None, final_upstream_model: None,
                 attempts: result.records.len() as u32,
                 loop_retries: loop_retries_for_log,
+                loop_truncated: 0,
                 input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0,
                 cost_usd: 0.0, wasted_cost_usd: wasted_cost,
                 duration_ms: duration_ms as i64, ttft_ms: result.ttft_ms.unwrap_or(0) as i64,

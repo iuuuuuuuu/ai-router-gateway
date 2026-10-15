@@ -25,6 +25,9 @@ export interface RetryConfig {
   loop_guard_max_repeats: number;
   /** 检测窗口字符数上限，超出只保留尾部（默认 4000）。 */
   loop_guard_window_chars: number;
+  /** 已提交之后的判定只看回答末尾这么多字符（默认 128）。提交后无法重试，
+   *  只能截断收尾，所以这个值同时决定「中段复读还能泄漏多少字」。 */
+  loop_guard_tail_chars: number;
 }
 export interface AdminConfig {
   listen: ListenConfig;
@@ -65,6 +68,8 @@ export interface GroupMember {
   channel_id: string; channel_name: string; upstream_model: string; exposed_model: string;
   enabled: boolean; cooling: boolean; cooling_until_ms: number | null; cooldown_kind: string | null;
   requests: number; failed_attempts: number; loop_retries: number;
+  /** 该候选提交后被截断的次数。 */
+  loop_truncated?: number;
   error_classes: { error_class: string; n: number }[];
   avg_duration_ms: number | null; avg_ttft_ms: number | null;
   input_tokens: number; output_tokens: number; cost_usd: number;
@@ -99,8 +104,11 @@ export interface RequestLog {
   attempts: number; input_tokens: number; output_tokens: number;
   cache_read_tokens: number; cache_creation_tokens: number;
   cost_usd: number; wasted_cost_usd: number; duration_ms: number; ttft_ms: number;
-  /** 本次请求因输出退化被内部丢弃并重试的次数。 */
+  /** 本次请求因输出退化被内部丢弃并重试的次数（提交前拦截，客户端零字节可见）。 */
   loop_retries: number;
+  /** 1 = 回答已开始发送后才判定为退化，网关就地截断并正常收尾。
+   *  与 loop_retries 不同：这条回答客户端已经收到了，只是没给完。 */
+  loop_truncated: number;
 }
 /** 实时并发快照："使用中" 的唯一数据来源。只含非零项，缺键即 0。 */
 export interface InflightSnapshot {
@@ -128,8 +136,9 @@ export interface GroupStatRow {
   avg_duration_ms: number | null; models: number;
 }
 export interface StatsPayload {
-  /** 汇总计数；loop_retries 为死循环拦截（输出退化）累计次数。 */
-  summary: Record<string, number | string | null> & { loop_retries?: number };
+  /** 汇总计数；loop_retries 为死循环拦截（输出退化）累计次数，
+   *  loop_truncated 为提交后截断累计次数（客户端已收到部分内容）。 */
+  summary: Record<string, number | string | null> & { loop_retries?: number; loop_truncated?: number };
   by_model: Record<string, number | string | null>[];
   /** Always the full cross-group overview, independent of group_id. */
   by_group: GroupStatRow[];

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
-import { BarChart3, Eraser, Layers, PieChart, RefreshCw, Repeat, ScrollText, ShieldAlert } from "@lucide/vue";
+import { BarChart3, Eraser, Layers, PieChart, RefreshCw, Repeat, Scissors, ScrollText, ShieldAlert } from "@lucide/vue";
 import type { EChartsCoreOption } from "echarts/core";
 import { api, type CooldownRow as ApiCooldownRow, type GroupStatRow, type StatsPayload } from "../api";
 import { channelName, groups } from "../store";
@@ -137,6 +137,8 @@ const rateTone = computed<Tone>(() => {
 // 死循环拦截（输出退化）累计次数：老服务端 / 老库还没这一列时返回 null，概览里整块不渲染，
 // 避免在没有该能力的实例上显示一个永远为 0 的指标。
 const loopRetries = computed(() => pick(["loop_retries", "loop_guard_retries"]));
+// 提交后截断：老服务端 / 老库没有这一列时返回 null，整个徽章不渲染。
+const loopTruncated = computed(() => pick(["loop_truncated"]));
 
 /* ------------------------------ 按模型成本 ------------------------------ */
 function firstNum(row: Row, keys: string[]): number | null {
@@ -443,9 +445,20 @@ onUnmounted(() => {
           tone="warn"
           class="ml-1 align-[1px]"
           data-test="loop-retries"
-          title="网关内部因输出退化（死循环）丢弃并重试的次数，客户端看不到这些被丢弃的尝试"
+          title="网关内部因输出退化（死循环）丢弃并重试的次数。这些尝试发生在提交前，客户端零字节可见"
         >
           <Repeat :size="11" />死循环拦截 {{ fmtInt(loopRetries) }} 次
+        </Badge>
+        <!-- 提交后截断是另一回事：那条回答客户端已经收到了（只是没给完），
+             与上面「客户端看不到」的丢弃不能混为一谈，所以分开计数、分开说明。 -->
+        <Badge
+          v-if="loopTruncated !== null && loopTruncated > 0"
+          tone="warn"
+          class="ml-1 align-[1px]"
+          data-test="loop-truncated"
+          title="回答已经开始发送后才判定为输出退化（死循环）并就地截断收尾的次数。客户端收到的是截断后的内容，不是完整回答"
+        >
+          <Scissors :size="11" />截断收尾 {{ fmtInt(loopTruncated) }} 次
         </Badge>
         <span v-if="lastAt" class="ml-1 font-mono text-[11.5px]">· 最后更新 {{ fmtClock(lastAt) }}</span>
       </div>
