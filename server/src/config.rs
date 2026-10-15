@@ -64,6 +64,16 @@ pub struct RetryConfig {
     /// the only remedy is to stop; this bounds how long a mid-answer loop may
     /// run before that happens. Smaller catches loops sooner but needs the
     /// repetition to be more complete.
+    ///
+    /// This is the tier-1 span AND the evidence floor for both tiers: the tail
+    /// must hold this many characters before ANY post-commit judgement happens,
+    /// which is what keeps a three-word answer from being judged. Tier 2 widens
+    /// the judged SPAN beyond this value (see `loopguard::TIER2_SPAN_MULT`),
+    /// but never lowers the floor. Those two tier-2 knobs are deliberately
+    /// compile-time constants rather than config fields: they are not
+    /// independent, and exposing them separately would let an operator widen
+    /// the span without raising the repeat bar, which silently increases the
+    /// false-positive rate.
     #[serde(default = "d_loop_guard_tail_chars")]
     pub loop_guard_tail_chars: usize,
     /// On a repetition, correct the model instead of discarding the attempt:

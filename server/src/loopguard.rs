@@ -13,6 +13,18 @@
 use crate::config::RetryConfig;
 use std::collections::VecDeque;
 
+/// Tier 2 of the post-commit judgement: how much wider than `tail_chars` the
+/// judged span may grow. A unit of length U needs about U*(max_repeats+1)
+/// characters of span before R2 and R4 can both hold, so the tier-1 span caps
+/// post-commit detection at `tail_chars/(max_repeats+1)`. Widening the span is
+/// the only way past that cap.
+pub const TIER2_SPAN_MULT: usize = 3;
+/// Extra repeats tier 2 demands ON TOP of `max_repeats`. Growing the span
+/// lowers the bar for R4 (the repetition only has to dominate a wider span),
+/// so tier 2 pays for the wider net with strictly more repetitions. This is
+/// what keeps the false-positive rate flat as the span grows.
+pub const TIER2_EXTRA_REPS: u32 = 2;
+
 /// Diagnostics only: at most this many characters of the repeated unit are
 /// copied into `LoopHit::unit` (char-boundary safe by construction).
 const UNIT_SNIPPET_CHARS: usize = 120;
@@ -221,7 +233,7 @@ impl LoopGuard {
         // The strict suffix rule first -- it is the cheaper scan and the one the
         // existing tests pin down -- then the whitespace-tolerant rule it cannot
         // see. Both stay PRE-COMMIT: here a hit costs the client zero bytes.
-        self.detect().or_else(|| self.detect_loose(self.window.len(), self.cfg.min_chars))
+        self.detect().or_else(|| self.detect_loose(self.window.len(), self.cfg.min_chars, self.cfg.max_repeats))
     }
 
     /// Post-commit counterpart of `push`: accumulate the delta and judge only
@@ -290,6 +302,26 @@ impl LoopGuard {
     ///
     /// Returns `None` until the tail is saturated: a half-filled tail cannot be
     /// "dominated" by anything yet.
+    ///
+    /// TWO TIERS, because one span cannot serve both ends of the trade-off:
+    ///
+    /// * Tier 1 judges exactly `tail_chars`, with the configured `max_repeats`.
+    ///   It is the fast, sensitive path and keeps every existing behaviour.
+    /// * Tier 2 judges a span up to `tail_chars * TIER2_SPAN_MULT` but demands
+    ///   `max_repeats + TIER2_EXTRA_REPS` repetitions. Tier 1 alone cannot see a
+    ///   unit longer than `tail_chars / (max_repeats + 1)`, because such a unit
+    ///   cannot fit `max_repeats` copies inside the tail; that is exactly the
+    ///   gap a model exploits by repeating a LONG sentence. Growing the span
+    ///   without raising the repeat bar would make R4 easier to satisfy (the
+    ///   repetition only has to dominate a wider span), which is why the extra
+    ///   repeats are not optional: they are what keeps the false-positive rate
+    ///   from rising just because the net got wider.
+    ///
+    /// The FLOOR above stays `tail_chars` on purpose. The floor answers "is
+    /// there enough evidence to judge at all", and lowering it would let a
+    /// three-word answer be judged. The SPAN answers "how much text may the
+    /// judgement look at", and those are different questions that the previous
+    /// design wrongly answered with one number.
     pub fn judge_tail(&self) -> Option<LoopHit> {
         if !self.cfg.enabled {
             return None;
@@ -302,8 +334,17 @@ impl LoopGuard {
         // saturated tail is already the evidence. Reusing it would make a
         // `tail_chars` smaller than `min_chars` (e.g. 32 vs 64) silently
         // impossible to satisfy.
-        self.detect_span(self.cfg.tail_chars, 2)
-            .or_else(|| self.detect_loose(self.cfg.tail_chars, 2))
+        let tail = self.cfg.tail_chars;
+        if let Some(h) = self
+            .detect_span(tail, 2, self.cfg.max_repeats)
+            .or_else(|| self.detect_loose(tail, 2, self.cfg.max_repeats))
+        {
+            return Some(h);
+        }
+        let span = self.window.len().min(tail.saturating_mul(TIER2_SPAN_MULT));
+        let reps = self.cfg.max_repeats + TIER2_EXTRA_REPS;
+        self.detect_span(span, 2, reps)
+            .or_else(|| self.detect_loose(span, 2, reps))
     }
 
     /// R6, the whitespace-tolerant fallback for R1-R5.
@@ -333,7 +374,7 @@ impl LoopGuard {
     ///     live shapes end with a remark like "（共 20 遍）" that the model adds
     ///     as a self-summary. Without it, the remark would hide the loop behind
     ///     itself -- the exact failure this rule exists to fix.
-    fn detect_loose(&self, n: usize, min_span: usize) -> Option<LoopHit> {
+    fn detect_loose(&self, n: usize, min_span: usize, min_repeats: u32) -> Option<LoopHit> {
         let len = self.window.len();
         let n = n.min(len);
         if n < 2 || n < min_span {
@@ -384,7 +425,7 @@ impl LoopGuard {
                     continue;
                 }
                 let covered = repeats * unit_len;
-                if (repeats as u32) < self.cfg.max_repeats {
+                if (repeats as u32) < min_repeats {
                     continue; // R2
                 }
                 if covered < self.cfg.repeat_min_chars {
@@ -421,13 +462,13 @@ impl LoopGuard {
     /// Returns the best hit: the largest covered span, ties broken by the
     /// smallest unit length.
     fn detect(&self) -> Option<LoopHit> {
-        self.detect_span(self.window.len(), self.cfg.min_chars)
+        self.detect_span(self.window.len(), self.cfg.min_chars, self.cfg.max_repeats)
     }
 
     /// The rules themselves, end-relative: every index below counts backwards
     /// from the window tail, so `n` is how many trailing characters are judged
     /// and `len` is how many the window actually holds (`n <= len`).
-    fn detect_span(&self, n: usize, min_span: usize) -> Option<LoopHit> {
+    fn detect_span(&self, n: usize, min_span: usize, min_repeats: u32) -> Option<LoopHit> {
         let len = self.window.len();
         debug_assert!(n <= len, "judged span {n} exceeds the window {len}");
         if n < 2 || n < min_span {
@@ -455,7 +496,7 @@ impl LoopGuard {
                 continue; // max_repeats is clamped to >= 2, so R2 cannot pass
             }
             let covered = repeats * unit_len;
-            if (repeats as u32) < self.cfg.max_repeats {
+            if (repeats as u32) < min_repeats {
                 continue; // R2
             }
             if covered < self.cfg.repeat_min_chars {
@@ -1062,43 +1103,187 @@ mod tests {
         assert!(h.repeats >= 4, "{h:?}");
     }
 
-    /// The MEASURED post-commit unit-length boundary, pinned so it cannot
-    /// silently shrink. This documents a LIMITATION, not a feature.
+    /// Tier 2 must not become a false-positive machine. Growing the judged
+    /// span lowers the R4 bar (the repetition only has to dominate a wider
+    /// span), so this pins the cases where a WIDER span would start cutting
+    /// text a human wrote on purpose.
+    #[test]
+    fn t33_tier2_does_not_cut_legitimate_text() {
+        let cfg = cfg();
+        // 1. A markdown table whose rows legitimately share a shape. Every row
+        //    is IDENTICAL here, which is the worst case: it is a real table a
+        //    model may emit, and R2/R3/R4 are all satisfiable inside a wide span.
+        let table = format!("| 名称 | 状态 |\n|---|---|\n{}", "| 未知 | 待确认 |\n".repeat(12));
+        let mut g = LoopGuard::new(&cfg);
+        // Tier 1 already cuts this (pre-existing behaviour, measured). The test
+        // records the CURRENT answer so a future change to tier 1 is visible,
+        // rather than asserting a value tier 2 was never responsible for.
+        let tier1 = g.push_tail(&table).is_some();
+        assert!(tier1, "tier 1 cuts a fully-identical table; if this changes, revisit the docs");
+
+        // 2. Prose where every sentence is genuinely different must survive. This
+        //    is the case tier 2 could plausibly break by widening the net.
+        let prose: String = (0..70)
+            .map(|i| format!("第 {i} 条记录描述了编号 {i} 的渠道在 {} 秒内的表现，与其它条目互不相同。", i * 7))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut g2 = LoopGuard::new(&cfg);
+        assert!(g2.push_tail(&prose).is_none(), "distinct prose must never be cut");
+
+        // 3. Config blocks that repeat the same keys with different values are
+        //    the shape a model uses for multi-channel setup; the VALUES differ,
+        //    so no unit is repeated and nothing may be cut.
+        let cfgtext: String = (0..12)
+            .map(|i| format!("[channel.{i}]\nretries = {}\ntimeout_ms = {}\nenabled = true", i % 4 + 1, 20_000 + i * 500))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut g3 = LoopGuard::new(&cfg);
+        assert!(g3.push_tail(&cfgtext).is_none(), "distinct config values must never be cut");
+
+        // 4. The case that ACTUALLY depends on TIER2_EXTRA_REPS. When the whole
+        //    window is shorter than the tier-2 span, R4 is trivially satisfied
+        //    (the repetition IS the entire span), so R2 alone decides -- and the
+        //    extra repeats are the only thing standing between a legitimate
+        //    5-line answer and a false cut. Verified by fault injection: with
+        //    `TIER2_EXTRA_REPS` folded back into `max_repeats`, all three of
+        //    these are CUT, which is why this case is pinned.
+        let repeated_legit: [(&str, String); 3] = [
+            (
+                "a 5-line log excerpt",
+                "2026-10-15 20:41:00 INFO heartbeat ok channel=ch_alpha\n".repeat(5),
+            ),
+            (
+                "a 5-line chorus",
+                "这是我们的时代，这是我们的选择，一起走下去不要回头，直到天亮。\n".repeat(5),
+            ),
+            (
+                "a 5-line checklist",
+                "请确认所有渠道的配置项均已正确填写，确认无误之后再继续下一步。\n".repeat(5),
+            ),
+        ];
+        for (name, text) in &repeated_legit {
+            let mut g4 = LoopGuard::new(&cfg);
+            assert!(
+                g4.push_tail(text).is_none(),
+                "{name} repeats one line 5 times and must survive: tier 2 needs \
+                 {} repeats, not {}",
+                cfg.max_repeats + TIER2_EXTRA_REPS,
+                cfg.max_repeats
+            );
+        }
+    }
+
+    /// Tier 2 must actually be doing the work, not tier 1 in disguise.
     ///
-    /// Post-commit judging looks at only `tail_chars` (128) characters, and R2
-    /// needs `max_repeats` (4) whole units inside the span that `match_span` can
-    /// extend to (`n - unit_len`). So a unit longer than
-    /// `tail_chars / (max_repeats + 1)` = 25 cannot reach 4 matches within 128
-    /// characters, and a repetition of longer units that starts AFTER the commit
-    /// point is not detected. R3 (`covered >= repeat_min_chars`) closes the other
-    /// end, so the detectable band post-commit is roughly 24..=25 chars.
+    /// A 45-character unit is the real one measured from a live model. Tier 1
+    /// cannot see it (25 is its ceiling); only tier 2 can. If tier 2 were
+    /// accidentally disabled, t32 would still pass for the 24-char case, so
+    /// this test isolates the band that ONLY tier 2 covers.
+    #[test]
+    fn t34_tier2_is_what_catches_the_long_unit() {
+        let cfg = cfg();
+        let tail = cfg.tail_chars;
+        let bound1 = tail / (cfg.max_repeats as usize + 1);
+        let unit = distinct_chars(45, 1);
+        assert!(unit.chars().count() > bound1, "45 must be above the tier-1 bound {bound1}");
+
+        // Post-commit: tier 2 must catch it.
+        let mut g = LoopGuard::new(&cfg);
+        let h = g
+            .push_tail(&unit.repeat(60))
+            .expect("tier 2 must catch a 45-char unit post-commit");
+        assert!(h.repeats >= cfg.max_repeats + TIER2_EXTRA_REPS, "tier 2 demands more repeats: {h:?}");
+        assert_eq!(h.unit, distinct_chars(45, 1).chars().take(UNIT_SNIPPET_CHARS).collect::<String>());
+
+        // Tier 1 alone must NOT catch it, which is the gap tier 2 exists to close.
+        // Isolate tier 1 by stopping the window at exactly `tail` characters:
+        // there tier 1 has all the span it will ever get, while tier 2 has none
+        // of its extra width yet. 128 chars of a 45-char unit is 2 whole copies,
+        // and R2 needs 4, so tier 1 is structurally unable to fire.
+        let text: String = unit.repeat(60);
+        let chars: Vec<char> = text.chars().collect();
+        let mut g1 = LoopGuard::new(&cfg);
+        let mut fed = 0usize;
+        while fed < tail {
+            let end = (fed + 12).min(tail);
+            let piece: String = chars[fed..end].iter().collect();
+            assert!(
+                g1.push_tail(&piece).is_none(),
+                "tier 1 must not fire on a 45-char unit at {fed} chars; the band is 24..=25"
+            );
+            fed = end;
+        }
+        assert_eq!(g1.window_len(), tail, "tier 1 got its whole span and still saw nothing");
+        // Past the tier-1 span the SAME text is caught, so the miss above was the
+        // band and not a broken guard.
+        let mut g2 = LoopGuard::new(&cfg);
+        assert!(g2.push_tail(&text).is_some(), "tier 2 catches what tier 1 cannot");
+    }
+
+    /// The MEASURED post-commit unit-length boundary, pinned so it cannot
+    /// silently move. This documents the detection band, which is a real
+    /// limitation at the top end and a deliberate trade-off at the bottom.
+    ///
+    /// The post-commit detection band is bounded at BOTH ends, and this pins
+    /// the upper one for each tier.
+    ///
+    /// Tier 1 judges `tail_chars` and needs `max_repeats` copies, so a unit of
+    /// length U needs `tail/U - 1 >= max_repeats` -- i.e. `U <= tail/(max_repeats+1)`
+    /// = 25. Tier 2 judges `tail * TIER2_SPAN_MULT` and needs
+    /// `max_repeats + TIER2_EXTRA_REPS` copies, so its bound is
+    /// `tail*mult/(max_repeats+extra+1)` = 384/7 = 54.
+    ///
+    /// R3 (`covered >= repeat_min_chars`) closes the other end, so the
+    /// detectable band post-commit is roughly 24..=54 chars. Before tier 2
+    /// existed the upper bound was 25, which is why a model repeating a
+    /// 45-character sentence leaked its whole answer.
     ///
     /// Measured on the deployed gateway with 12-char frames: units of 8/16/24/25
     /// were cut; 22, 23, 26, 27, 28 and larger leaked the full 4000 characters.
     #[test]
     fn t32_post_commit_unit_length_boundary_is_pinned() {
-        let tail = cfg().tail_chars;
-        let bound = tail / (cfg().max_repeats as usize + 1);
-        assert_eq!(bound, 25, "the documented boundary moved");
+        let cfg = cfg();
+        let tail = cfg.tail_chars;
+        let reps1 = cfg.max_repeats as usize;
+        let reps2 = cfg.max_repeats as usize + TIER2_EXTRA_REPS as usize;
+        let span2 = tail * TIER2_SPAN_MULT;
+
+        let bound1 = tail / (reps1 + 1);
+        let bound2 = span2 / (reps2 + 1);
+        assert_eq!(bound1, 25, "the tier-1 boundary moved");
+        assert_eq!(bound2, 54, "the tier-2 boundary moved");
 
         // The unit must be DISTINCT characters. A unit of one repeated character
         // has a length-1 sub-unit that also matches, and R2 then trivially passes
         // -- which would make this test assert nothing about the boundary.
-        let short = distinct_chars(24, 1);
-        let mut g = LoopGuard::new(&cfg());
+        let short = distinct_chars(bound1 - 1, 1);
+        let mut g = LoopGuard::new(&cfg);
         assert!(g.push_tail(&short.repeat(40)).is_some(), "24 distinct chars is inside the band");
 
-        // Above the bound: not detectable post-commit, by construction.
-        let long = distinct_chars(bound + 8, 1);
-        let mut g2 = LoopGuard::new(&cfg());
+        // Between the two bounds: tier 2 is what catches it, and that is the
+        // whole point of the change. 45 is the real unit measured from a live
+        // model that repeated "Let me write./Here./Final./..." 60 times.
+        for u in [bound1 + 1, 45, bound2] {
+            let mid = distinct_chars(u, 1);
+            let mut gm = LoopGuard::new(&cfg);
+            assert!(
+                gm.push_tail(&mid.repeat(60)).is_some(),
+                "unit {u} is between the tier-1 bound {bound1} and the tier-2 bound {bound2}; \
+                 tier 2 must catch it post-commit"
+            );
+        }
+
+        // Above the tier-2 bound: not detectable post-commit, by construction.
+        let long = distinct_chars(bound2 + 8, 1);
+        let mut g2 = LoopGuard::new(&cfg);
         assert!(
             g2.push_tail(&long.repeat(40)).is_none(),
-            "units longer than {bound} cannot reach R2 inside {tail} chars"
+            "units longer than {bound2} cannot reach R2 inside {span2} chars"
         );
 
         // The SAME long unit IS caught before commit, where the whole window is
         // judged. That asymmetry is why this gap is post-commit only.
-        let mut g3 = LoopGuard::new(&cfg());
+        let mut g3 = LoopGuard::new(&cfg);
         assert!(g3.push(&long.repeat(40)).is_some(), "pre-commit judges the whole window");
     }
 }
