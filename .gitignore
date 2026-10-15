@@ -197,3 +197,6 @@ Desktop.ini
 /tools/_ports.mjs
 /tools/_start-bg.mjs
 /tools/_build-server.sh
+
+# ── 「获取模型列表 / 连通测试」成功却报错（缺 fmtSec import）修复的真机验收（本机证据，不入库）──
+/tools/_accept-fetch-fix.mjs

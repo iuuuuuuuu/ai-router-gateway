@@ -12,6 +12,10 @@ import ChannelCard from "../components/channels/ChannelCard.vue";
 import { api, type Channel, type InflightSnapshot, type ModelBinding } from "../api";
 import { channels, groupsUsingModel, markDirty, models, modelsOfChannel, state, uid } from "../store";
 import { toast } from "../toast";
+// fmtSec：界面时长统一显示成中文「秒」。v0.4.4 在 runFetch() 与 test() 里用上了它，
+// 却漏了这行 import —— 两处都在 try 里，于是 ReferenceError 被自己的 catch 抓住，
+// 成功路径被显示成「获取失败 / 连通测试失败」。补上即可（同一个 import 修两处）。
+import { fmtSec } from "../format";
 
 /* ------------------------------- 列表渲染 ------------------------------- */
 
