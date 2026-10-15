@@ -133,7 +133,54 @@ pub fn parse_request(body: &Value) -> anyhow::Result<ChatRequest> {
         stream: obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
         tools,
         tool_choice,
+        reasoning: parse_reasoning(obj),
     })
+}
+
+/// OpenAI-family thinking knobs. Several spellings coexist across compatible
+/// providers, so all of them are read rather than just the canonical one:
+/// `reasoning_effort` (OpenAI o-series), `reasoning: {effort}` (Responses-style
+/// clients), `thinking` (Anthropic-shaped clients talking to an OpenAI exit),
+/// and `enable_thinking` / `extra_body.enable_thinking` (DashScope, vLLM, and
+/// other OpenAI-compatible servers).
+///
+/// The original field objects are also kept verbatim, so a same-protocol
+/// forward can replay what the client actually sent instead of a re-derivation.
+fn parse_reasoning(obj: &serde_json::Map<String, Value>) -> super::ir::ReasoningCfg {
+    let mut cfg = super::ir::ReasoningCfg::default();
+
+    if let Some(e) = obj.get("reasoning_effort").and_then(|v| v.as_str()) {
+        cfg.effort = Some(e.to_string());
+    } else if let Some(e) = obj.get("reasoning").and_then(|v| v.pointer("/effort")).and_then(|v| v.as_str()) {
+        cfg.effort = Some(e.to_string());
+    }
+    if let Some(b) = obj.get("thinking").and_then(|v| v.pointer("/budget_tokens")).and_then(|v| v.as_u64()) {
+        cfg.budget_tokens = Some(b as u32);
+    }
+    if let Some(t) = obj.get("thinking").and_then(|v| v.get("type")).and_then(|v| v.as_str()) {
+        cfg.enabled = Some(t == "enabled" || t == "auto");
+    }
+    if let Some(b) = obj
+        .get("enable_thinking")
+        .or_else(|| obj.get("extra_body").and_then(|v| v.pointer("/enable_thinking")))
+        .and_then(|v| v.as_bool())
+    {
+        cfg.enabled = Some(b);
+    }
+
+    let mut fields = serde_json::Map::new();
+    for key in ["reasoning_effort", "reasoning", "thinking"] {
+        if let Some(v) = obj.get(key) {
+            fields.insert(key.to_string(), v.clone());
+        }
+    }
+    if let Some(v) = obj.get("enable_thinking").or_else(|| obj.get("extra_body").and_then(|v| v.pointer("/enable_thinking"))) {
+        fields.insert("enable_thinking".to_string(), v.clone());
+    }
+    if !fields.is_empty() {
+        cfg.raw = Some(json!({"protocol": "openai", "fields": fields}));
+    }
+    cfg
 }
 
 fn extract_text(content: Option<&Value>) -> Option<String> {
@@ -240,6 +287,7 @@ pub fn render_upstream_request(req: &ChatRequest, model: &str, stream: bool) -> 
         // ask for usage in the final chunk (OpenAI spec)
         body.insert("stream_options".into(), json!({"include_usage": true}));
     }
+    insert_reasoning(&mut body, req);
     if !req.tools.is_empty() {
         let tools: Vec<Value> = req
             .tools
@@ -259,6 +307,50 @@ pub fn render_upstream_request(req: &ChatRequest, model: &str, stream: bool) -> 
     Value::Object(body)
 }
 
+/// Emit the client's thinking request into an OpenAI-shaped body.
+///
+/// Preference order, and the reasoning behind it:
+///  1. The client's own fields when it also spoke OpenAI. Replaying them is the
+///     only option that cannot invent or mis-translate anything.
+///  2. Otherwise translate from the IR: `reasoning_effort` when the client gave
+///     an effort, else an Anthropic/Gemini budget mapped onto the nearest effort.
+/// An upstream that does not understand these keys ignores them, which is the
+/// same behaviour it had before -- they were never sent at all.
+fn insert_reasoning(body: &mut serde_json::Map<String, Value>, req: &ChatRequest) {
+    let r = &req.reasoning;
+
+    if r.is_empty() {
+        return;
+    }
+    if let Some(fields) = r.raw_for("openai") {
+        for (k, v) in fields {
+            body.insert(k.clone(), v.clone());
+        }
+        // A client that disabled thinking must not also inherit a translated
+        // budget from another spelling in the same request.
+        if r.enabled == Some(false) {
+            body.insert("reasoning_effort".into(), json!("none"));
+        }
+        return;
+    }
+    if !r.wants_thinking() {
+        body.insert("reasoning_effort".into(), json!("none"));
+        return;
+    }
+    if let Some(e) = &r.effort {
+        body.insert("reasoning_effort".into(), json!(e));
+        return;
+    }
+    if let Some(b) = r.budget_tokens {
+        let effort = match b {
+            0..=4096 => "low",
+            4097..=16384 => "medium",
+            _ => "high",
+        };
+        body.insert("reasoning_effort".into(), json!(effort));
+    }
+}
+
 pub fn parse_response(body: &Value, model_echo: &str) -> anyhow::Result<ChatResponse> {
     // 200-with-error detection happens before this in the proxy; here we
     // additionally catch nested error shapes.
@@ -272,6 +364,19 @@ pub fn parse_response(body: &Value, model_echo: &str) -> anyhow::Result<ChatResp
     let message = choice.get("message").cloned().unwrap_or(json!({}));
 
     let mut content: Vec<Content> = vec![];
+    // Thinking first, and as its own block: several OpenAI-compatible providers
+    // return it as `reasoning_content` (DeepSeek, Qwen, vLLM) or `reasoning`
+    // (OpenRouter, some gateways). It must never be concatenated into the
+    // answer -- a client rendering only `content` would suddenly see the
+    // model's scratchpad as its reply.
+    for key in ["reasoning_content", "reasoning"] {
+        if let Some(t) = message.get(key).and_then(|v| v.as_str()) {
+            if !t.is_empty() {
+                content.push(Content::Reasoning { text: t.to_string() });
+                break;
+            }
+        }
+    }
     if let Some(t) = message.get("content").and_then(|v| v.as_str()) {
         if !t.is_empty() { content.push(Content::Text { text: t.to_string() }); }
     }
@@ -311,6 +416,12 @@ pub fn parse_usage(u: Option<&Value>) -> Usage {
 }
 
 /// Render a full (non-stream) response for an OpenAI client.
+/// Reasoning is deliberately NOT serialized here. The gateway emits text in
+/// the shape the client's entry protocol documents; inventing a
+/// `reasoning_content` field for a client that never asked changes its message
+/// parsing. Callers that want the thinking get it on the stream (`StreamEvent::
+/// Reasoning`), where the field is present only when the entry protocol is one
+/// that can carry it.
 pub fn render_response(resp: &ChatResponse) -> Value {
     let mut message = serde_json::Map::new();
     let text: String = resp
@@ -381,6 +492,17 @@ pub fn render_stream_event(model: &str, ev: &StreamEvent) -> Vec<Value> {
             "model": model,
             "choices": [{"index": 0, "delta": {"tool_calls": [{"index": index, "function": {"arguments": partial_json}}]}, "finish_reason": null}]
         })],
+        // `reasoning_content`: the field DeepSeek and most OpenAI-compatible
+        // providers actually stream thinking in. Emitted as its own delta, never
+        // merged into `content`, so a client that ignores the field still sees
+        // exactly the answer it saw before.
+        StreamEvent::Reasoning { text } => vec![json!({
+            "id": format!("chatcmpl-gw{}", uuid::Uuid::new_v4().simple()),
+            "object": "chat.completion.chunk",
+            "created": chrono::Utc::now().timestamp(),
+            "model": model,
+            "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}]
+        })],
         StreamEvent::Finish { reason, usage } => {
             let mut frames = vec![json!({
                 "id": format!("chatcmpl-gw{}", uuid::Uuid::new_v4().simple()),
@@ -413,6 +535,13 @@ pub fn render_stream_event(model: &str, ev: &StreamEvent) -> Vec<Value> {
 pub enum Classified {
     Ignore,
     Text(String),
+    /// Thinking delta from `reasoning_content` / `reasoning`.
+    Reasoning(String),
+    /// One delta that carried BOTH a thought and answer text. This variant
+    /// exists because `Classified` reports one frame at a time: choosing the
+    /// thought first and returning it alone silently deleted the answer text
+    /// whenever a provider put both in the same delta.
+    ReasoningAndText { reasoning: String, text: String },
     /// args carries any arguments that arrived in the SAME frame as the name
     /// (providers that emit a whole call at once); it is empty when the
     /// arguments follow in later ToolInput frames.
@@ -450,8 +579,20 @@ pub fn classify_upstream_frame(data: &str) -> Classified {
             return Classified::Finish { reason, usage };
         }
         if let Some(delta) = choice.get("delta") {
-            if let Some(t) = delta.get("content").and_then(|c| c.as_str()) {
-                if !t.is_empty() { return Classified::Text(t.to_string()); }
+            let think = ["reasoning_content", "reasoning"]
+                .iter()
+                .find_map(|k| delta.get(*k).and_then(|c| c.as_str()))
+                .filter(|t| !t.is_empty());
+            let text = delta.get("content").and_then(|c| c.as_str()).filter(|t| !t.is_empty());
+            // Both halves are reported together. Returning the thought first and
+            // dropping the text deleted real answer content; a frame carrying
+            // ONLY reasoning must still be reported rather than treated as
+            // ignorable.
+            match (think, text) {
+                (Some(r), Some(t)) => return Classified::ReasoningAndText { reasoning: r.to_string(), text: t.to_string() },
+                (Some(r), None) => return Classified::Reasoning(r.to_string()),
+                (None, Some(t)) => return Classified::Text(t.to_string()),
+                (None, None) => {}
             }
             if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                 for tc in tcs {

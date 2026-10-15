@@ -87,7 +87,71 @@ pub fn parse_request(body: &Value) -> anyhow::Result<ChatRequest> {
         stream: false, // caller sets based on :streamGenerateContent path
         tools,
         tool_choice: None, // Gemini uses toolConfig; rarely used — omitted v1
+        reasoning: parse_reasoning(obj),
     })
+}
+
+/// Gemini thinking knobs: `generationConfig.thinkingConfig`
+/// (`thinkingBudget`, `includeThoughts`) plus `reasoning_effort` for
+/// OpenAI-shaped clients routed into a Gemini exit.
+fn parse_reasoning(obj: &serde_json::Map<String, Value>) -> super::ir::ReasoningCfg {
+    let mut cfg = super::ir::ReasoningCfg::default();
+    let tc = obj.get("generationConfig").and_then(|v| v.pointer("/thinkingConfig"));
+    if let Some(b) = tc.and_then(|v| v.get("thinkingBudget")).and_then(|v| v.as_i64()) {
+        // Gemini uses 0 to disable and -1 for "dynamic"; only a positive value
+        // is a real budget. 0 is recorded as an explicit off switch.
+        if b > 0 {
+            cfg.budget_tokens = Some(b as u32);
+        } else if b == 0 {
+            cfg.enabled = Some(false);
+        }
+    }
+    if let Some(t) = tc.and_then(|v| v.get("includeThoughts")).and_then(|v| v.as_bool()) {
+        cfg.enabled = Some(t);
+    }
+    if let Some(e) = obj.get("reasoning_effort").and_then(|v| v.as_str()) {
+        cfg.effort = Some(e.to_string());
+    }
+    let mut fields = serde_json::Map::new();
+    if let Some(v) = tc {
+        fields.insert("thinkingConfig".to_string(), v.clone());
+    }
+    if let Some(v) = obj.get("reasoning_effort") {
+        fields.insert("reasoning_effort".to_string(), v.clone());
+    }
+    if !fields.is_empty() {
+        cfg.raw = Some(json!({"protocol": "gemini", "fields": fields}));
+    }
+    cfg
+}
+
+/// Emit the client's thinking request into Gemini's `generationConfig`.
+///
+/// `includeThoughts: true` is what makes Gemini return the thinking at all, so
+/// it is set whenever thinking is wanted -- without it Gemini accepts
+/// `thinkingBudget` and returns an answer with the thoughts stripped, which is
+/// indistinguishable from the bug being fixed.
+fn insert_reasoning(gen: &mut serde_json::Map<String, Value>, req: &ChatRequest) {
+    let r = &req.reasoning;
+    if r.is_empty() {
+        return;
+    }
+    if let Some(fields) = r.raw_for("gemini") {
+        for (k, v) in fields {
+            if k == "thinkingConfig" {
+                gen.insert("thinkingConfig".into(), v.clone());
+            } else {
+                gen.insert(k.clone(), v.clone());
+            }
+        }
+        return;
+    }
+    if !r.wants_thinking() {
+        gen.insert("thinkingConfig".into(), json!({"thinkingBudget": 0, "includeThoughts": false}));
+        return;
+    }
+    let budget = r.budget_or_effort().unwrap_or(8192);
+    gen.insert("thinkingConfig".into(), json!({"thinkingBudget": budget, "includeThoughts": true}));
 }
 
 pub fn render_upstream_request(req: &ChatRequest, model: &str, stream: bool) -> (String, Value) {
@@ -100,6 +164,9 @@ pub fn render_upstream_request(req: &ChatRequest, model: &str, stream: bool) -> 
         for c in &m.content {
             match c {
                 Content::Text { text } => parts.push(json!({"text": text})),
+                // Historical thinking is echoed back with the "thought" flag so
+                // Gemini still recognises it as reasoning rather than answer.
+                Content::Reasoning { text } => parts.push(json!({"text": text, "thought": true})),
                 Content::ImageUrl { url } => parts.push(json!({"text": format!("[image: {url}]")})),
                 Content::ImageData { media_type, data } => {
                     parts.push(json!({"inlineData": {"mimeType": media_type, "data": data}}))
@@ -124,6 +191,7 @@ pub fn render_upstream_request(req: &ChatRequest, model: &str, stream: bool) -> 
     if let Some(t) = req.temperature { gen.insert("temperature".into(), json!(t)); }
     if let Some(t) = req.top_p { gen.insert("topP".into(), json!(t)); }
     if !req.stop.is_empty() { gen.insert("stopSequences".into(), json!(req.stop)); }
+    insert_reasoning(&mut gen, req);
     if !gen.is_empty() { body.insert("generationConfig".into(), Value::Object(gen)); }
     if !req.tools.is_empty() {
         body.insert("tools".into(), json!([{"functionDeclarations": req.tools.iter().map(|t| json!({
@@ -142,7 +210,17 @@ pub fn parse_response(body: &Value, model_echo: &str) -> anyhow::Result<ChatResp
     let mut content: Vec<Content> = vec![];
     for p in cand.pointer("/content/parts").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
         if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
-            if !t.is_empty() { content.push(Content::Text { text: t.to_string() }); }
+            // Gemini marks a thinking part with "thought": true. Without this
+            // check the model's reasoning would be handed to the client as its
+            // answer -- which is exactly the failure mode seen on upstreams
+            // that do not set the flag (see classify_upstream_frame).
+            if !t.is_empty() {
+                if p.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    content.push(Content::Reasoning { text: t.to_string() });
+                } else {
+                    content.push(Content::Text { text: t.to_string() });
+                }
+            }
         }
         if let Some(fc) = p.get("functionCall") {
             content.push(Content::ToolUse {
@@ -168,11 +246,16 @@ pub fn parse_response(body: &Value, model_echo: &str) -> anyhow::Result<ChatResp
 }
 
 pub fn render_response(resp: &ChatResponse) -> Value {
+    // Gemini CAN carry a thought in a non-streaming body ("thought": true), and
+    // does not require a signature for it, so unlike Anthropic this one is
+    // forwarded rather than dropped. The old catch-all would have emitted a
+    // bogus empty text part instead.
     let parts: Vec<Value> = resp
         .content
         .iter()
         .map(|c| match c {
             Content::Text { text } => json!({"text": text}),
+            Content::Reasoning { text } => json!({"text": text, "thought": true}),
             Content::ToolUse { name, input, .. } => json!({"functionCall": {"name": name, "args": input}}),
             _ => json!({"text": ""}),
         })
@@ -197,6 +280,11 @@ pub fn render_stream_event(_model: &str, ev: &StreamEvent) -> Vec<Value> {
         StreamEvent::Start { .. } => vec![],
         StreamEvent::TextDelta { text, .. } => vec![json!({
             "candidates": [{"content": {"parts": [{"text": text}], "role": "model"}}]
+        })],
+        // "thought": true is how Gemini distinguishes a thinking part from the
+        // answer inside the same parts array.
+        StreamEvent::Reasoning { text } => vec![json!({
+            "candidates": [{"content": {"parts": [{"text": text, "thought": true}], "role": "model"}}]
         })],
         // Gemini's functionCall is whole-package: name + COMPLETE args in ONE
         // frame. Emitting an empty args object here and dropping the input
@@ -223,6 +311,8 @@ pub fn render_stream_event(_model: &str, ev: &StreamEvent) -> Vec<Value> {
 pub enum Classified {
     Ignore,
     Text(String),
+    /// Thinking part ("thought": true).
+    Reasoning(String),
     ToolCall { name: String, args: Value },
     Finish { reason: FinishReason, usage: Usage },
     Error(String),
@@ -239,7 +329,12 @@ pub fn classify_upstream_frame(data: &str) -> Classified {
         if let Some(parts) = cand.pointer("/content/parts").and_then(|p| p.as_array()) {
             for p in parts {
                 if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
-                    if !t.is_empty() { return Classified::Text(t.to_string()); }
+                    if !t.is_empty() {
+                        if p.get("thought").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            return Classified::Reasoning(t.to_string());
+                        }
+                        return Classified::Text(t.to_string());
+                    }
                 }
                 if let Some(fc) = p.get("functionCall") {
                     return Classified::ToolCall {

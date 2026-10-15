@@ -18,6 +18,11 @@ pub struct ChatRequest {
     pub stream: bool,
     pub tools: Vec<ir::Tool>,
     pub tool_choice: Option<ir::ToolChoice>,
+    /// The client's thinking/reasoning request. Default when unset. Without
+    /// this field the gateway silently deleted every thinking knob, because it
+    /// re-renders the upstream body from this struct rather than forwarding the
+    /// client's JSON.
+    pub reasoning: ir::ReasoningCfg,
 }
 
 #[derive(Debug, Clone)]
@@ -47,6 +52,9 @@ pub enum StreamEvent {
     /// for the None case: that silently corrupts the tool call.
     ToolUseStart { index: usize, id: String, name: String, args: Option<serde_json::Value> },
     ToolInputDelta { index: usize, partial_json: String },
+    /// Model thinking, streamed separately from the answer. Renderers that
+    /// cannot express it must drop it rather than append it to the text.
+    Reasoning { text: String },
     Finish { reason: ir::FinishReason, usage: ir::Usage },
 }
 

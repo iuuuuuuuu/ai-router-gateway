@@ -565,11 +565,23 @@ async fn attempt_stream(
 
     let mut frame_deadline = Instant::now() + budget.first_event_timeout;
 
+    // Thinking seen before the commit point. It cannot be sent as it arrives:
+    // the pre-commit region may still end in a retry, and a retry that had
+    // already streamed the reasoning would make the client show it twice.
+    // Collecting it here keeps the order and replays it as part of the commit.
+    let mut pre_reasoning: Vec<StreamEvent> = Vec::new();
+
     /// One classified upstream frame. Declared once here because the enum is
     /// not allowed to be the subject of a match while declared inside the loop.
     enum FrameClass {
         Ignore,
         Text(String),
+        /// Model thinking. Never enters the loop guard and never joins
+        /// `pending`: reasoning is not the answer, so neither a repetition in
+        /// it nor delaying it should affect the client's prose.
+        Reasoning(String),
+        /// One upstream delta that carried a thought AND answer text.
+        ReasoningAndText { reasoning: String, text: String },
         /// args = arguments that arrived in the SAME frame as the name (a whole
         /// call delivered at once); empty when they stream in as ToolInput.
         ToolUseStart { index: usize, id: String, name: String, args: String },
@@ -586,7 +598,7 @@ async fn attempt_stream(
     // that ended the holdback are one and the same commit, so a tool call
     // arriving after buffered text must carry that text with it instead of
     // discarding it.
-    let committed: Vec<StreamEvent> = loop {
+    let committed_tail: Vec<StreamEvent> = loop {
         let next = tokio::select! {
             ev = es.next() => ev,
             _ = sleep_until_std(frame_deadline) => {
@@ -617,6 +629,8 @@ async fn attempt_stream(
             Protocol::Openai => match openai::classify_upstream_frame(&data) {
                 CO::Ignore => FrameClass::Ignore,
                 CO::Text(t) => FrameClass::Text(t),
+                CO::Reasoning(t) => FrameClass::Reasoning(t),
+                CO::ReasoningAndText { reasoning, text } => FrameClass::ReasoningAndText { reasoning, text },
                 CO::ToolUseStart { index, id, name, args } => FrameClass::ToolUseStart { index, id, name, args },
                 CO::ToolInput { index, delta } => FrameClass::ToolInput { index, delta },
                 CO::Finish { reason, usage } => FrameClass::Finish { reason, usage: Some(usage) },
@@ -627,6 +641,7 @@ async fn attempt_stream(
                 CA::Ignore => FrameClass::Ignore,
                 CA::Start { input_tokens } => FrameClass::Start { input_tokens },
                 CA::Text(t) => FrameClass::Text(t),
+                CA::Reasoning(t) => FrameClass::Reasoning(t),
                 CA::ToolUseStart { index, id, name, args } => FrameClass::ToolUseStart { index, id, name, args },
                 CA::ToolInput { index, delta } => FrameClass::ToolInput { index, delta },
                 CA::Finish { reason, usage } => FrameClass::Finish { reason, usage: Some(usage) },
@@ -636,6 +651,7 @@ async fn attempt_stream(
             Protocol::Gemini => match gemini::classify_upstream_frame(&data) {
                 CG::Ignore => FrameClass::Ignore,
                 CG::Text(t) => FrameClass::Text(t),
+                CG::Reasoning(t) => FrameClass::Reasoning(t),
                 CG::ToolCall { name, args } => FrameClass::ToolCallFull { name, args },
                 CG::Finish { reason, usage } => FrameClass::Finish { reason, usage: Some(usage) },
                 CG::Error(m) => FrameClass::Error(m),
@@ -663,6 +679,37 @@ async fn attempt_stream(
                     }];
                 }
                 return Err((ProxyError::EmptyResponse, usage_acc));
+            }
+            FrameClass::Reasoning(t) => {
+                // Thinking is held separately and never enters `pending`. It is
+                // not part of the answer, so a repetition inside a scratchpad is
+                // not the degenerate output the guard exists to stop (see
+                // docs/loopguard-spec.md §2). It is buffered rather than sent
+                // because this region may still end in a retry.
+                pre_reasoning.push(StreamEvent::Reasoning { text: t });
+                continue;
+            }
+            FrameClass::ReasoningAndText { reasoning, text } => {
+                // One delta, two destinations: the thought is buffered for the
+                // commit list, the text goes through the normal holdback and
+                // loop-guard path. Dropping either half loses real content.
+                pre_reasoning.push(StreamEvent::Reasoning { text: reasoning });
+                if let Some(hit) = guard.push(&text) {
+                    return Err((
+                        ProxyError::DegenerateOutput { unit: hit.unit, repeats: hit.repeats },
+                        usage_acc,
+                    ));
+                }
+                pending.push_str(&text);
+                if pending.chars().count() >= hold {
+                    // The post-loop merge prepends `pre_reasoning`, so this
+                    // commit list carries the thinking in front of the text.
+                    break vec![StreamEvent::TextDelta {
+                        text: std::mem::take(&mut pending),
+                        finish: None,
+                    }];
+                }
+                continue;
             }
             FrameClass::Text(t) => {
                 // Only text is judged. A repetition is a property of prose, not
@@ -731,6 +778,11 @@ async fn attempt_stream(
     };
 
     // COMMITTED (or empty-but-valid). Client still received zero bytes.
+    // Thinking precedes the answer in the commit list because that is the order
+    // the upstream produced it in; a client rendering both must not see the
+    // reasoning after the text it explains.
+    let mut committed = pre_reasoning;
+    committed.extend(committed_tail);
     let (outcome_tx, outcome_rx) = tokio::sync::oneshot::channel::<StreamOutcome>();
     let entry = ctx.entry;
     let exposed_name = ctx.exposed_model.clone();
@@ -835,6 +887,8 @@ async fn attempt_stream(
                 Protocol::Openai => match openai::classify_upstream_frame(&data) {
                     CO::Ignore => FrameClass::Ignore,
                     CO::Text(t) => FrameClass::Text(t),
+                    CO::Reasoning(t) => FrameClass::Reasoning(t),
+                    CO::ReasoningAndText { reasoning, text } => FrameClass::ReasoningAndText { reasoning, text },
                     CO::ToolUseStart { index, id, name, args } => FrameClass::ToolUseStart { index, id, name, args },
                     CO::ToolInput { index, delta } => FrameClass::ToolInput { index, delta },
                     CO::Finish { reason, usage } => FrameClass::Finish { reason, usage: Some(usage) },
@@ -845,6 +899,7 @@ async fn attempt_stream(
                     CA::Ignore => FrameClass::Ignore,
                     CA::Start { input_tokens } => FrameClass::Start { input_tokens },
                     CA::Text(t) => FrameClass::Text(t),
+                    CA::Reasoning(t) => FrameClass::Reasoning(t),
                     CA::ToolUseStart { index, id, name, args } => FrameClass::ToolUseStart { index, id, name, args },
                     CA::ToolInput { index, delta } => FrameClass::ToolInput { index, delta },
                     CA::Finish { reason, usage } => FrameClass::Finish { reason, usage: Some(usage) },
@@ -854,6 +909,7 @@ async fn attempt_stream(
                 Protocol::Gemini => match gemini::classify_upstream_frame(&data) {
                     CG::Ignore => FrameClass::Ignore,
                     CG::Text(t) => FrameClass::Text(t),
+                    CG::Reasoning(t) => FrameClass::Reasoning(t),
                     CG::ToolCall { name, args } => FrameClass::ToolCallFull { name, args },
                     CG::Finish { reason, usage } => FrameClass::Finish { reason, usage: Some(usage) },
                     CG::Error(m) => FrameClass::Error(m),
@@ -870,6 +926,30 @@ async fn attempt_stream(
                     feed_repair(&feed, entry, &m).await;
                     if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
                     return;
+                }
+                FrameClass::Reasoning(t) => {
+                    // Forward immediately: thinking is not judged and not held
+                    // back, for the same reasons as the pre-commit path.
+                    feed_emit(&feed, entry, &StreamEvent::Reasoning { text: t }, &exposed_name).await;
+                }
+                FrameClass::ReasoningAndText { reasoning, text } => {
+                    // Emit the thought, then run the text through the SAME
+                    // post-commit detection as a plain Text frame: a mixed
+                    // delta must not become a hole in the guard's coverage.
+                    feed_emit(&feed, entry, &StreamEvent::Reasoning { text: reasoning }, &exposed_name).await;
+                    if let Some(hit) = guard.push_tail(&text) {
+                        loop_truncated = true;
+                        feed_emit(
+                            &feed, entry,
+                            &StreamEvent::Finish { reason: ir::FinishReason::Length, usage: final_usage.clone() },
+                            &exposed_name,
+                        ).await;
+                        flush_tool(&feed, entry, &exposed_name, &mut pending_tool).await;
+                        feed_close_clean(&feed, entry).await;
+                        if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
+                        return;
+                    }
+                    feed_emit(&feed, entry, &StreamEvent::TextDelta { text, finish: None }, &exposed_name).await;
                 }
                 FrameClass::Text(t) => {
                     // POST-COMMIT detection. The bytes already sent cannot be

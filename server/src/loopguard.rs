@@ -17,6 +17,32 @@ use std::collections::VecDeque;
 /// copied into `LoopHit::unit` (char-boundary safe by construction).
 const UNIT_SNIPPET_CHARS: usize = 120;
 
+/// R6 (`detect_loose`) bounds. The repeated unit is bounded so the scan stays
+/// cheap on a long window, and the trailing remark is bounded so it can never
+/// itself become the "repetition" R6 finds.
+const LOOSE_UNIT_MAX_CHARS: usize = 128;
+const LOOSE_TRAILER_CHARS: usize = 32;
+
+/// Does this span contain a blank line -- a line break with only whitespace
+/// after it? A single line break is ordinary formatting; a blank line inside a
+/// repetition means layout interrupted content, which is what R6 keys on.
+fn has_blank_line(chars: &[char]) -> bool {
+    let mut seen_break = false;
+    for &ch in chars {
+        match ch {
+            '\n' => {
+                if seen_break {
+                    return true;
+                }
+                seen_break = true;
+            }
+            c if c.is_whitespace() => {}
+            _ => seen_break = false,
+        }
+    }
+    false
+}
+
 /// Runtime configuration for degenerate-repeat detection, normalized from
 /// `RetryConfig` and clamped into a safe range.
 #[derive(Debug, Clone, Copy)]
@@ -124,7 +150,10 @@ impl LoopGuard {
             return None;
         }
         self.append(delta);
-        self.detect()
+        // The strict suffix rule first -- it is the cheaper scan and the one the
+        // existing tests pin down -- then the whitespace-tolerant rule it cannot
+        // see. Both stay PRE-COMMIT: here a hit costs the client zero bytes.
+        self.detect().or_else(|| self.detect_loose(self.window.len(), self.cfg.min_chars))
     }
 
     /// Post-commit counterpart of `push`: accumulate the delta and judge only
@@ -179,6 +208,101 @@ impl LoopGuard {
         // `tail_chars` smaller than `min_chars` (e.g. 32 vs 64) silently
         // impossible to satisfy.
         self.detect_span(self.cfg.tail_chars, 2)
+            .or_else(|| self.detect_loose(self.cfg.tail_chars, 2))
+    }
+
+    /// R6, the whitespace-tolerant fallback for R1-R5.
+    ///
+    /// The suffix rule needs the repeated unit to sit *contiguously* at the
+    /// window tail, so a model that repeats a unit and then separates the runs
+    /// with blank lines slips through (the newlines break the shift-compare on
+    /// its first step). Worse, R5 skips candidate unit lengths inside a trailing
+    /// blank run, which is exactly where such tail sits.
+    ///
+    /// R6 asks a slightly weaker question: ignore whitespace entirely, then look
+    /// for one unit repeated at the tail of what is left. A model that emits
+    /// "hello " 22 times around two blank lines is repeating the same unit; the
+    /// blank lines are formatting, not evidence of thought.
+    ///
+    /// Deliberately narrow, so the weaker question does not become a
+    /// false-positive machine:
+    ///   * the span must contain a blank line (a line break with only
+    ///     whitespace after it). A single newline is ordinary prose formatting;
+    ///     a blank line inside a repetition is a strong "I am looping" signal,
+    ///     and requiring it keeps every existing single-line case untouched.
+    ///   * the threshold rules R2/R3/R4 are reused unchanged -- only R1's notion
+    ///     of "contiguous" is relaxed, not the amount of evidence required.
+    ///   * the repeated unit must contain an alphanumeric character, so runs of
+    ///     pure punctuation or separators stay invisible (R5's concern, kept).
+    ///   * a short TRAILER of characters may follow the repetition, because the
+    ///     live shapes end with a remark like "（共 20 遍）" that the model adds
+    ///     as a self-summary. Without it, the remark would hide the loop behind
+    ///     itself -- the exact failure this rule exists to fix.
+    fn detect_loose(&self, n: usize, min_span: usize) -> Option<LoopHit> {
+        let len = self.window.len();
+        let n = n.min(len);
+        if n < 2 || n < min_span {
+            return None; // R1
+        }
+        let start = len - n;
+        let span = self.window.range(start..len).copied().collect::<Vec<char>>();
+        if !has_blank_line(&span) {
+            return None;
+        }
+        // Collapse whitespace: R6 judges shape, not layout.
+        let dense: Vec<char> = span.into_iter().filter(|c| !c.is_whitespace()).collect();
+        let m = dense.len();
+        if m < 2 {
+            return None;
+        }
+        // The remark after the repetition; bounded, so it cannot become the
+        // repetition itself.
+        let trailer_max = LOOSE_TRAILER_CHARS.min(m.saturating_sub(1));
+        let mut best: Option<(usize, usize, usize)> = None; // (covered, unit_len, tail_end)
+        for end in (m - trailer_max)..=m {
+            let max_unit = (end / 2).min(LOOSE_UNIT_MAX_CHARS);
+            for unit_len in 1..=max_unit {
+                // Cheap pre-filter, exactly as in detect_span.
+                if dense[end - 1] != dense[end - 1 - unit_len] {
+                    continue;
+                }
+                let mut repeats = 0usize;
+                while (repeats + 1) * unit_len <= end
+                    && dense[end - (repeats + 1) * unit_len..end - repeats * unit_len]
+                        == dense[end - unit_len..end]
+                {
+                    repeats += 1;
+                }
+                if repeats < 2 {
+                    continue;
+                }
+                let covered = repeats * unit_len;
+                if (repeats as u32) < self.cfg.max_repeats {
+                    continue; // R2
+                }
+                if covered < self.cfg.repeat_min_chars {
+                    continue; // R3
+                }
+                if (covered as f64) < self.cfg.repeat_ratio * (m as f64) {
+                    continue; // R4, over the collapsed span
+                }
+                let unit = &dense[end - unit_len..end];
+                if !unit.iter().any(|c| c.is_alphanumeric()) {
+                    continue; // the R5 concern, restated for a collapsed span
+                }
+                if best.map_or(true, |(b, _, _)| covered > b) {
+                    best = Some((covered, unit_len, end));
+                }
+                if covered == m {
+                    break;
+                }
+            }
+        }
+        best.map(|(covered, unit_len, end)| LoopHit {
+            unit: dense[end - unit_len..end].iter().collect::<String>().chars().take(UNIT_SNIPPET_CHARS).collect(),
+            repeats: (covered / unit_len) as u32,
+            chars: covered,
+        })
     }
 
     /// R1-R5 over every candidate `unit_len` of the LAST `n` characters.
@@ -521,5 +645,177 @@ mod tests {
         let text = format!("{}{}", " ".repeat(300), frame.repeat(113));
         assert_eq!(text.chars().count(), 1204);
         assert!(hit(&text).is_none(), "covered 896 < 0.75 * 1204 = 903 is correctly not a hit");
+    }
+
+    /// R6 regression: the shapes that motivated it. Each replays the LIVE call
+    /// R6 regression: the shapes that motivated it. Each replays the LIVE call
+    /// sequence -- 12-char frames from the upstream, pre-commit push() until the
+    /// window reaches min_chars, then post-commit push_tail(). A whole-string
+    /// push gives different answers, because a pure-repetition moment can fall
+    /// between frames; the frame stride is what the gateway actually sees.
+    ///
+    /// Shape c is the one the R1-R5 suffix rule cannot see at all: the model
+    /// repeats a unit, inserts a blank line, repeats it again, and closes with a
+    /// one-line remark. Before R6 it streamed to completion uncaught.
+    #[test]
+    fn t22_blank_line_separated_runs_are_caught_pre_commit() {
+        let hello = "hello ";
+        let frame = "好的，我来处理。";
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "两段 hello 复读 + 结尾说明",
+                format!("{}\n\n{}\n\n（共 20 遍）", hello.repeat(11), hello.repeat(11)),
+            ),
+            (
+                "两段中文帧复读 + 结尾说明",
+                format!("{}\n\n{}\n\n（共 12 遍）", frame.repeat(6), frame.repeat(6)),
+            ),
+            (
+                "两段各四次 + 结尾说明",
+                format!("{}\n\n{}\n\n（共 8 遍）", frame.repeat(4), frame.repeat(4)),
+            ),
+        ];
+        let mut stride = |text: &str| -> (bool, Option<LoopHit>) {
+            let chars: Vec<char> = text.chars().collect();
+            let mut g = LoopGuard::new(&cfg());
+            let mut committed = false;
+            for chunk in chars.chunks(12) {
+                let piece: String = chunk.iter().collect();
+                if !committed {
+                    if let Some(h) = g.push(&piece) {
+                        return (false, Some(h)); // pre-commit: the client saw nothing
+                    }
+                    if g.window_len() >= cfg().min_chars {
+                        committed = true;
+                    }
+                } else if let Some(h) = g.push_tail(&piece) {
+                    return (true, Some(h));
+                }
+            }
+            (committed, None)
+        };
+        for (name, text) in cases {
+            let (post, hit) = stride(&text);
+            assert!(!post, "{name}: must be caught PRE-commit, so the retry stays invisible");
+            let h = hit.unwrap_or_else(|| panic!("{name} must be caught, not streamed to completion"));
+            assert!(h.repeats >= cfg().max_repeats, "{name}: repeats {} below max_repeats", h.repeats);
+            assert!(h.chars >= cfg().repeat_min_chars, "{name}: covered {} below repeat_min_chars", h.chars);
+            assert!(
+                h.unit.chars().any(|c| c.is_alphanumeric()),
+                "{name}: the unit must carry content, got {:?}",
+                h.unit
+            );
+        }
+    }
+
+    /// The boundary of the above: an answer shorter than the pre-commit holdback
+    /// is never judged, and that is correct -- a 59-character answer cannot ruin
+    /// a response, and holding it back to inspect it would add latency for
+    /// nothing. Recorded so the limit stays visible instead of looking like a bug.
+    #[test]
+    fn t23_short_blank_line_shapes_are_below_the_judged_window() {
+        let frame = "好的，我来处理。";
+        let text = format!("{}\n\n{}\n\n（共 6 遍）", frame.repeat(3), frame.repeat(3));
+        assert_eq!(text.chars().count(), 59);
+        assert!(text.chars().count() < cfg().min_chars);
+        assert!(hit(&text).is_none(), "below min_chars nothing is judged");
+    }
+
+    /// R6 must not fire on ordinary multi-paragraph prose, lists, headings or
+    /// separators: the blank-line requirement plus the reused R2/R3/R4
+    /// thresholds are what keep it narrow. These are the closest normal shapes
+    /// to a loop, replayed through the live frame stride.
+    #[test]
+    fn t24_blank_line_formatting_alone_is_not_a_hit() {
+        let paragraph = |n: usize| {
+            (0..n)
+                .map(|i| {
+                    format!(
+                        "第 {} 段：这一段说明配置项的含义、默认值与取值范围，越界之后网关会如何处理。\n",
+                        i + 1
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let cases: Vec<(&str, String)> = vec![
+            ("多段散文 6 段", paragraph(6)),
+            ("多段散文 12 段", paragraph(12)),
+            (
+                "清单 5 条相同",
+                format!("{}\n\n共 5 项待确认", (0..5).map(|_| "- 待确认".to_string()).collect::<Vec<_>>().join("\n")),
+            ),
+            ("markdown 小节标题", "\n\n# 一、概述\n\n## 二、配置\n\n### 三、部署".to_string()),
+            ("分隔线 + 空行说明", format!("{}\n\n以上是分隔线", "-".repeat(40))),
+            (
+                "正文 + 空行 + 四行不同表格",
+                format!("补充说明如下。\n\n| 项 | 值 |\n|---|---|\n| a | 1 |\n| b | 2 |\n| c | 3 |"),
+            ),
+            ("纯换行", "\n".repeat(200)),
+            ("纯空格", " ".repeat(200)),
+        ];
+        for (name, text) in cases {
+            let chars: Vec<char> = text.chars().collect();
+            let mut g = LoopGuard::new(&cfg());
+            let mut committed = false;
+            let mut fired = None;
+            for chunk in chars.chunks(12) {
+                let piece: String = chunk.iter().collect();
+                if !committed {
+                    if let Some(h) = g.push(&piece) {
+                        fired = Some(format!("PRE n={} unit={:?} x{}", g.window_len(), h.unit, h.repeats));
+                        break;
+                    }
+                    if g.window_len() >= cfg().min_chars {
+                        committed = true;
+                    }
+                } else if let Some(h) = g.push_tail(&piece) {
+                    fired = Some(format!("POST n={} unit={:?} x{}", g.window_len(), h.unit, h.repeats));
+                    break;
+                }
+            }
+            assert!(fired.is_none(), "{name} must not be judged a loop, but got {fired:?}");
+        }
+    }
+
+    /// The post-commit half of R6 is load-bearing too. Once the answer is
+    /// committed the bytes are gone, so the only question is how MUCH leaks
+    /// before the truncation. Both cases below end in a blank line followed by
+    /// more of the same unit, which the contiguous tail rule cannot join up;
+    /// without the loose rule they either miss the tail window entirely or
+    /// declare later with a narrower unit.
+    #[test]
+    fn t25_post_commit_loose_tail_catches_sooner() {
+        let hello = "hello ";
+        let prose: String = (0..80).map(|i| char::from_u32(0x4E00 + i).unwrap()).collect();
+        // Blank line inside the last 128 characters: the contiguous rule sees
+        // only the short run after the blank line and stays under R4.
+        let text = format!("{prose}{}\n\n{}", hello.repeat(6), hello.repeat(14));
+        let chars: Vec<char> = text.chars().collect();
+        let mut g = LoopGuard::new(&cfg());
+        let mut committed = false;
+        let mut emitted = 0usize;
+        let mut hit = None;
+        for chunk in chars.chunks(12) {
+            let piece: String = chunk.iter().collect();
+            if !committed {
+                assert!(g.push(&piece).is_none(), "this case must reach the post-commit path");
+                if g.window_len() >= cfg().min_chars {
+                    committed = true;
+                    emitted = g.window_len();
+                }
+            } else {
+                emitted += chunk.len();
+                if let Some(h) = g.push_tail(&piece) {
+                    hit = Some(h);
+                    break;
+                }
+            }
+        }
+        let h = hit.expect("a blank line inside the tail window must not hide the repetition");
+        assert_eq!(h.unit, "hello", "the collapsed unit has no trailing space");
+        assert_eq!(h.repeats, 18);
+        assert_eq!(h.chars, 90);
+        assert_eq!(emitted, 192, "the leak is bounded by the tail window, not the whole tail");
     }
 }

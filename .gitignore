@@ -113,6 +113,14 @@ Desktop.ini
 /tools/_cfg-shape.mjs
 /tools/_slow-upstream.mjs
 /tools/_midloop-upstream.mjs
+/tools/_echo-upstream.mjs
+/tools/_diag-reasoning.mjs
+/tools/_diag-loop-repro.mjs
+/tools/_diag-reasoning-resp.mjs
+/tools/_diag-loop-rate.mjs
+/tools/_shapes-upstream.mjs
+/tools/_diag-shapes.mjs
+/tools/_diag-r4.mjs
 /tools/_build-client.sh
 /tools/_accept-looptail.mjs
 /tools/_accept-keycopy.mjs

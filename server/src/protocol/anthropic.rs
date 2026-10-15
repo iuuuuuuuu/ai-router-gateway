@@ -111,7 +111,65 @@ pub fn parse_request(body: &Value) -> anyhow::Result<ChatRequest> {
         top_p: obj.get("top_p").and_then(|v| v.as_f64()),
         stop, stream: obj.get("stream").and_then(|v| v.as_bool()).unwrap_or(false),
         tools, tool_choice,
+        reasoning: parse_reasoning(obj),
     })
+}
+
+/// Anthropic thinking knobs: `thinking: {type: "enabled"|"disabled", budget_tokens}`.
+/// `reasoning_effort` is also read because OpenAI-shaped clients routed into an
+/// Anthropic exit still mean the same thing by it.
+fn parse_reasoning(obj: &serde_json::Map<String, Value>) -> super::ir::ReasoningCfg {
+    let mut cfg = super::ir::ReasoningCfg::default();
+    let thinking = obj.get("thinking");
+    if let Some(t) = thinking.and_then(|v| v.get("type")).and_then(|v| v.as_str()) {
+        cfg.enabled = Some(t == "enabled");
+    }
+    if let Some(b) = thinking.and_then(|v| v.get("budget_tokens")).and_then(|v| v.as_u64()) {
+        cfg.budget_tokens = Some(b as u32);
+    }
+    if let Some(e) = obj.get("reasoning_effort").and_then(|v| v.as_str()) {
+        cfg.effort = Some(e.to_string());
+    }
+    let mut fields = serde_json::Map::new();
+    for key in ["thinking", "reasoning_effort"] {
+        if let Some(v) = obj.get(key) {
+            fields.insert(key.to_string(), v.clone());
+        }
+    }
+    if !fields.is_empty() {
+        cfg.raw = Some(json!({"protocol": "anthropic", "fields": fields}));
+    }
+    cfg
+}
+
+/// Emit the client's thinking request into an Anthropic-shaped body.
+///
+/// Anthropic expresses thinking as an explicit token budget, so the IR's budget
+/// is used directly and an effort-only request is translated (see
+/// `ReasoningCfg::budget_or_effort`). The client's own `thinking` object wins
+/// when it spoke Anthropic: that is the only path that cannot mis-translate an
+/// option we do not model.
+fn insert_reasoning(body: &mut serde_json::Map<String, Value>, req: &ChatRequest) {
+    let r = &req.reasoning;
+    if r.is_empty() {
+        return;
+    }
+    if let Some(fields) = r.raw_for("anthropic") {
+        for (k, v) in fields {
+            body.insert(k.clone(), v.clone());
+        }
+        return;
+    }
+    if !r.wants_thinking() {
+        body.insert("thinking".into(), json!({"type": "disabled"}));
+        return;
+    }
+    if let Some(b) = r.budget_or_effort() {
+        // Anthropic requires budget_tokens >= 1024; a smaller value is a 400.
+        body.insert("thinking".into(), json!({"type": "enabled", "budget_tokens": b.max(1024)}));
+    } else {
+        body.insert("thinking".into(), json!({"type": "enabled"}));
+    }
 }
 
 pub fn render_upstream_request(req: &ChatRequest, model: &str, stream: bool) -> Value {
@@ -123,6 +181,11 @@ pub fn render_upstream_request(req: &ChatRequest, model: &str, stream: bool) -> 
             .iter()
             .map(|c| match c {
                 Content::Text { text } => json!({"type": "text", "text": text}),
+                // Anthropic echoes prior thinking back as a thinking block, but
+                // only with a signature we do not hold. Replaying it unsigned is
+                // rejected, so historical reasoning is dropped from the request
+                // rather than sent malformed.
+                Content::Reasoning { .. } => json!({"type": "text", "text": ""}),
                 Content::ImageUrl { url } => json!({"type": "image", "source": {"type": "url", "url": url}}),
                 Content::ImageData { media_type, data } => {
                     json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})
@@ -149,6 +212,7 @@ pub fn render_upstream_request(req: &ChatRequest, model: &str, stream: bool) -> 
     if let Some(t) = req.temperature { body.insert("temperature".into(), json!(t)); }
     if let Some(t) = req.top_p { body.insert("top_p".into(), json!(t)); }
     if !req.stop.is_empty() { body.insert("stop_sequences".into(), json!(req.stop)); }
+    insert_reasoning(&mut body, req);
     if !req.tools.is_empty() {
         body.insert("tools".into(), json!(req.tools.iter().map(|t| json!({
             "name": t.name, "description": t.description, "input_schema": t.input_schema
@@ -176,6 +240,13 @@ pub fn parse_response(body: &Value, model_echo: &str) -> anyhow::Result<ChatResp
     for b in body.get("content").and_then(|v| v.as_array()).unwrap_or(&vec![]) {
         match b.get("type").and_then(|v| v.as_str()) {
             Some("text") => content.push(Content::Text { text: b.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string() }),
+            // A thinking block, kept as thinking. is_error/redacted blocks carry
+            // no readable text, so they contribute nothing.
+            Some("thinking") => {
+                if let Some(t) = b.get("thinking").and_then(|v| v.as_str()) {
+                    if !t.is_empty() { content.push(Content::Reasoning { text: t.to_string() }); }
+                }
+            }
             Some("tool_use") => content.push(Content::ToolUse {
                 id: b.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 name: b.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
@@ -201,13 +272,21 @@ pub fn parse_response(body: &Value, model_echo: &str) -> anyhow::Result<ChatResp
 }
 
 pub fn render_response(resp: &ChatResponse) -> Value {
+    // Reasoning is DROPPED here, deliberately. Anthropic validates the
+    // `signature` of a thinking block when a client replays it in a later
+    // assistant turn, and the IR does not carry that signature, so emitting an
+    // unsigned block would turn a working multi-turn conversation into a 400.
+    // Dropping it is the only option that cannot break the next request. (The
+    // streaming path still forwards thinking: a streamed thinking_delta needs no
+    // signature, so nothing is lost for clients that read it live.)
     let blocks: Vec<Value> = resp
         .content
         .iter()
-        .map(|c| match c {
-            Content::Text { text } => json!({"type": "text", "text": text}),
-            Content::ToolUse { id, name, input } => json!({"type": "tool_use", "id": id, "name": name, "input": input}),
-            _ => json!({"type": "text", "text": ""}),
+        .filter_map(|c| match c {
+            Content::Text { text } => Some(json!({"type": "text", "text": text})),
+            Content::ToolUse { id, name, input } => Some(json!({"type": "tool_use", "id": id, "name": name, "input": input})),
+            Content::Reasoning { .. } => None,
+            _ => Some(json!({"type": "text", "text": ""})),
         })
         .collect();
     json!({
@@ -256,6 +335,13 @@ pub fn render_stream_event(model: &str, ev: &StreamEvent) -> Vec<(String, Value)
         StreamEvent::ToolInputDelta { index, partial_json } => vec![("content_block_delta".into(), json!({
             "type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": partial_json}
         }))],
+        // `thinking_delta` is Anthropic's own name for a streamed reasoning
+        // chunk. Index 0 matches how text is emitted here (this exit does not
+        // emit a content_block_start for text either), so a client that ignores
+        // thinking sees an unchanged stream.
+        StreamEvent::Reasoning { text } => vec![("content_block_delta".into(), json!({
+            "type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": text}
+        }))],
         StreamEvent::Finish { reason, usage } => vec![
             ("message_delta".into(), json!({
                 "type": "message_delta",
@@ -283,6 +369,8 @@ pub enum Classified {
     Ignore,
     Start { input_tokens: u64 },
     Text(String),
+    /// Thinking delta from a `thinking_delta` content block.
+    Reasoning(String),
     /// args carries any input delivered in the SAME frame as the name; it is
     /// empty when the input follows in input_json_delta events.
     ToolUseStart { index: usize, id: String, name: String, args: String },
@@ -327,6 +415,9 @@ pub fn classify_upstream_event(event: &str, data: &str) -> Classified {
             let delta = v.get("delta");
             match delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()) {
                 Some("text_delta") => Classified::Text(delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()).unwrap_or("").to_string()),
+                Some("thinking_delta") => Classified::Reasoning(
+                    delta.and_then(|d| d.get("thinking")).and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                ),
                 Some("input_json_delta") => Classified::ToolInput {
                     index: v.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize,
                     delta: delta.and_then(|d| d.get("partial_json")).and_then(|p| p.as_str()).unwrap_or("").to_string(),

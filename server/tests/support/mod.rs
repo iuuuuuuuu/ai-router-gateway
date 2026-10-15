@@ -87,6 +87,27 @@ pub enum Behavior {
     /// guard's holdback) and then keeps the connection open for a while. Lets a
     /// test prove occupancy survives the commit, not just the header arrival.
     StreamSlow,
+    /// 200 + SSE whose single text delta is the REQUEST BODY this upstream
+    /// received. The only fixture that observes the forwarded wire form, so a
+    /// passthrough claim can be checked against real bytes.
+    EchoBody,
+    /// The real-world shape: a repeated run, a blank line, the run again, then
+    /// a concluding remark. Emitted in 12-char frames like the live upstream.
+    BlankLineRepeatShape,
+    /// One OpenAI delta carrying BOTH content and reasoning_content.
+    ReasoningAndTextSameFrame,
+    /// OpenAI SSE: reasoning_content deltas, then answer text.
+    ReasoningStream,
+    /// OpenAI SSE: a frame carrying ONLY reasoning_content, then the answer.
+    ReasoningOnly,
+    /// Anthropic SSE: a thinking_delta content block, then a text block.
+    GoodAnthropicReasoningStream,
+    /// Gemini SSE: a part flagged "thought": true, then the answer part.
+    GoodGeminiReasoningStream,
+    /// Buffered OpenAI JSON whose message carries reasoning_content.
+    GoodOpenAiReasoningJson,
+    /// Buffered Anthropic JSON whose content has a thinking block then text.
+    GoodAnthropicReasoningJson,
 }
 
 async fn handle_beh(beh: Behavior, body: String, hdrs: axum::http::HeaderMap, prefix: &str) -> axum::response::Response {
@@ -367,6 +388,103 @@ async fn handle_beh(beh: Behavior, body: String, hdrs: axum::http::HeaderMap, pr
             sse.push_str(&openai_tail_sse("tool_calls"));
             ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
         }
+        Behavior::EchoBody => {
+            // Reply with the REQUEST BODY this upstream received, as one OpenAI
+            // text delta. A test can then assert on the exact bytes the gateway
+            // forwarded instead of trusting that a field "should" be present:
+            // this is the only fixture that observes the upstream wire form.
+            let sse = openai_text_chunk(&serde_json::json!({ "echo": body }).to_string());
+            let mut full = sse;
+            full.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], full).into_response()
+        }
+        Behavior::BlankLineRepeatShape => {
+            // The shape from the real-world report: the same run of text, a
+            // blank line, the run again, then the model's own concluding remark
+            // ("（共 20 遍）"). Fed in 12-char frames because that is the stride
+            // the live upstream uses, and the guard only ever sees frame
+            // boundaries -- a whole-string feed can answer differently.
+            let mut sse = String::new();
+            let text = format!("{0}\n\n{0}\n\n（共 20 遍）", "hello ".repeat(11));
+            let chars: Vec<char> = text.chars().collect();
+            for chunk in chars.chunks(12) {
+                sse.push_str(&openai_text_chunk(&chunk.iter().collect::<String>()));
+            }
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::ReasoningAndTextSameFrame => {
+            // Some providers put reasoning AND content in ONE delta. Whichever
+            // the classifier reports first, the other must not be lost.
+            let mut sse = String::new();
+            sse.push_str(&sse_frame(&serde_json::json!({"choices":[{"index":0,"delta":{"content":"BOTH-TEXT","reasoning_content":"BOTH-THOUGHT"}}]}).to_string()));
+            sse.push_str(&openai_text_chunk(" tail"));
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::ReasoningStream => {
+            // thinking deltas interleaved with answer text -- reasoning arrives
+            // BEFORE the prose in the real providers' shape.
+            let mut sse = String::new();
+            sse.push_str(&sse_frame(&serde_json::json!({"choices":[{"index":0,"delta":{"reasoning_content":"let me think"}}]}).to_string()));
+            sse.push_str(&sse_frame(&serde_json::json!({"choices":[{"index":0,"delta":{"reasoning_content":" about this"}}]}).to_string()));
+            sse.push_str(&openai_text_chunk("the answer"));
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::ReasoningOnly => {
+            // A frame carrying ONLY reasoning must not be mistaken for the
+            // answer: before the fix it was classified as ignorable.
+            let mut sse = String::new();
+            sse.push_str(&sse_frame(&serde_json::json!({"choices":[{"index":0,"delta":{"reasoning_content":"THOUGHT-MARKER"}}]}).to_string()));
+            sse.push_str(&openai_text_chunk("final"));
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::GoodAnthropicReasoningStream => {
+            // Anthropic spells streamed thinking "thinking_delta"; the
+            // event framing is built with an explicit \n so the two-line
+            // SSE shape is exact.
+            let mut sse = String::new();
+            let ev = |name: &str, payload: serde_json::Value| format!("event: {name}\ndata: {payload}\n\n");
+            sse.push_str(&ev("message_start", serde_json::json!({"type":"message_start","message":{"usage":{"input_tokens":3}}})));
+            sse.push_str(&ev("content_block_delta", serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"ANTHRO-THOUGHT"}})));
+            sse.push_str(&ev("content_block_delta", serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}})));
+            sse.push_str(&ev("message_delta", serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}})));
+            sse.push_str(&ev("message_stop", serde_json::json!({"type":"message_stop"})));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::GoodGeminiReasoningStream => {
+            let mut sse = String::new();
+            sse.push_str(&sse_frame(&serde_json::json!({"candidates":[{"content":{"parts":[{"text":"GEMINI-THOUGHT","thought":true}],"role":"model"}}]}).to_string()));
+            sse.push_str(&sse_frame(&serde_json::json!({"candidates":[{"content":{"parts":[{"text":"answer"}],"role":"model"}}]}).to_string()));
+            sse.push_str(&sse_frame(&serde_json::json!({"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":5}}).to_string()));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::GoodOpenAiReasoningJson => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "id": "chatcmpl-x", "object": "chat.completion", "model": "m",
+                "choices": [{"index": 0, "message": {
+                    "role": "assistant",
+                    "reasoning_content": "JSON-THOUGHT",
+                    "content": "json answer"
+                }, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2}
+            })),
+        ).into_response(),
+        Behavior::GoodAnthropicReasoningJson => (
+            axum::http::StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "id": "msg_x", "type": "message", "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "ANTHRO-JSON-THOUGHT", "signature": "sig"},
+                    {"type": "text", "text": "anthropic answer"}
+                ],
+                "model": "claude-fake", "stop_reason": "end_turn", "stop_sequence": null,
+                "usage": {"input_tokens": 12, "output_tokens": 6}
+            })),
+        ).into_response(),
     }
 }
 

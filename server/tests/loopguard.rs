@@ -426,6 +426,31 @@ async fn l13c_a_normal_committed_answer_is_never_truncated() {
     assert_eq!(req["loop_truncated"], 0, "no truncation on a healthy answer: {req}");
 }
 
+/// The shape from the real-world report. Before the fix the loop guard let it
+/// through completely: two runs of the same text separated by a blank line are
+/// not CONTIGUOUS at the tail, so the suffix rule found nothing, and the whole
+/// duplicated answer reached the client.
+///
+/// Detection happens PRE-commit here (the duplicate starts well inside the
+/// holdback region), so the retry is invisible: the client sees only the good
+/// fallback answer and the interception is recorded as a loop retry.
+#[tokio::test]
+async fn l13e_blank_line_separated_runs_are_caught() {
+    let (st, router) = harness(&[Behavior::BlankLineRepeatShape, Behavior::GoodStream], 1, test_retry()).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200, "sse={sse}");
+
+    // The duplicated run must NOT reach the client: the fallback answered.
+    assert!(!sse.contains("hello hello hello"), "the duplicated run reached the client: {sse}");
+    assert!(sse.contains(GOOD), "missing the good answer: {sse}");
+    assert_stream_clean(&sse);
+
+    let req = newest_request_row(&st).await;
+    assert_eq!(req["loop_retries"], 1, "the interception must be recorded: {req}");
+    assert_eq!(req["attempts"], 2);
+    assert_eq!(req["status"], "success");
+}
+
 #[tokio::test]
 async fn l13d_truncation_can_be_disabled() {
     // The switch governs BOTH windows: turning the guard off must restore the
