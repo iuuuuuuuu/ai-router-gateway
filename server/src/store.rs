@@ -31,6 +31,39 @@ pub struct SwitchLog {
     pub message: String,
 }
 
+/// Chinese label for a failure class. One place, so the console, the switch
+/// log and the client-facing error message can never disagree about what a
+/// class is called.
+pub fn error_class_label(class: &str) -> &'static str {
+    match class {
+        // Exactly the strings router::classify_failure produces; a class with no
+        // arm here falls back to a readable generic rather than an empty string.
+        "degenerate_output" => "输出复读",
+        "auth_error" => "鉴权失败",
+        "model_not_found" => "模型不存在",
+        "rate_limited" => "被限流",
+        "http_5xx" => "上游服务端错误",
+        "bad_request" => "请求被拒绝",
+        "content_filter" => "内容被拦截",
+        "connect_timeout" => "连接超时",
+        "ttfb_timeout" => "首字节超时",
+        "first_event_timeout" => "首个事件超时",
+        "attempt_deadline" => "本次尝试超时",
+        "connect_error" => "连接失败",
+        "upstream_error_body" => "上游返回错误内容",
+        "not_sse_garbage" => "上游返回的不是有效流",
+        "empty_response" => "上游返回空内容",
+        "client_aborted" => "客户端已断开",
+        "committed" => "已提交",
+        // Loop-guard classes that are not failures of the upstream at all: the
+        // answer was corrected, or cut short on purpose. They must read as such
+        // in the log, not as a mystery "other error".
+        "loop_continue" => "复读后自动续写",
+        "loop_continue_exhausted" => "复读纠正次数用尽，已收尾",
+        _ => "其他错误",
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RequestLog {
     pub id: Option<i64>,
@@ -51,6 +84,16 @@ pub struct RequestLog {
     /// `loop_retries`: those attempts were discarded before the client saw a
     /// byte, whereas a truncated answer WAS delivered — just not in full.
     pub loop_truncated: i64,
+    /// How many correction rounds this answer needed (the model repeated
+    /// itself, was told why, and carried on). 0 means it never looped.
+    pub loop_continues: u32,
+    /// The failure cause of a terminal row, in the same vocabulary the switch
+    /// log uses (degenerate_output, auth_error, ...). Empty on success.
+    /// Without it the exhausted row said only "it failed", leaving the cause
+    /// visible exclusively in the switch log.
+    pub error_class: String,
+    /// The Chinese, human-readable cause matching error_class.
+    pub error_message: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
@@ -171,7 +214,10 @@ impl Store {
                 cost_usd REAL NOT NULL DEFAULT 0, wasted_cost_usd REAL NOT NULL DEFAULT 0,
                 duration_ms INTEGER NOT NULL DEFAULT 0, ttft_ms INTEGER NOT NULL DEFAULT 0,
                 loop_retries INTEGER NOT NULL DEFAULT 0,
-                loop_truncated INTEGER NOT NULL DEFAULT 0);
+                loop_truncated INTEGER NOT NULL DEFAULT 0,
+                loop_continues INTEGER NOT NULL DEFAULT 0,
+                error_class TEXT NOT NULL DEFAULT '',
+                error_message TEXT NOT NULL DEFAULT '');
              CREATE INDEX IF NOT EXISTS idx_rl_ts ON request_logs(ts);
              CREATE INDEX IF NOT EXISTS idx_rl_model ON request_logs(exposed_model);
              CREATE INDEX IF NOT EXISTS idx_rl_status ON request_logs(status);
@@ -236,6 +282,22 @@ impl Store {
         if !has_loop_truncated {
             conn.execute_batch("ALTER TABLE request_logs ADD COLUMN loop_truncated INTEGER NOT NULL DEFAULT 0;")?;
         }
+        // Correction rounds, and the cause of a terminal failure. Both backfill
+        // to "nothing to report" (0 / empty), which is the honest reading of a
+        // row written before the columns existed.
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(request_logs)")?
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<Result<Vec<_>, _>>()?;
+        if !cols.iter().any(|c| c == "loop_continues") {
+            conn.execute_batch("ALTER TABLE request_logs ADD COLUMN loop_continues INTEGER NOT NULL DEFAULT 0;")?;
+        }
+        if !cols.iter().any(|c| c == "error_class") {
+            conn.execute_batch("ALTER TABLE request_logs ADD COLUMN error_class TEXT NOT NULL DEFAULT '';")?;
+        }
+        if !cols.iter().any(|c| c == "error_message") {
+            conn.execute_batch("ALTER TABLE request_logs ADD COLUMN error_message TEXT NOT NULL DEFAULT '';")?;
+        }
         Ok(())
     }
 
@@ -292,9 +354,9 @@ impl Store {
     pub fn insert_request_log(&self, l: &RequestLog) -> anyhow::Result<i64> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO request_logs (ts, request_id, group_id, exposed_model, entry_protocol, status, final_channel, final_upstream_model, attempts, loop_retries, loop_truncated, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, wasted_cost_usd, duration_ms, ttft_ms)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)",
-            params![l.ts, l.request_id, l.group_id, l.exposed_model, l.entry_protocol, l.status, l.final_channel, l.final_upstream_model, l.attempts, l.loop_retries, l.loop_truncated, l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens, l.cost_usd, l.wasted_cost_usd, l.duration_ms, l.ttft_ms],
+            "INSERT INTO request_logs (ts, request_id, group_id, exposed_model, entry_protocol, status, final_channel, final_upstream_model, attempts, loop_retries, loop_truncated, loop_continues, error_class, error_message, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, wasted_cost_usd, duration_ms, ttft_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+            params![l.ts, l.request_id, l.group_id, l.exposed_model, l.entry_protocol, l.status, l.final_channel, l.final_upstream_model, l.attempts, l.loop_retries, l.loop_truncated, l.loop_continues, l.error_class, l.error_message, l.input_tokens, l.output_tokens, l.cache_read_tokens, l.cache_creation_tokens, l.cost_usd, l.wasted_cost_usd, l.duration_ms, l.ttft_ms],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -338,7 +400,7 @@ impl Store {
     pub fn list_request_logs_page(&self, limit: i64, offset: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<LogPage> {
         let (limit, offset) = page_bounds(limit, offset);
         let conn = self.conn.lock().unwrap();
-        let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'exposed_model',exposed_model,'entry_protocol',entry_protocol,'status',status,'final_channel',final_channel,'final_upstream_model',final_upstream_model,'attempts',attempts,'loop_retries',loop_retries,'loop_truncated',loop_truncated,'input_tokens',input_tokens,'output_tokens',output_tokens,'cache_read_tokens',cache_read_tokens,'cache_creation_tokens',cache_creation_tokens,'cost_usd',cost_usd,'wasted_cost_usd',wasted_cost_usd,'duration_ms',duration_ms,'ttft_ms',ttft_ms)";
+        let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'exposed_model',exposed_model,'entry_protocol',entry_protocol,'status',status,'final_channel',final_channel,'final_upstream_model',final_upstream_model,'attempts',attempts,'loop_retries',loop_retries,'loop_truncated',loop_truncated,'loop_continues',loop_continues,'error_class',error_class,'error_message',error_message,'input_tokens',input_tokens,'output_tokens',output_tokens,'cache_read_tokens',cache_read_tokens,'cache_creation_tokens',cache_creation_tokens,'cost_usd',cost_usd,'wasted_cost_usd',wasted_cost_usd,'duration_ms',duration_ms,'ttft_ms',ttft_ms)";
         let total = count_rows(&conn, "request_logs", request_id, group_id)?;
         let (where_sql, mut binds) = build_filters(request_id, group_id);
         let n = binds.len();
@@ -493,7 +555,7 @@ impl Store {
             // requests (a failed attempt's duration is dominated by timeouts and
             // would misrepresent latency), and with no successes at all they stay
             // NULL so the console shows "—" instead of a bogus 0ms.
-            "SELECT json_object('requests',COUNT(*),'success',COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),'exhausted',COALESCE(SUM(CASE WHEN status='exhausted' THEN 1 ELSE 0 END),0),'aborted',COALESCE(SUM(CASE WHEN status='aborted' THEN 1 ELSE 0 END),0),'loop_retries',COALESCE(SUM(loop_retries),0),'loop_truncated',COALESCE(SUM(loop_truncated),0),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cache_read_tokens',COALESCE(SUM(cache_read_tokens),0),'cache_creation_tokens',COALESCE(SUM(cache_creation_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'avg_ttft_ms',ROUND(AVG(CASE WHEN status='success' THEN ttft_ms END))) FROM request_logs{scope}"
+            "SELECT json_object('requests',COUNT(*),'success',COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),'exhausted',COALESCE(SUM(CASE WHEN status='exhausted' THEN 1 ELSE 0 END),0),'aborted',COALESCE(SUM(CASE WHEN status='aborted' THEN 1 ELSE 0 END),0),'loop_retries',COALESCE(SUM(loop_retries),0),'loop_truncated',COALESCE(SUM(loop_truncated),0),'loop_continues',COALESCE(SUM(loop_continues),0),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cache_read_tokens',COALESCE(SUM(cache_read_tokens),0),'cache_creation_tokens',COALESCE(SUM(cache_creation_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'avg_ttft_ms',ROUND(AVG(CASE WHEN status='success' THEN ttft_ms END))) FROM request_logs{scope}"
         ))?;
         let v: String = match group_id {
             Some(g) if !g.is_empty() => stmt.query_row(params![g], |r| r.get(0))?,
@@ -747,6 +809,9 @@ mod tests {
             attempts: 1,
             loop_retries: 0,
             loop_truncated: 0,
+            loop_continues: 0,
+            error_class: String::new(),
+            error_message: String::new(),
             input_tokens: 10,
             output_tokens: 5,
             cache_read_tokens: 0,

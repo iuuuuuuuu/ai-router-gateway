@@ -100,11 +100,18 @@ pub enum EntryProtocol {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StreamOutcome {
     pub usage: ir::Usage,
-    /// The post-commit loop guard cut the answer short. The client received a
-    /// valid, complete-looking stream — that is the point of truncation — so
-    /// this flag is the ONLY record that the answer is not what the model meant
-    /// to write. It must reach the request log.
+    /// The answer was cut short because the model repeated itself (either the
+    /// wrap-up that closes an answer whose correction rounds ran out, or a
+    /// post-commit truncation). The client received a valid, complete-looking
+    /// stream — that is the point of the clean wrap-up — so this flag is the
+    /// ONLY record that the answer is not what the model meant to write. It
+    /// must reach the request log.
     pub loop_truncated: bool,
+    /// How many correction rounds this answer needed: the model repeated
+    /// itself, the gateway told it why and asked it to carry on, and it did.
+    /// 0 means the answer never looped. Unlike `loop_truncated` this is not a
+    /// defect marker — a corrected answer is a delivered answer.
+    pub loop_continues: u32,
 }
 
 pub enum Outcome {
@@ -349,20 +356,36 @@ pub async fn run(ctx: &ProxyCtx<'_>) -> RunResult {
     }
 }
 
+/// Human-readable Chinese cause for one failed attempt. This is what the
+/// console shows in the request log and the switch log, so it must name the
+/// CAUSE, not merely the error's Rust variant: "上游返回 401（鉴权失败）" tells
+/// the operator what to fix, "UpstreamStatus" does not.
 pub fn proxy_err_message(e: &ProxyError) -> String {
     match e {
-        ProxyError::UpstreamStatus { status, class } => format!("upstream status {status} ({class:?})"),
-        ProxyError::Timeout { what } => format!("timeout: {what:?}"),
-        ProxyError::Connect(m) => format!("connect: {m}"),
-        ProxyError::ErrorBody(m) => format!("error body: {m}"),
-        ProxyError::NotSse(m) => format!("not sse: {m}"),
-        ProxyError::EmptyResponse => "empty response".into(),
+        ProxyError::UpstreamStatus { status, class } => match class {
+            crate::proxy::StatusClass::Auth => format!("上游返回 {status}：鉴权失败（API Key 无效或已过期）"),
+            crate::proxy::StatusClass::ModelNotFound => format!("上游返回 {status}：该渠道没有这个模型"),
+            crate::proxy::StatusClass::RateLimited { .. } => format!("上游返回 {status}：被限流"),
+            crate::proxy::StatusClass::BadRequest => format!("上游返回 {status}：请求被拒绝"),
+            crate::proxy::StatusClass::Server => format!("上游返回 {status}：上游服务端错误"),
+            crate::proxy::StatusClass::ContentFilter => format!("上游返回 {status}：内容被安全策略拦截"),
+        },
+        ProxyError::Timeout { what } => format!("超时：{}", match what {
+            TimeoutWhat::Connect => "连接上游超时",
+            TimeoutWhat::Ttfb => "上游首字节超时",
+            TimeoutWhat::FirstEvent => "上游第一个事件超时",
+            TimeoutWhat::Attempt => "本次尝试超时",
+        }),
+        ProxyError::Connect(m) => format!("连接上游失败：{m}"),
+        ProxyError::ErrorBody(m) => format!("上游返回错误内容：{m}"),
+        ProxyError::NotSse(m) => format!("上游返回的不是有效流：{m}"),
+        ProxyError::EmptyResponse => "上游返回空内容".into(),
         ProxyError::DegenerateOutput { unit, repeats } => format!(
-            "degenerate output: repeated {}-char unit {} times",
+            "输出复读：同一段内容连续重复了 {repeats} 次（重复单元 {} 个字符：{}）",
             unit.chars().count(),
-            repeats
+            unit.chars().take(40).collect::<String>(),
         ),
-        ProxyError::ClientGone => "client gone".into(),
+        ProxyError::ClientGone => "客户端已断开".into(),
     }
 }
 
@@ -468,14 +491,109 @@ fn upstream_headers(cand: &crate::router::Candidate) -> reqwest::header::HeaderM
 }
 
 fn render_upstream_body(ctx: &ProxyCtx<'_>, cand: &crate::router::Candidate) -> serde_json::Value {
+    render_upstream_body_for(&ctx.ir, cand)
+}
+
+fn render_upstream_body_for(ir: &ChatRequest, cand: &crate::router::Candidate) -> serde_json::Value {
     match cand.protocol {
-        Protocol::Openai => openai::render_upstream_request(&ctx.ir, &cand.upstream_model, ctx.ir.stream),
-        Protocol::Anthropic => anthropic::render_upstream_request(&ctx.ir, &cand.upstream_model, ctx.ir.stream),
+        Protocol::Openai => openai::render_upstream_request(ir, &cand.upstream_model, ir.stream),
+        Protocol::Anthropic => anthropic::render_upstream_request(ir, &cand.upstream_model, ir.stream),
         Protocol::Gemini => {
-            let (_path, body) = gemini::render_upstream_request(&ctx.ir, &cand.upstream_model, ctx.ir.stream);
+            let (_path, body) = gemini::render_upstream_request(ir, &cand.upstream_model, ir.stream);
             body
         }
     }
+}
+
+// ===== loop correction: "you are repeating, carry on from where you were cut" =====
+
+/// How much of the model's own already-written text is handed back to it in a
+/// correction round. Bounded: this is context for "where was I", not a second
+/// copy of the answer, and the request may already be long.
+const CONTINUE_CONTEXT_CHARS: usize = 4000;
+
+/// The IR for one correction round: the original conversation, plus what the
+/// model had already written (when any of it survived the cut), plus the reason
+/// it was interrupted.
+///
+/// The reason is not optional. A model told only "continue" tends to restart
+/// the same loop; a model told WHY it was cut — it was repeating — resumes the
+/// actual task. `kept` is omitted when empty rather than sent as an empty
+/// assistant turn, which some providers reject.
+fn continuation_ir(base: &ChatRequest, kept: &str, prompt: &str) -> ChatRequest {
+    let mut ir = base.clone();
+    if !kept.trim().is_empty() {
+        let tail: String = {
+            let n = kept.chars().count();
+            let skip = n.saturating_sub(CONTINUE_CONTEXT_CHARS);
+            kept.chars().skip(skip).collect()
+        };
+        ir.messages.push(ir::Message {
+            role: ir::Role::Assistant,
+            content: vec![ir::Content::Text { text: tail }],
+            tool_call_id: None,
+        });
+    }
+    ir.messages.push(ir::Message {
+        role: ir::Role::User,
+        content: vec![ir::Content::Text { text: prompt.to_string() }],
+        tool_call_id: None,
+    });
+    ir
+}
+
+/// May one more correction round start?
+///
+/// Three things must hold. The round cap and the request's total deadline, because
+/// a correction is a real upstream call and must fit in the budget the walk was
+/// given rather than extend it. And `stuck`: a model that repeats the SAME unit
+/// again right after being told it is repeating is not going to recover — each
+/// further round would only relay more of the same loop before the guard could
+/// cut it again, so the loop stops here instead of burning the remaining cap.
+fn can_continue_now(
+    cfg: &crate::loopguard::LoopCfg,
+    done: u32,
+    deadline: Instant,
+    ttfb: Duration,
+    stuck: bool,
+) -> bool {
+    if !cfg.continue_enabled || done >= cfg.continue_max || stuck {
+        return false;
+    }
+    let hard = deadline.checked_sub(ttfb).unwrap_or(deadline);
+    Instant::now() < hard
+}
+
+/// Open one correction round against the SAME candidate. Same channel and same
+/// upstream model on purpose: this is the answer being continued, not a new
+/// answer, so switching candidates mid-answer would splice two different models
+/// together.
+async fn open_continuation(
+    http: &HttpPool,
+    cand: &crate::router::Candidate,
+    connect_timeout: Duration,
+    ttfb_timeout: Duration,
+    ir: &ChatRequest,
+) -> Result<reqwest::Response, ProxyError> {
+    let url = format!("{}{}", build_upstream_url(cand), upstream_path_suffix(cand, ir));
+    let body = render_upstream_body_for(ir, cand);
+    let req = http
+        .client_for(connect_timeout.as_millis() as u64)
+        .post(&url)
+        .headers(upstream_headers(cand))
+        .json(&body);
+    let resp = match tokio::time::timeout(ttfb_timeout, req.send()).await {
+        Err(_) => return Err(ProxyError::Timeout { what: TimeoutWhat::Ttfb }),
+        Ok(Err(e)) => return Err(ProxyError::Connect(e.to_string())),
+        Ok(Ok(r)) => r,
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        let sc = status_class(status.as_u16());
+        let _ = resp.text().await; // drain
+        return Err(ProxyError::UpstreamStatus { status: status.as_u16(), class: sc });
+    }
+    Ok(resp)
 }
 
 // ---- non-stream attempt: buffer whole body, validate, commit ----
@@ -524,6 +642,49 @@ async fn sleep_until_std(t: Instant) {
 
 // ---- streaming attempt: classify frames, commit at first content ----
 
+/// Start one POST-COMMIT correction round: same candidate, same channel, and a
+/// prompt that states the reason. Returns the replacement stream plus the
+/// re-seeded window state, or `None` when no round can start (cap reached, no
+/// budget left, or the continuation could not be opened) — in which case the
+/// caller must finish the answer at the cut instead of continuing to relay a
+/// stream that is still repeating.
+#[allow(clippy::too_many_arguments)]
+async fn start_post_commit_round(
+    http: &HttpPool,
+    cand: &crate::router::Candidate,
+    base_ir: &ChatRequest,
+    cfg: &crate::loopguard::LoopCfg,
+    hit: &crate::loopguard::LoopHit,
+    guard: &mut crate::loopguard::LoopGuard,
+    continues: u32,
+    deadline: Instant,
+    ttfb: Duration,
+    connect: Duration,
+    last_unit: &Option<String>,
+) -> Option<reqwest::Response> {
+    // Same unit as the round that just failed => the model is stuck on one
+    // phrase and another round cannot help (see `can_continue_now`).
+    let stuck = last_unit.as_deref() == Some(hit.unit.as_str());
+    if !can_continue_now(cfg, continues, deadline, ttfb, stuck) {
+        return None;
+    }
+    // Everything before the repetition is answer text the client ALREADY has,
+    // so only the tail is re-sent as context — the whole answer would waste the
+    // continuation's context window.
+    let kept = guard.text_before(hit.real_span);
+    let prompt = crate::loopguard::render_continue_prompt(&cfg.continue_prompt, hit);
+    let ir = continuation_ir(base_ir, &kept, &prompt);
+    match open_continuation(http, cand, connect, ttfb, &ir).await {
+        Ok(resp) => {
+            // Re-seed only on success: a failed round must leave the window
+            // intact so the cut still points at the real repetition.
+            guard.reseed(&kept);
+            Some(resp)
+        }
+        Err(_) => None,
+    }
+}
+
 async fn attempt_stream(
     ctx: &ProxyCtx<'_>,
     cand: &crate::router::Candidate,
@@ -565,6 +726,11 @@ async fn attempt_stream(
 
     let mut frame_deadline = Instant::now() + budget.first_event_timeout;
 
+    // Set when the answer was wrapped up at a loop cut rather than finished by
+    // the model. It is the sole record that the answer the client received is
+    // a shortened one, and it survives into the pump's outcome.
+    let mut loop_truncated = false;
+
     // Thinking seen before the commit point. It cannot be sent as it arrives:
     // the pre-commit region may still end in a retry, and a retry that had
     // already streamed the reasoning would make the client show it twice.
@@ -598,7 +764,28 @@ async fn attempt_stream(
     // that ended the holdback are one and the same commit, so a tool call
     // arriving after buffered text must carry that text with it instead of
     // discarding it.
+    //
+    // ROUNDS: a loop hit no longer throws this attempt away. Everything the
+    // model wrote BEFORE it started repeating is real answer text, so the
+    // repetition is cut out, that text is kept, and the model is asked - with
+    // the reason stated in the prompt - to carry on from where it was cut off.
+    // Only when no round can start (cap reached, or no budget left) is the
+    // answer wrapped up where it stands; it is never discarded whole.
+    let mut continues: u32 = 0;
+    // Handed out of the inner frame loop by the loop-guard arms below.
+    let mut looped: Option<crate::loopguard::LoopHit> = None;
+    // Length of the frame that triggered the hit. It reached the guard but not
+    // `pending`, which is what makes the pending cut exact (see below).
+    let mut trigger_len: usize = 0;
+    // The repeated unit of the last correction round, for the stuck check.
+    let mut last_unit: Option<String> = None;
+    // True once the upstream stream has been deliberately abandoned. The pump
+    // must then finish the answer instead of reading a stream we walked away
+    // from, which would relay the very repetition that was just cut.
+    let mut upstream_done = false;
     let committed_tail: Vec<StreamEvent> = loop {
+        looped = None;
+        let tail: Vec<StreamEvent> = loop {
         let next = tokio::select! {
             ev = es.next() => ev,
             _ = sleep_until_std(frame_deadline) => {
@@ -695,10 +882,12 @@ async fn attempt_stream(
                 // loop-guard path. Dropping either half loses real content.
                 pre_reasoning.push(StreamEvent::Reasoning { text: reasoning });
                 if let Some(hit) = guard.push(&text) {
-                    return Err((
-                        ProxyError::DegenerateOutput { unit: hit.unit, repeats: hit.repeats },
-                        usage_acc,
-                    ));
+                    // Not a failure: hand the hit to the round logic, which keeps
+                    // the text written before the repetition and asks the model to
+                    // carry on from the cut.
+                    trigger_len = text.chars().count();
+                    looped = Some(hit);
+                    break Vec::new();
                 }
                 pending.push_str(&text);
                 if pending.chars().count() >= hold {
@@ -716,10 +905,9 @@ async fn attempt_stream(
                 // of tool arguments, and delaying the latter would break the
                 // tool stream semantics (see docs/loopguard-spec.md §2).
                 if let Some(hit) = guard.push(&t) {
-                    return Err((
-                        ProxyError::DegenerateOutput { unit: hit.unit, repeats: hit.repeats },
-                        usage_acc,
-                    ));
+                    trigger_len = t.chars().count();
+                    looped = Some(hit);
+                    break Vec::new();
                 }
                 pending.push_str(&t);
                 if pending.chars().count() >= hold {
@@ -775,6 +963,93 @@ async fn attempt_stream(
                 break Vec::new();
             }
         }
+        };
+
+        // ---- no loop: this round produced the answer ----
+        let Some(hit) = looped.take() else { break tail };
+
+        // ---- a loop was detected: cut it and try to carry on ----
+        // Everything before the repetition is real answer text. `text_before`
+        // walks back `real_span` characters from the window tail, which is
+        // exactly the boundary the detector found, and drops the repetition
+        // itself along with it.
+        let kept = guard.text_before(hit.real_span);
+        // Is there an ANSWER before the loop, or only the loop itself?
+        //
+        // `hold` is the same threshold the commit point uses: the number of
+        // buffered characters at which an answer counts as started. Below it
+        // nothing had committed, so the "prefix" is not an answer the client
+        // is owed — it is a model that repeated itself from its first
+        // character. Wrapping up on that would hand the client a fragment of
+        // the repetition (or nothing at all) as a successful answer, which is
+        // strictly worse than letting the walk try the next candidate. Above
+        // it there IS real answer text, and the whole point of this path is
+        // that such text is continued rather than thrown away.
+        if kept.chars().count() < hold {
+            return Err((
+                ProxyError::DegenerateOutput { unit: hit.unit, repeats: hit.repeats },
+                usage_acc,
+            ));
+        }
+        // The holdback buffer holds the SAME tail as the window (every text
+        // char enters the guard before it enters `pending`), so the repetition
+        // has to come out of it too: otherwise a wrap-up at this cut would
+        // relay the very repetition that was just detected.
+        // `pending` is the window MINUS the frame that triggered this hit: that
+        // frame reached the guard but never reached `pending`. So the repetition
+        // occupies the window's last `real_span` chars, of which only the part
+        // BEFORE the trigger frame can be sitting in `pending`. Dropping the
+        // whole `real_span` here would eat into text that is still good — for a
+        // short trigger frame it would wipe `pending` out entirely.
+        {
+            let plen = pending.chars().count();
+            let drop_from_pending = hit.real_span.saturating_sub(trigger_len).min(plen);
+            let keep_n = plen - drop_from_pending;
+            if keep_n < plen {
+                pending = pending.chars().take(keep_n).collect();
+            }
+        }
+        // The repeated unit must not be re-detected: the window now holds only
+        // the text that survived, so the continuation is judged on its own
+        // output plus a bounded tail of the answer it is continuing.
+        guard.reseed(&kept);
+        let prompt = crate::loopguard::render_continue_prompt(&budget.loop_guard.continue_prompt, &hit);
+        // The unit of the round that just ran. Repeating the SAME unit after being
+        // told about it means the model is stuck, so the next round is refused.
+        let stuck = last_unit.as_deref() == Some(hit.unit.as_str());
+        if can_continue_now(&budget.loop_guard, continues, budget.deadline, budget.ttfb_timeout, stuck) {
+            let next_ir = continuation_ir(&ctx.ir, &kept, &prompt);
+            match open_continuation(&ctx.state.http, cand, budget.connect_timeout, budget.ttfb_timeout, &next_ir).await {
+                Ok(resp) => {
+                    continues += 1;
+                    last_unit = Some(hit.unit.clone());
+                    es = resp.bytes_stream().eventsource();
+                    // A fresh stream deserves a fresh first-event window; the
+                    // request's total deadline still bounds it.
+                    frame_deadline = Instant::now() + budget.first_event_timeout;
+                    // `pending` and `pre_reasoning` deliberately SURVIVE: the
+                    // text held back before the cut is the beginning of this
+                    // answer, and the continuation appends to it. Dropping
+                    // either would delete real content the client never saw.
+                    continue;
+                }
+                Err(e) => {
+                    // The continuation could not start. The answer so far is
+                    // still real text, so wrap up with what we have instead of
+                    // failing a request that already holds a partial answer.
+                    let _ = e;
+                }
+            }
+        }
+        // No round available (cap reached, no budget, or the continuation could
+        // not be opened): close the answer cleanly at the cut.
+        loop_truncated = true;
+        upstream_done = true;
+        commit_finish = Some(ir::FinishReason::Length);
+        break vec![StreamEvent::TextDelta {
+            text: std::mem::take(&mut pending),
+            finish: commit_finish,
+        }];
     };
 
     // COMMITTED (or empty-but-valid). Client still received zero bytes.
@@ -789,6 +1064,15 @@ async fn attempt_stream(
     let idle = budget.chunk_idle_timeout;
     let deadline_total = budget.deadline;
     let proto = cand.protocol;
+    // Moved into the pump so a POST-COMMIT loop can be corrected there too:
+    // the correction is another upstream call against the SAME candidate, with
+    // the same budget rules the pre-commit rounds obey.
+    let cont_http = ctx.state.http.clone();
+    let cont_cand = cand.clone();
+    let cont_base_ir = ctx.ir.clone();
+    let cont_cfg = budget.loop_guard.clone();
+    let cont_ttfb = budget.ttfb_timeout;
+    let cont_connect = budget.connect_timeout;
 
     tokio::spawn(async move {
         // The account stays "in use" until the pump stops relaying, not until
@@ -797,16 +1081,21 @@ async fn attempt_stream(
         let _inflight = inflight;
         let mut tx = Some(outcome_tx);
         let mut final_usage = usage_acc;
-        // Set only by the post-commit loop guard below. It is the sole record
-        // that the answer the client just received is a truncated one.
-        let mut loop_truncated = false;
+        // Both flags are seeded from the PRE-COMMIT rounds, which already know
+        // whether this answer was cut at a loop (`loop_truncated`) and how many
+        // corrections it took (`continues`). The post-commit guard below can
+        // only ever raise them further.
+        let mut loop_truncated = loop_truncated;
+        let mut loop_continues: u32 = continues;
+        // The repeated unit of the last correction round, for the stuck check.
+        let mut last_unit: Option<String> = last_unit;
         let feed = feed_tx.clone();
 
         // POST-COMMIT pump: convert frames to IR events, render in client protocol.
         let mut finished = committed.is_empty();
         if finished {
             feed_close_clean(&feed, entry).await;
-            if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
+            if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
             return;
         }
 
@@ -842,22 +1131,44 @@ async fn attempt_stream(
             }
         }
 
+        // The pre-commit rounds may have walked away from the upstream stream
+        // (a cut that no correction could resume). Reading it now would relay
+        // the very repetition that was just removed, so the answer is finished
+        // at the cut instead.
+        let mut upstream_done = upstream_done;
+        // The upstream stream is swappable: a correction round replaces it with
+        // the continuation's stream, spliced onto the same client feed so the
+        // client sees ONE continuous answer.
+        let mut es = es;
+
         loop {
+            if upstream_done {
+                if !finished {
+                    finished = true;
+                    feed_emit(&feed, entry, &StreamEvent::Finish {
+                        reason: commit_finish.unwrap_or(ir::FinishReason::Length),
+                        usage: final_usage.clone(),
+                    }, &exposed_name).await;
+                }
+                feed_close_clean(&feed, entry).await;
+                if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+                return;
+            }
             let next = tokio::select! {
                 ev = es.next() => ev,
                 _ = sleep_until_std(Instant::now() + idle) => {
-                    feed_repair(&feed, entry, "upstream chunk idle timeout").await;
-                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
+                    feed_repair(&feed, entry, "上游分片超时，已中断").await;
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
                     return;
                 }
                 _ = sleep_until_std(deadline_total) => {
-                    feed_repair(&feed, entry, "total deadline exceeded").await;
-                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
+                    feed_repair(&feed, entry, "总超时时间已用尽，已中断").await;
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
                     return;
                 }
                 _ = client_gone.cancelled() => {
                     // client vanished: stop pumping; drop closes upstream conn
-                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
                     return;
                 }
             };
@@ -872,11 +1183,11 @@ async fn attempt_stream(
                     }
                 }
                 if !finished {
-                    feed_repair(&feed, entry, "upstream stream ended prematurely").await;
+                    feed_repair(&feed, entry, "上游连接提前结束").await;
                 } else {
                     feed_close_clean(&feed, entry).await;
                 }
-                if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
+                if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
                 return;
             };
             let Ok(ev) = ev else { continue };
@@ -924,7 +1235,7 @@ async fn attempt_stream(
                 FrameClass::Error(m) => {
                     // mid-stream upstream error AFTER commit: repair, never leak
                     feed_repair(&feed, entry, &m).await;
-                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
                     return;
                 }
                 FrameClass::Reasoning(t) => {
@@ -938,40 +1249,20 @@ async fn attempt_stream(
                     // delta must not become a hole in the guard's coverage.
                     feed_emit(&feed, entry, &StreamEvent::Reasoning { text: reasoning }, &exposed_name).await;
                     if let Some(hit) = guard.push_tail(&text) {
-                        loop_truncated = true;
-                        feed_emit(
-                            &feed, entry,
-                            &StreamEvent::Finish { reason: ir::FinishReason::Length, usage: final_usage.clone() },
-                            &exposed_name,
-                        ).await;
+                        // Same correction path as a plain Text hit: the thought
+                        // has already been relayed, and the answer must carry on
+                        // rather than stop here.
                         flush_tool(&feed, entry, &exposed_name, &mut pending_tool).await;
-                        feed_close_clean(&feed, entry).await;
-                        if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
-                        return;
-                    }
-                    feed_emit(&feed, entry, &StreamEvent::TextDelta { text, finish: None }, &exposed_name).await;
-                }
-                FrameClass::Text(t) => {
-                    // POST-COMMIT detection. The bytes already sent cannot be
-                    // recalled, so unlike a pre-commit hit (which discards the
-                    // whole attempt and retries another candidate) the only
-                    // honest remedy here is to STOP: emit a normal finish and
-                    // close, so the client keeps a valid stream and stops
-                    // receiving the loop instead of being fed thousands more
-                    // characters of it. A retry is impossible — it would
-                    // duplicate the prefix the client already has.
-                    if let Some(hit) = guard.push_tail(&t) {
-                        tracing::warn!(
-                            unit_chars = hit.unit.chars().count(),
-                            repeats = hit.repeats,
-                            covered = hit.chars,
-                            "degenerate output detected AFTER commit; truncating the answer"
-                        );
+                        if let Some(resp) = start_post_commit_round(
+                            &cont_http, &cont_cand, &cont_base_ir, &cont_cfg, &hit, &mut guard,
+                            loop_continues, deadline_total, cont_ttfb, cont_connect, &last_unit,
+                        ).await {
+                            loop_continues += 1;
+                            last_unit = Some(hit.unit.clone());
+                            es = resp.bytes_stream().eventsource();
+                            continue;
+                        }
                         loop_truncated = true;
-                        // A tool call already assembled but not yet emitted is
-                        // released first: truncating mid-call would hand the
-                        // client an argument list cut in half.
-                        flush_tool(&feed, entry, &exposed_name, &mut pending_tool).await;
                         finished = true;
                         feed_emit(
                             &feed, entry,
@@ -979,7 +1270,49 @@ async fn attempt_stream(
                             &exposed_name,
                         ).await;
                         feed_close_clean(&feed, entry).await;
-                        if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
+                        if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+                        return;
+                    }
+                    feed_emit(&feed, entry, &StreamEvent::TextDelta { text, finish: None }, &exposed_name).await;
+                }
+                FrameClass::Text(t) => {
+                    // POST-COMMIT detection. The bytes already sent cannot be
+                    // recalled, so the repetition itself is not relayed: the
+                    // model is instead asked, with the reason stated, to carry
+                    // on from the cut, and the continuation is spliced onto the
+                    // SAME client stream. Only when no round can start is the
+                    // answer finished where it stands — it is never abandoned
+                    // whole, because the prefix the client already holds is real
+                    // answer text.
+                    if let Some(hit) = guard.push_tail(&t) {
+                        tracing::warn!(
+                            unit_chars = hit.unit.chars().count(),
+                            repeats = hit.repeats,
+                            covered = hit.chars,
+                            "degenerate output detected AFTER commit; correcting"
+                        );
+                        // A tool call already assembled but not yet emitted is
+                        // released first: cutting mid-call would hand the
+                        // client an argument list cut in half.
+                        flush_tool(&feed, entry, &exposed_name, &mut pending_tool).await;
+                        if let Some(resp) = start_post_commit_round(
+                            &cont_http, &cont_cand, &cont_base_ir, &cont_cfg, &hit, &mut guard,
+                            loop_continues, deadline_total, cont_ttfb, cont_connect, &last_unit,
+                        ).await {
+                            loop_continues += 1;
+                            last_unit = Some(hit.unit.clone());
+                            es = resp.bytes_stream().eventsource();
+                            continue;
+                        }
+                        loop_truncated = true;
+                        finished = true;
+                        feed_emit(
+                            &feed, entry,
+                            &StreamEvent::Finish { reason: ir::FinishReason::Length, usage: final_usage.clone() },
+                            &exposed_name,
+                        ).await;
+                        feed_close_clean(&feed, entry).await;
+                        if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
                         return;
                     }
                     feed_emit(&feed, entry, &StreamEvent::TextDelta { text: t, finish: None }, &exposed_name).await
@@ -1030,7 +1363,7 @@ async fn attempt_stream(
                     } else {
                         feed_repair(&feed, entry, "upstream closed without finish").await;
                     }
-                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated }); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
                     return;
                 }
             }
@@ -1134,7 +1467,7 @@ pub async fn feed_repair(tx: &mpsc::Sender<ClientFrame>, entry: EntryProtocol, m
     match entry {
         EntryProtocol::Openai => {
             let err = serde_json::json!({
-                "error": { "message": format!("upstream interrupted: {msg}"), "type": "gateway_upstream_interrupted", "code": "upstream_interrupted" }
+                "error": { "message": format!("上游流中断：{msg}"), "type": "gateway_upstream_interrupted", "code": "upstream_interrupted" }
             });
             let _ = tx.send(ClientFrame::Sse(format!("data: {err}\n\n"))).await;
             let ev = StreamEvent::Finish { reason: ir::FinishReason::ContentFilter, usage: ir::Usage::default() };
@@ -1144,12 +1477,12 @@ pub async fn feed_repair(tx: &mpsc::Sender<ClientFrame>, entry: EntryProtocol, m
         }
         EntryProtocol::Anthropic => {
             let err = serde_json::json!({
-                "type": "error", "error": { "type": "api_error", "message": format!("upstream interrupted: {msg}") }
+                "type": "error", "error": { "type": "api_error", "message": format!("上游流中断：{msg}") }
             });
             let _ = tx.send(ClientFrame::Sse(format!("event: error\ndata: {err}\n\n"))).await;
         }
         EntryProtocol::Gemini => {
-            let err = serde_json::json!({ "error": { "code": 502, "message": format!("upstream interrupted: {msg}"), "status": "UNAVAILABLE" } });
+            let err = serde_json::json!({ "error": { "code": 502, "message": format!("上游流中断：{msg}"), "status": "UNAVAILABLE" } });
             let _ = tx.send(ClientFrame::Sse(format!("data: {err}\n\n"))).await;
         }
     }

@@ -26,7 +26,7 @@ pub struct AuthedReq {
 
 /// Resolve API key -> group. Accepts Authorization: Bearer or x-api-key.
 pub fn authenticate(state: &crate::proxy::AppState, headers: &HeaderMap) -> Result<String, Response> {
-    let snap = state.config.get().ok_or_else(|| error_response(EntryProtocol::Openai, StatusCode::SERVICE_UNAVAILABLE, "config_not_loaded", "gateway has no configuration yet"))?;
+    let snap = state.config.get().ok_or_else(|| error_response(EntryProtocol::Openai, StatusCode::SERVICE_UNAVAILABLE, "config_not_loaded", "网关尚未加载任何配置"))?;
     let presented = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -35,14 +35,14 @@ pub fn authenticate(state: &crate::proxy::AppState, headers: &HeaderMap) -> Resu
         .or_else(|| headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()))
         .unwrap_or("");
     if presented.is_empty() {
-        return Err(error_response(EntryProtocol::Openai, StatusCode::UNAUTHORIZED, "missing_api_key", "provide Authorization: Bearer <key> or x-api-key"));
+        return Err(error_response(EntryProtocol::Openai, StatusCode::UNAUTHORIZED, "missing_api_key", "缺少 API Key：请提供 Authorization: Bearer <key> 或 x-api-key 请求头"));
     }
     for k in &snap.config.api_keys {
         if k.enabled && k.key == presented {
             return Ok(k.group_id.clone());
         }
     }
-    Err(error_response(EntryProtocol::Openai, StatusCode::UNAUTHORIZED, "invalid_api_key", "unknown or disabled API key"))
+    Err(error_response(EntryProtocol::Openai, StatusCode::UNAUTHORIZED, "invalid_api_key", "API Key 无效或已被禁用"))
 }
 
 /// Standard error body in the client's protocol.
@@ -64,10 +64,10 @@ pub async fn list_models(State(state): State<crate::proxy::AppState>, headers: H
         Err(r) => return r,
     };
     let Some(snap) = state.config.get() else {
-        return error_response(EntryProtocol::Openai, StatusCode::SERVICE_UNAVAILABLE, "config_not_loaded", "no config");
+        return error_response(EntryProtocol::Openai, StatusCode::SERVICE_UNAVAILABLE, "config_not_loaded", "网关尚未加载任何配置");
     };
     let Some(group) = snap.config.groups.iter().find(|g| g.id == group_id) else {
-        return error_response(EntryProtocol::Openai, StatusCode::UNAUTHORIZED, "invalid_api_key", "key group missing");
+        return error_response(EntryProtocol::Openai, StatusCode::UNAUTHORIZED, "invalid_api_key", "该 API Key 没有绑定任何分组");
     };
     let now_ms = crate::store::now_ms() as u64;
     // Task-27 deliverable 1b: the group itself is routable as a "model" (the
@@ -120,10 +120,10 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
         Err(r) => return r,
     };
     let Some(snap) = state.config.get() else {
-        return error_response(entry, StatusCode::SERVICE_UNAVAILABLE, "config_not_loaded", "no config");
+        return error_response(entry, StatusCode::SERVICE_UNAVAILABLE, "config_not_loaded", "网关尚未加载任何配置");
     };
     let Some(group) = snap.config.groups.iter().find(|g| g.id == group_id) else {
-        return error_response(entry, StatusCode::UNAUTHORIZED, "invalid_api_key", "key group missing");
+        return error_response(entry, StatusCode::UNAUTHORIZED, "invalid_api_key", "该 API Key 没有绑定任何分组");
     };
 
     // resolve exposed model: from body (openai/anthropic) or path (gemini)
@@ -144,14 +144,14 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
     // below; this guard only decides "404 or not".
     let wildcard = crate::router::is_wildcard(group, &exposed_model);
     if !wildcard && !group.exposed_models.iter().any(|m| m == &exposed_model) {
-        return error_response(entry, StatusCode::NOT_FOUND, "model_not_found", &format!("model '{exposed_model}' is not exposed to your group"));
+        return error_response(entry, StatusCode::NOT_FOUND, "model_not_found", &format!("模型「{exposed_model}」未对该分组开放"));
     }
 
     // Gemini native streaming is signaled by the URL suffix, not body.stream.
     let gemini_path_stream = entry == EntryProtocol::Gemini && path.contains(":streamGenerateContent");
     let ir_req = match parse_request_for(entry, &body, &exposed_model, gemini_path_stream) {
         Ok(r) => r,
-        Err(msg) => return error_response(entry, StatusCode::BAD_REQUEST, "bad_request", &format!("invalid request body: {msg}")),
+        Err(msg) => return error_response(entry, StatusCode::BAD_REQUEST, "bad_request", &format!("请求体无效：{msg}")),
     };
 
     let request_id = uuid::Uuid::new_v4().to_string();
@@ -254,6 +254,9 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                 // Non-stream: there is no pump, so nothing can be truncated
                 // after delivery — the whole answer arrives in one piece.
                 loop_truncated: 0,
+                loop_continues: 0,
+                error_class: String::new(),
+                error_message: String::new(),
                 input_tokens: usage.input_tokens as i64,
                 output_tokens: usage.output_tokens as i64,
                 cache_read_tokens: usage.cache_read_tokens as i64,
@@ -318,6 +321,22 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                     attempts: recs,
                     loop_retries: lr,
                     loop_truncated: outcome.loop_truncated as i64,
+                    loop_continues: outcome.loop_continues,
+                    // A corrected answer is still a delivered answer, so the row
+                    // stays "success"; the class records that it needed
+                    // correcting, which is the whole point of showing a cause.
+                    error_class: if outcome.loop_continues > 0 { "loop_continue" } else { "" }.to_string(),
+                    // BOTH facts are reported when both are true. A corrected
+                    // answer that later hit the round cap and got truncated is
+                    // exactly that — saying only "纠正了 N 次" would hide the
+                    // truncation, and saying only "已截断" would hide the work
+                    // the correction did.
+                    error_message: match (outcome.loop_continues, outcome.loop_truncated) {
+                        (0, false) => String::new(),
+                        (0, true) => "检测到输出复读，已截断收尾".to_string(),
+                        (n, false) => format!("检测到输出复读，已自动纠正并续写 {n} 次"),
+                        (n, true) => format!("检测到输出复读，已自动纠正并续写 {n} 次；仍复读，已截断收尾"),
+                    },
                     input_tokens: usage.input_tokens as i64, output_tokens: usage.output_tokens as i64,
                     cache_read_tokens: usage.cache_read_tokens as i64, cache_creation_tokens: usage.cache_creation_tokens as i64,
                     cost_usd: cost, wasted_cost_usd: wasted, duration_ms: dur, ttft_ms: ttft.unwrap_or(0),
@@ -326,6 +345,33 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
             response
         }
         None => {
+            // WHY it failed, computed before the row so both the log row and the
+            // client message can use it. `cause_counts` is the mix of classes
+            // across every failed attempt; `last_cause` is the last real failure,
+            // which is the one the client would have hit.
+            let mut cause_counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+            for rec in result.records.iter().filter(|r| r.error_class != "committed") {
+                *cause_counts.entry(rec.error_class).or_insert(0) += 1;
+            }
+            let cause_summary = cause_counts
+                .iter()
+                .map(|(class, n)| format!("{}×{}", crate::store::error_class_label(class), n))
+                .collect::<Vec<_>>()
+                .join("、");
+            let last_cause = result
+                .records
+                .iter()
+                .rev()
+                .find(|r| r.error_class != "committed")
+                .map(|r| r.message.clone())
+                .unwrap_or_default();
+            // The dominant class, for the row: it is the one-word answer to
+            // "what went wrong" that the log could not previously give.
+            let failure_class_for_log = cause_counts
+                .iter()
+                .max_by_key(|(_, n)| **n)
+                .map(|(class, _)| (*class).to_string())
+                .unwrap_or_default();
             // terminal failure: ONE structurally-valid error in the client's protocol
             state.store.insert_request_log(&crate::store::RequestLog {
                 id: None, ts: iso_now(), request_id: request_id.clone(), group_id: group_id.clone(),
@@ -334,6 +380,9 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                 attempts: result.records.len() as u32,
                 loop_retries: loop_retries_for_log,
                 loop_truncated: 0,
+                loop_continues: 0,
+                error_class: failure_class_for_log.clone(),
+                error_message: last_cause.clone(),
                 input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0,
                 cost_usd: 0.0, wasted_cost_usd: wasted_cost,
                 duration_ms: duration_ms as i64, ttft_ms: result.ttft_ms.unwrap_or(0) as i64,
@@ -343,7 +392,26 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                 crate::router::Terminal::NoCandidate => (StatusCode::NOT_FOUND, "no_route_for_model"),
                 crate::router::Terminal::Exhausted => (StatusCode::BAD_GATEWAY, "all_upstreams_failed"),
             };
-            let mut r = error_response(entry, code, kind, &format!("all {} upstream attempt(s) failed; see gateway request {request_id}", result.records.len()));
+            // The client-facing text names the CAUSE, not just the count: a bare
+            // "6 次尝试全部失败" forces the operator to open the switch log to
+            // learn WHY, which is exactly the gap this fills.
+            // When every attempt failed the same way the summary and the last
+            // cause say the same thing, so only the detail is printed; the
+            // summary earns its place only when the failures differ.
+            let message = if cause_summary.is_empty() {
+                format!("上游 {} 次尝试全部失败，请查看请求日志 {} 的失败原因", result.records.len(), request_id)
+            } else if cause_counts.len() == 1 {
+                format!("上游 {} 次尝试全部失败：{}。请求 ID：{}", result.records.len(), last_cause, request_id)
+            } else {
+                format!(
+                    "上游 {} 次尝试全部失败（原因：{}）。最后一条失败原因：{}。请求 ID：{}",
+                    result.records.len(),
+                    cause_summary,
+                    last_cause,
+                    request_id,
+                )
+            };
+            let mut r = error_response(entry, code, kind, &message);
             if matches!(result.terminal, crate::router::Terminal::AllCooldown) {
                 // 头部值必须是裸的秒数 "30"。旧写法把整行 "retry-after: 30" 当成值插入，
                 // 客户端解析 Retry-After 会拿到畸形字符串。

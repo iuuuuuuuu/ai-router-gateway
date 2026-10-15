@@ -66,6 +66,24 @@ pub struct RetryConfig {
     /// repetition to be more complete.
     #[serde(default = "d_loop_guard_tail_chars")]
     pub loop_guard_tail_chars: usize,
+    /// On a repetition, correct the model instead of discarding the attempt:
+    /// keep the text written BEFORE the loop and ask the model to carry on from
+    /// where it was cut off. Disabling this restores the old behaviour (throw
+    /// the whole attempt away and retry another candidate).
+    #[serde(default = "d_true")]
+    pub loop_guard_continue_enabled: bool,
+    /// How many times one answer may be corrected. Each round is a real upstream
+    /// call, so this is also the worst-case extra cost of a looping model. When
+    /// the rounds are used up the answer is closed cleanly with what it has
+    /// (a staged wrap-up) rather than thrown away.
+    #[serde(default = "d_loop_guard_continue_max")]
+    pub loop_guard_continue_max: u32,
+    /// The correction prompt. It MUST state the reason: a model that is told
+    /// only "continue" tends to restart the same loop, whereas one told WHY it
+    /// was interrupted (it was repeating) resumes the actual task.
+    /// Placeholders: {unit} = the repeated text, {repeats} = how many times.
+    #[serde(default = "d_loop_guard_continue_prompt")]
+    pub loop_guard_continue_prompt: String,
 }
 
 fn d_max_attempts() -> u32 { 6 }
@@ -85,6 +103,12 @@ fn d_loop_guard_repeat_ratio() -> f64 { 0.75 }
 fn d_loop_guard_max_repeats() -> u32 { 4 }
 fn d_loop_guard_window_chars() -> usize { 4000 }
 fn d_loop_guard_tail_chars() -> usize { 128 }
+fn d_loop_guard_continue_max() -> u32 { 2 }
+fn d_loop_guard_continue_prompt() -> String {
+    // Chinese on purpose: the model that loops is usually a Chinese-speaking
+    // assistant, and the reason ("你复读了") is what makes the correction work.
+    "你刚才的输出出现了复读：同一段内容「{unit}」连续重复了 {repeats} 次，已被系统截断。请不要重复已经说过的内容，也不要道歉或解释，直接接着上面被打断的地方继续输出剩余内容。".to_string()
+}
 
 impl Default for RetryConfig {
     fn default() -> Self {
@@ -106,6 +130,9 @@ impl Default for RetryConfig {
             loop_guard_max_repeats: d_loop_guard_max_repeats(),
             loop_guard_window_chars: d_loop_guard_window_chars(),
             loop_guard_tail_chars: d_loop_guard_tail_chars(),
+            loop_guard_continue_enabled: true,
+            loop_guard_continue_max: d_loop_guard_continue_max(),
+            loop_guard_continue_prompt: d_loop_guard_continue_prompt(),
         }
     }
 }

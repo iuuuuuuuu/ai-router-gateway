@@ -45,7 +45,7 @@ fn has_blank_line(chars: &[char]) -> bool {
 
 /// Runtime configuration for degenerate-repeat detection, normalized from
 /// `RetryConfig` and clamped into a safe range.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LoopCfg {
     pub enabled: bool,
     pub min_chars: usize,
@@ -62,6 +62,14 @@ pub struct LoopCfg {
     /// has taken over a 4000-character window", which would let the loop run for
     /// thousands of characters before it is caught.
     pub tail_chars: usize,
+    /// Correct-and-continue instead of discard-and-retry.
+    pub continue_enabled: bool,
+    /// Upper bound on corrections for ONE answer. Clamped to a small number:
+    /// each round is a full upstream call, and a model that loops three times
+    /// in a row is not going to be saved by a fourth prompt.
+    pub continue_max: u32,
+    /// The correction prompt, already validated (never empty).
+    pub continue_prompt: String,
 }
 
 impl LoopCfg {
@@ -111,9 +119,58 @@ impl LoopCfg {
             tracing::warn!(configured = rc.loop_guard_tail_chars, used = tail_chars, "loop_guard_tail_chars out of range; clamped");
         }
 
-        Self { enabled, min_chars, repeat_min_chars, repeat_ratio, max_repeats, window_chars, tail_chars }
+        // A correction round is an extra upstream call per answer, so the cap
+        // is clamped rather than trusted: 0 means "never continue" (the old
+        // discard-and-retry behaviour), and the upper bound keeps one looping
+        // answer from multiplying the request's cost.
+        let continue_max = rc.loop_guard_continue_max.min(LOOP_CONTINUE_MAX_CAP);
+        if continue_max != rc.loop_guard_continue_max {
+            tracing::warn!(configured = rc.loop_guard_continue_max, used = continue_max, "loop_guard_continue_max out of range; clamped");
+        }
+        // An empty prompt would send the model a bare "continue" with no reason,
+        // which is the one thing the correction must never be: the reason is what
+        // stops it restarting the same loop.
+        let continue_prompt = if rc.loop_guard_continue_prompt.trim().is_empty() {
+            tracing::warn!("loop_guard_continue_prompt is empty; using the built-in prompt");
+            d_continue_prompt()
+        } else {
+            rc.loop_guard_continue_prompt.clone()
+        };
+
+        Self {
+            enabled, min_chars, repeat_min_chars, repeat_ratio, max_repeats,
+            window_chars, tail_chars,
+            continue_enabled: rc.loop_guard_continue_enabled,
+            continue_max,
+            continue_prompt,
+        }
     }
 }
+
+/// Hard ceiling on correction rounds per answer (see `LoopCfg::continue_max`).
+pub const LOOP_CONTINUE_MAX_CAP: u32 = 5;
+
+/// The built-in correction prompt, used when the configured one is empty. Kept
+/// in sync with `config::d_loop_guard_continue_prompt` by construction (that
+/// function calls this).
+pub fn d_continue_prompt() -> String {
+    "你刚才的输出出现了复读：同一段内容「{unit}」连续重复了 {repeats} 次，已被系统截断。请不要重复已经说过的内容，也不要道歉或解释，直接接着上面被打断的地方继续输出剩余内容。".to_string()
+}
+
+/// Fill `{unit}` / `{repeats}` in the correction prompt.
+///
+/// The unit is clamped here as well as in `LoopHit`: the prompt is user
+/// configurable, so an unbounded `{unit}` would let a pathological repetition
+/// balloon one request into megabytes.
+pub fn render_continue_prompt(template: &str, hit: &LoopHit) -> String {
+    let unit: String = hit.unit.chars().take(PROMPT_UNIT_MAX_CHARS).collect();
+    template
+        .replace("{unit}", &unit)
+        .replace("{repeats}", &hit.repeats.to_string())
+}
+
+/// How much of the repeated unit is echoed into the correction prompt.
+const PROMPT_UNIT_MAX_CHARS: usize = 60;
 
 /// A detected degenerate repetition: `unit` was repeated `repeats` times and
 /// covered `chars` characters at the tail of the window.
@@ -122,8 +179,19 @@ pub struct LoopHit {
     /// The repeated unit (truncated to <= 120 characters).
     pub unit: String,
     pub repeats: u32,
-    /// Characters covered by the repetition = repeats * unit_len.
+    /// Characters covered by the repetition = repeats * unit_len. For R6 this
+    /// counts only the NON-WHITESPACE characters, because R6 judges the
+    /// collapsed span (see `detect_loose`).
     pub chars: usize,
+    /// How many REAL characters at the tail of the judged span belong to the
+    /// repetition (plus, for R6, the trailing remark that follows it).
+    ///
+    /// This is what lets a caller CUT the loop out of the answer instead of
+    /// throwing the whole attempt away: `span[.. span_len - real_span]` is the
+    /// text the model wrote BEFORE it started repeating. R1-R5 report the same
+    /// value as `chars`; R6 differs because collapsing whitespace changes the
+    /// length of the region it matched.
+    pub real_span: usize,
 }
 
 /// Rolling character window plus the detection rules.
@@ -134,7 +202,7 @@ pub struct LoopGuard {
 
 impl LoopGuard {
     pub fn new(cfg: &LoopCfg) -> Self {
-        Self { cfg: *cfg, window: VecDeque::new() }
+        Self { cfg: cfg.clone(), window: VecDeque::new() }
     }
 
     /// Current window length (diagnostics/tests). Never exceeds `window_chars`.
@@ -166,6 +234,33 @@ impl LoopGuard {
         }
         self.append(delta);
         self.judge_tail()
+    }
+
+    /// The text the window holds, minus the last `exclude` characters.
+    ///
+    /// This is how a caller recovers "what the model had written BEFORE it
+    /// started repeating": `real_span` counts back from the window tail, so
+    /// dropping that many characters leaves exactly the pre-loop text. Used to
+    /// tell the model where it was cut off, and to re-seed the window so the
+    /// removed repetition cannot be re-detected.
+    pub fn text_before(&self, exclude: usize) -> String {
+        let len = self.window.len();
+        let keep = len.saturating_sub(exclude);
+        self.window.range(..keep).copied().collect()
+    }
+
+    /// Drop the window and re-seed it with the text that SURVIVED a loop cut.
+    ///
+    /// The repetition that was just removed must not stay in the window: the
+    /// very next frame would be judged against it and reported as a fresh loop
+    /// before the model had written a single character of the continuation.
+    /// Only a bounded tail is kept, which is all a tail judgement needs.
+    pub fn reseed(&mut self, tail: &str) {
+        self.window.clear();
+        let n = tail.chars().count();
+        let skip = n.saturating_sub(self.cfg.tail_chars);
+        let keep: String = tail.chars().skip(skip).collect();
+        self.append(&keep);
     }
 
     /// Append characters and trim the window from the head to `window_chars`.
@@ -249,8 +344,20 @@ impl LoopGuard {
         if !has_blank_line(&span) {
             return None;
         }
-        // Collapse whitespace: R6 judges shape, not layout.
-        let dense: Vec<char> = span.into_iter().filter(|c| !c.is_whitespace()).collect();
+        // Collapse whitespace: R6 judges shape, not layout. `real_at[k]` is the
+        // index in `span` of the k-th surviving character, which is how a match
+        // found on the collapsed text is mapped back onto the real one: without
+        // it a caller could not tell where the repetition actually begins and
+        // would have to discard the whole attempt (the behaviour this rule
+        // exists to avoid).
+        let mut dense: Vec<char> = Vec::with_capacity(span.len());
+        let mut real_at: Vec<usize> = Vec::with_capacity(span.len());
+        for (i, c) in span.iter().enumerate() {
+            if !c.is_whitespace() {
+                dense.push(*c);
+                real_at.push(i);
+            }
+        }
         let m = dense.len();
         if m < 2 {
             return None;
@@ -302,6 +409,11 @@ impl LoopGuard {
             unit: dense[end - unit_len..end].iter().collect::<String>().chars().take(UNIT_SNIPPET_CHARS).collect(),
             repeats: (covered / unit_len) as u32,
             chars: covered,
+            // Where the repetition really starts. Everything from there to the
+            // end of the span is loop (plus the model's own trailing remark),
+            // so a caller that cuts here keeps exactly the text written BEFORE
+            // the loop -- the whole point of reporting a real span.
+            real_span: span.len() - real_at[end - covered],
         })
     }
 
@@ -364,6 +476,9 @@ impl LoopGuard {
             unit: self.window.range(len - unit_len..len).take(UNIT_SNIPPET_CHARS).collect(),
             repeats: (covered / unit_len) as u32,
             chars: covered,
+            // R1-R5 match a contiguous suffix of the judged span, so the real
+            // characters it covers are exactly the collapsed count.
+            real_span: covered,
         })
     }
 
@@ -402,7 +517,11 @@ mod tests {
     use super::*;
 
     fn cfg() -> LoopCfg {
-        LoopCfg { enabled: true, min_chars: 64, repeat_min_chars: 24, repeat_ratio: 0.75, max_repeats: 4, window_chars: 4000, tail_chars: 128 }
+        LoopCfg {
+            enabled: true, min_chars: 64, repeat_min_chars: 24, repeat_ratio: 0.75,
+            max_repeats: 4, window_chars: 4000, tail_chars: 128,
+            continue_enabled: false, continue_max: 0, continue_prompt: String::new(),
+        }
     }
 
     fn hit(text: &str) -> Option<LoopHit> {
@@ -817,5 +936,82 @@ mod tests {
         assert_eq!(h.repeats, 18);
         assert_eq!(h.chars, 90);
         assert_eq!(emitted, 192, "the leak is bounded by the tail window, not the whole tail");
+    }
+
+    /// `real_span` is what makes a loop CUTTABLE: it says how many characters at
+    /// the tail of the judged span are the repetition, so everything before them
+    /// is text worth keeping. If it were wrong the cut would either leave part of
+    /// the loop in place or eat good prose.
+    #[test]
+    fn t26_real_span_locates_the_cut_for_r1_to_r5() {
+        // Contiguous repetition: the collapsed span and the real span coincide.
+        let mut g = LoopGuard::new(&cfg());
+        let mut hit = None;
+        for _ in 0..20 {
+            if let Some(h) = g.push("好问题。") { hit = Some(h); break; }
+        }
+        let h = hit.expect("the short-cycle shape must be detected");
+        assert_eq!(h.real_span, h.chars, "R1-R5 judge real characters: no collapsing");
+        assert_eq!(h.chars, h.unit.chars().count() * h.repeats as usize);
+        // The cut removes every COPY the detector counted and keeps exactly the
+        // one before them — which is real answer text, not part of the loop. So
+        // the kept text ends with a single unit, never with a run of them.
+        let kept = g.text_before(h.real_span);
+        assert_eq!(kept, h.unit, "only the first, un-repeated copy may survive: {kept:?}");
+    }
+
+    /// R6 collapses whitespace, so `chars` (collapsed) and `real_span` (real) are
+    /// DIFFERENT numbers. Using the collapsed one to cut would remove the wrong
+    /// amount of text, which is why the two are separate fields.
+    #[test]
+    fn t27_real_span_counts_real_characters_under_r6() {
+        let cfg = cfg();
+        let hello = "hello ";
+        let text = format!("{0}\n\n{0}\n\n（共 20 遍）", hello.repeat(11));
+        let chars: Vec<char> = text.chars().collect();
+        let mut g = LoopGuard::new(&cfg);
+        let mut hit = None;
+        for chunk in chars.chunks(12) {
+            let piece: String = chunk.iter().collect();
+            if let Some(h) = g.push(&piece) { hit = Some(h); break; }
+        }
+        let h = hit.expect("the real-world shape must be detected");
+        // R6 collapses whitespace, so the REAL length of the matched region is
+        // strictly larger than the collapsed one it reported. This is the whole
+        // reason the two are separate fields: cutting by `chars` would remove
+        // the wrong number of characters.
+        assert!(h.real_span > h.chars,
+            "R6 collapses spaces, so the real span must exceed the collapsed one (real={} collapsed={})",
+            h.real_span, h.chars);
+        // The cut removes the duplicate run AND the model's own concluding
+        // remark that follows it — a remark is a self-summary OF the loop, so
+        // it goes with it.
+        let kept = g.text_before(h.real_span);
+        assert!(!kept.contains("（共 20 遍）"), "the trailing remark must go with the loop: {kept:?}");
+        // WINDOW-BOUNDED, and that is honest rather than ideal: R1 lets the
+        // guard fire as soon as it has `min_chars` of evidence, so for this
+        // shape the judged window contains only the run itself and there is no
+        // earlier copy left inside it to keep. The caller sees an empty `kept`
+        // and falls back to trying another candidate instead of emitting a
+        // fragment of the repetition as an answer.
+        assert_eq!(kept, "", "at n=min_chars the window holds only the run");
+        assert_eq!(h.real_span, g.window_len(), "the whole judged window was the loop");
+    }
+
+    /// The window must not report the repetition it just cut as a fresh one.
+    #[test]
+    fn t28_reseed_forgets_the_removed_loop() {
+        let mut g = LoopGuard::new(&cfg());
+        let mut hit = None;
+        for _ in 0..20 {
+            if let Some(h) = g.push("好问题。") { hit = Some(h); break; }
+        }
+        let h = hit.expect("detected");
+        let kept = g.text_before(h.real_span);
+        g.reseed(&kept);
+        // The continuation's first characters must not be judged against the
+        // repetition that was just removed.
+        assert!(g.push_tail("新的内容").is_none(), "the cut loop must not be re-detected");
+        assert!(g.window_len() <= cfg().tail_chars, "the window keeps only a bounded tail");
     }
 }

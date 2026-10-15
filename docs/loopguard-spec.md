@@ -93,16 +93,28 @@ R4 的语义变成「**最近这段输出就是循环**」，泄漏量被 `tail_
 - 网关的**提交点**：流式响应在收到第一个合法内容帧之后才向客户端写首字节（I1）。
 - loop guard 只在 **PRE-COMMIT 窗口**生效：尚未提交前，文本增量先攒在 `pending` 里，不写客户端。
 - `hold = LoopCfg::min_chars`（默认 64 字符）：`pending` 达到 `hold` 且期间没有命中退化 → 一次性提交，客户端才开始收字节。
-- 命中退化 → 丢弃整个 `pending` + 该次尝试 → 记 `error_class = "degenerate_output"` → 按路由规则换下一个候选。客户端此时仍是零字节。
+- 命中退化 → **保留复读之前的正文**（`LoopHit::real_span` 指出复读占了尾部多少字符，`LoopGuard::text_before` 取回前面的正文），
+  并把复读整段从 `pending` 里切掉。切掉后有两种出路：
+  1. **纠正**（默认开）：对**同一个候选**发一次纠正请求——把正文尾部（≤4000 字符）作为 assistant 消息、
+     再附一条 user 消息说明原因（`你在复读了，接着上次被打断的输出继续`），续写接回同一条客户端流；
+  2. **回退**：复读前没有可交付的正文（`kept < hold`，说明模型从第一个字符就在复读）、纠正次数用尽、
+     总超时不够、纠正请求打不开时 → 记 `error_class = "degenerate_output"` → 按路由规则换下一个候选。
+  客户端在两种出路下都仍是零字节（I1 不变）。
+- ★纠正**不是新的一次尝试**：它发生在 `attempt_once` 内部，所以 `attempts` / 切换日志 / `loop_retries` 的语义都不变，
+  纠正次数单独记在 `loop_continues`。
 - ★`LoopCfg::from_retry` 在 `enabled == false` 时**强制 `min_chars = 0`**：关闭功能 = 不缓冲 = 第一帧立即提交（等于本功能不存在时的行为）。
   保持缓冲却不检测等于「白白推迟首字节」，是欺骗。
 - 代价（必须如实写进 README）：开启时首字节推迟约 `min_chars` 个字符（默认 64）。
-- **提交后**（I6）：字节已在客户端手里，**不能重试**——重试等于把前缀再发一遍。此时命中退化只会：
+- **提交后**（I6）：字节已在客户端手里，**不能重新开始**——重试等于把前缀再发一遍。此时命中退化会：
   1. 先把已装配但未发出的 tool call 冲出去（避免把参数截半）；
-  2. 发一个 `FinishReason::Length` 的结束帧（客户端看到的是一条**正常结束**的回答）；
-  3. `feed_close_clean` 正常收尾（`[DONE]` / 终止符 + Close）；
-  4. 请求日志写 `loop_truncated = 1`（`status` 仍是 `success`，因为客户端确实收到了一条完整合法的流）。
-- 代价：中段复读**无法避免**已发出的那部分（这是物理限制），只能把泄漏量约束到 `tail_chars` 决定的量级。
+  2. **纠正**（默认开）：对同一候选发一次纠正请求，把续写**接回同一条流**——客户端看到的是一条连续的回答，
+     且复读前的正文一个字都没丢。这与提交前是同一条纠正路径，只是拼接点不同；
+  3. **回退**（纠正关掉 / 次数用尽 / 总超时不够 / 打不开 / 模型复读同一段内容）：发一个 `FinishReason::Length`
+     的结束帧（客户端看到的是一条**正常结束**的回答），`feed_close_clean` 正常收尾，请求日志写 `loop_truncated = 1`
+     （`status` 仍是 `success`，因为客户端确实收到了一条完整合法的流）。
+- 代价：中段复读**无法避免**已发出的那部分（这是物理限制）。每次纠正都是一条新的上游流，新流同样要先攒够证据
+  才允许再切，所以「反复复读且不收手」的模型每次纠正会多泄漏一个证据窗口；`can_continue_now` 的**卡住判定**
+  （复读单元与上一轮完全相同 → 不再纠正）把这种模型的代价压回一次纠正。这个量级由 l13f 钉住。
 
 ---
 
@@ -172,7 +184,7 @@ impl LoopGuard {
 
 ---
 
-## 4. `server/src/config.rs`（`RetryConfig` 新增 7 个字段）
+## 4. `server/src/config.rs`（`RetryConfig` 新增 10 个字段）
 
 | 字段 | 默认 | `#[serde(default = ...)]` |
 |---|---|---|
@@ -183,8 +195,18 @@ impl LoopGuard {
 | `loop_guard_max_repeats` | `4` | `d_loop_guard_max_repeats` |
 | `loop_guard_window_chars` | `4000` | `d_loop_guard_window_chars` |
 | `loop_guard_tail_chars` | `128` | `d_loop_guard_tail_chars` |
+| `loop_guard_continue_enabled` | `true` | `d_loop_guard_continue_enabled` |
+| `loop_guard_continue_max` | `2`（上限 `LOOP_CONTINUE_MAX_CAP = 5`） | `d_loop_guard_continue_max` |
+| `loop_guard_continue_prompt` | 内置中文提示词（见下） | `d_loop_guard_continue_prompt` |
 
 **三处同步**：字段声明 + `fn d_xxx()` + 手写 `impl Default for RetryConfig`。缺任何一处都会让老配置文件与默认配置走岔。
+
+`d_loop_guard_continue_prompt()` 与 `loopguard::d_continue_prompt()` 是**同一段文案的两份拷贝**（同一句文档注释在两侧都写了「保持同步」）：
+
+> 你刚才的输出出现了复读：同一段内容「{unit}」连续重复了 {repeats} 次，已被系统截断。请不要重复已经说过的内容，也不要道歉或解释，直接接着上面被打断的地方继续输出剩余内容。
+
+- `{unit}` 在渲染时按 `PROMPT_UNIT_MAX_CHARS = 60` 截断——提示词可配置，不设上限会让病态复读把一次请求撑成兆字节。
+- 配置里留空（或全空白）时回落到内置文案，绝不发出没有「为什么」的纠正提示词。
 
 ---
 
@@ -207,8 +229,20 @@ impl LoopGuard {
   2. **Finish 帧**：正常收尾，提交；
   3. **Done（流结束）**：正常收尾，提交；
   4. **流结束返回 None**：按空响应/正常收尾处理（与既有语义一致）。
-- `proxy_err_message` 增加 `DegenerateOutput` 分支，文案形如
-  `degenerate output: repeated {unit_len}-char unit {repeats} times`（用于日志与 `switch_logs.message`）。
+- `proxy_err_message` 增加 `DegenerateOutput` 分支，文案是**中文且带原因**：
+  `输出复读：同一段内容连续重复了 {repeats} 次（重复单元 {unit_len} 个字符：{unit}）`（用于日志与 `switch_logs.message`）。
+  ★`proxy_err_message` 的全部文案都是中文（用户看不懂英文报错），`code` 标识符保持英文供程序判断。
+- 纠正引擎（`continuation_ir` / `can_continue_now` / `open_continuation` / `start_post_commit_round`）：
+  - `continuation_ir(base, kept, prompt)`：克隆原 IR，追加一条 assistant 消息（`kept` 的尾部 ≤ `CONTINUE_CONTEXT_CHARS = 4000` 字符，**空白时整条跳过**——上游会拒绝空 assistant 消息），
+    再追加一条 user 消息（渲染后的提示词）。同候选、同渠道、同上游模型：这是**同一条回答的续写**，换候选等于把两个模型的输出缝在一起。
+  - `can_continue_now(cfg, done, deadline, ttfb, stuck)`：四道闸门——`continue_enabled`、`done < continue_max`、
+    总超时留得下这次请求（`now < deadline - ttfb`，纠正**绝不延长**本次预算）、以及 `stuck`（复读单元与上一轮完全相同 → 模型卡住了，不再纠正）。
+  - `LoopGuard::reseed(&kept)`：切掉复读后**重建窗口**，只保留 `tail_chars` 的尾部。不重建的话下一帧会立刻拿被切掉的复读当证据、报出一次新的复读。
+  - `LoopGuard::text_before(real_span)`：从窗口尾部回退 `real_span` 个字符，得到「复读之前的正文」。
+  - `pending` 的切法与窗口**不同**：`pending` 是窗口**减去触发帧**（触发帧进了 guard 但没进 `pending`），
+    所以丢弃量是 `real_span - trigger_len`，按 `real_span` 直接切会啃掉好文本。
+  - 复读前正文不足 `hold`（= 提交阈值）时**不纠正也不交付**，仍走旧回退：说明模型从第一个字符就在复读，此时「续写」没有可续的正文，
+    硬发出去等于把复读的碎片当成成功回答交给客户端。
 - POST-COMMIT pump：同一个 `guard` 被 move 进 pump 任务（跨提交点保持窗口，因此**横跨提交点的循环**也判得准），
   `FrameClass::Text` 分支改为 `guard.push_tail(&t)`；命中即按 §2 的提交后流程截断收尾并 `return`。
 - 非流式路径不改（见 §8.1）。
@@ -221,6 +255,13 @@ impl LoopGuard {
 - 落库口径：`loop_retries` = 本次客户端请求的 `records` 里 `error_class == "degenerate_output"` 的条数（= 内部被拦下的次数）。
 - `switch_logs` 每条退化尝试单独一行：`outcome = "failed"`、`error_class = "degenerate_output"`、`channel_id` 是被丢弃的那个候选。
 - `list_request_logs` / `stats_*` / `group_member_stats` 都要带出 `loop_retries`（按 `final_channel::final_upstream_model` 聚合）。
+- `request_logs` 另有 `loop_continues INTEGER NOT NULL DEFAULT 0`（同样含老库 ALTER 迁移兜底）：本次回答**实际发起过几次纠正**。
+  `0` = 从没复读；`> 0` = 复读过、被纠正过，且客户端拿到的是**完整回答**（与 `loop_truncated` 语义相反，两者互斥：纠正成功就不会截断）。
+- `request_logs` 另有 `error_class TEXT NOT NULL DEFAULT ''` 与 `error_message TEXT NOT NULL DEFAULT ''`（同样含老库 ALTER 迁移兜底）：
+  **失败原因直接记在请求日志这一行上**。没有这两列时 `exhausted` 行只说「失败了」，真实原因只能去切换日志里逐条翻——这正是要修的缺口。
+  成功行 `error_class` 为空；被纠正过的回答写 `loop_continue`，被截断的写 `loop_truncated` 文案。
+- `store::error_class_label(class)` 是失败类的**唯一中文词表**：控制台、切换日志与客户端错误消息共用它，
+  三处不可能对同一个类给出不同说法。
 - `request_logs` 另有 `loop_truncated INTEGER NOT NULL DEFAULT 0`（同样含老库 ALTER 迁移兜底），口径是**提交后截断**：
   `1` = 这条回答被 loop guard 截断过。★与 `loop_retries` **语义相反**，不可混用：
   `loop_retries` 那些尝试客户端**一个字节都没看到**（提交前丢弃），而 `loop_truncated` 的回答客户端**已经收到了**（只是没给完）。
@@ -231,9 +272,12 @@ impl LoopGuard {
 ## 8. 诚实边界（必须写进 README，不含糊）
 
 1. **只有流式路径检测退化**。非流式（`stream: false`）一次拿完整 JSON，没有增量帧，本版本不检测。
-2. **提交后能检测，但不能重试**。已经向客户端写了首字节之后再出现的退化**无法**内部换候选（换了就等于往同一条回答里塞第二次回答，违反 I2），
-   所以处置是**就地截断 + 正常收尾**（§2）。★因此提交后命中**一定**会泄漏一段已发出的复读文本，泄漏量由 `tail_chars` 决定（默认 128 字符量级，实测 24 个重复单元 ≈ 96 字符）。
-   这是物理限制（字节已在客户端手里），不是实现缺陷；把它说成"客户端看不到"是错的。
+2. **提交后能检测，也能纠正，但不能重新开始**。已经向客户端写了首字节之后再出现的退化**无法**内部换候选
+   （换了就等于往同一条回答里塞第二次回答，违反 I2），处置是**纠正续写**；纠正不可用时才**就地截断 + 正常收尾**（§2）。
+   ★无论哪条路，提交后命中**一定**会泄漏一段已发出的复读文本，泄漏量由 `tail_chars` 与纠正轮数共同决定：
+   每条新流都要先攒够证据才允许再切，所以「反复复读且不收手」的模型每次纠正多泄漏一个证据窗口，
+   卡住判定把它压回一次纠正。l13f 把这条不等式钉在测试里（`leaked <= (1 + loop_continues) * 24`）。
+   这是物理限制（字节已在客户端手里），不是实现缺陷；把它说成「客户端看不到」是错的。
    注意这与旧行为不同：旧版本对提交后的复读**完全不检测**（只有把整段尝试丢掉才安全，所以当时干脆不看）。
 3. 开启 loop guard 的代价是首字节推迟约 `min_chars` 个字符；关掉它首字节立即返回，但退化不再被拦截。
 4. 误判是可能的（长文里恰好出现高比例重复，例如代码里连续空行/重复分隔线）。阈值可配；命中只影响该次尝试，会被内部重试吸收。
@@ -242,10 +286,13 @@ impl LoopGuard {
 
 ## 9. 客户端
 
-- 设置页：死循环拦截开关 + **6** 个阈值输入（`loop-guard-enabled` / `-min-chars` / `-repeat-min-chars` / `-repeat-ratio` / `-max-repeats` / `-window-chars` / `-tail-chars`），
-  并把「提交前 5 项 / 提交后 1 项」的差别写在页面上。
+- 设置页：死循环拦截开关 + **6** 个阈值输入（`loop-guard-enabled` / `-min-chars` / `-repeat-min-chars` / `-repeat-ratio` / `-max-repeats` / `-window-chars` / `-tail-chars`）
+  + **3 个纠正项**（`loop-guard-continue-enabled` / `-continue-max` / `-continue-prompt`），并把「提交前 / 提交后 / 纠正」的差别写在页面上。
 - 日志页：`error_class == "degenerate_output"` 显示为「输出退化」（warn 色）；`loop_truncated > 0` 的行状态显示为
   **「成功（已截断）」**（warn 色 + tooltip 说明），不得只写「成功」——那是把截断过的回答当成完好回答。
+  `loop_continues > 0` 的行显示为**「成功（已纠正复读）」**（warn 色 + tooltip 说明已自动纠正几次），同样不得只写「成功」。
+- 日志页新增**「失败原因」列**：直接渲染 `error_message`（失败行为中文原因，成功行为 `—`），鼠标悬停看全文。
+  这一列就是「报错要看得懂」的落点：不必再去切换日志里翻是哪条尝试、为什么失败。
 - 统计页：死循环拦截次数（`loop_retries`）与截断收尾次数（`loop_truncated`）**分两个徽章**，
   因为前者「客户端看不到」、后者「客户端收到了」；分组详情/模型详情同样展示。
 

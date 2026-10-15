@@ -44,8 +44,15 @@ async fn t02_single_500_exhausts_clean_502() {
     let (status, body) = post_chat(&router, EXPOSED, false).await;
     assert_eq!(status, 502);
     leak_scan_json(&body);
+    // The message must say HOW MANY attempts failed and WHY. Checking for the
+    // word "all" only worked while the text was English; the properties that
+    // matter are language-independent and are what the operator actually needs.
     let msg = body.pointer("/error/message").and_then(|m| m.as_str()).unwrap_or_default();
-    assert!(msg.contains("all"), "error should be gateway-phrased: {msg}");
+    assert!(msg.contains('2'), "the attempt count must be stated: {msg}");
+    assert!(
+        msg.contains("上游服务端错误"),
+        "the failure CAUSE must be stated, not just the count: {msg}"
+    );
 }
 
 // ---- 3. garbage body (not JSON) => contained, next candidate or clean 502 ----

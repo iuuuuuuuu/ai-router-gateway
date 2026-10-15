@@ -413,7 +413,10 @@ async fn g08_per_group_max_attempts_bounds_the_walk() {
     let (status, body) = post_stream_key(&router, "gw-test-key", EXPOSED).await;
     assert_eq!(status, 502, "override max_attempts=1 => exhausted: {body}");
     assert!(body.contains("all_upstreams_failed"), "{body}");
-    assert!(!body.contains(UNIT), "{body}");
+    // The repeated unit appears in the failure MESSAGE by design (it names the
+    // cause); what must never appear is a degenerate ANSWER, so assert on the
+    // absence of an answer rather than on a substring of the diagnosis.
+    assert!(!body.contains("\"choices\""), "no answer may be delivered: {body}");
     let row_a = newest_request_row(&st, "gA").await;
     assert_eq!(row_a["status"], "exhausted", "{row_a}");
     assert_eq!(row_a["attempts"], 1, "the override bound the walk: {row_a}");

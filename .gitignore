@@ -120,6 +120,8 @@ Desktop.ini
 /tools/_diag-loop-rate.mjs
 /tools/_shapes-upstream.mjs
 /tools/_diag-shapes.mjs
+/tools/_diag-continue.mjs
+/tools/_diag-ui-columns.mjs
 /tools/_diag-r4.mjs
 /tools/_build-client.sh
 /tools/_accept-looptail.mjs
@@ -133,6 +135,7 @@ Desktop.ini
 /tools/_accept-midloop.mjs
 /tools/_verify-task43.mjs
 /tools/_verify-d2-cost.mjs
+/tools/_tmp-logs.mjs
 /tools/_verify-d2-waste.mjs
 /tools/_db-schema.mjs
 /tools/_d3-probe.mjs

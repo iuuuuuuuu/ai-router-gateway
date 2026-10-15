@@ -5,7 +5,7 @@
 import { computed, onMounted, ref } from "vue";
 import { Check, CircleAlert, Database, Eye, EyeOff, LoaderCircle, Power, Repeat, Rocket, Server, Timer, Trash2 } from "@lucide/vue";
 import {
-  Alert, Btn, Card, Field, IconBtn, Modal, SecInput, TInput, TSelect, TToggle,
+  Alert, Btn, Card, Field, IconBtn, Modal, SecInput, TInput, TSelect, TTextarea, TToggle,
 } from "../components/ui";
 import { api, getBase, getKey, setBase, setKey } from "../api";
 import { RETRY_PRESETS, matchRetryPreset, retryPresetOptions } from "../retry-presets";
@@ -184,6 +184,9 @@ onMounted(() => {
     if (typeof r.loop_guard_max_repeats !== "number") r.loop_guard_max_repeats = 4;
     if (typeof r.loop_guard_window_chars !== "number") r.loop_guard_window_chars = 4000;
     if (typeof r.loop_guard_tail_chars !== "number") r.loop_guard_tail_chars = 128;
+    if (typeof r.loop_guard_continue_enabled !== "boolean") r.loop_guard_continue_enabled = true;
+    if (typeof r.loop_guard_continue_max !== "number") r.loop_guard_continue_max = 2;
+    if (typeof r.loop_guard_continue_prompt !== "string") r.loop_guard_continue_prompt = "";
   }
   void loadAutostart();
 });
@@ -396,14 +399,46 @@ onMounted(() => {
                 />
               </div>
             </Field>
+            <Field
+              label="复读纠正（保留正文续写）"
+              hint="命中复读时不再整段丢弃：网关保留复读之前的正文，在提示词里说明「你在复读了，接着被打断的地方继续」，让同一个上游接着写，并把续写接回同一条客户端流。关闭后回到旧行为：提交前命中就丢弃整段换候选，提交后命中就就地截断收尾"
+            >
+              <div data-test="loop-guard-continue-enabled">
+                <TToggle v-model="retry.loop_guard_continue_enabled" data-test="loop-guard-continue-enabled" @change="markDirty()" />
+              </div>
+            </Field>
+            <Field
+              label="最多纠正几次"
+              hint="同一条回答里最多发起几次纠正。每次纠正都是一次真实的上游调用，所以它受总超时约束，绝不会延长本次请求的预算。模型在纠正后仍然复读同一段内容时视为「卡住了」，会提前停止而不是把次数用完"
+            >
+              <div data-test="loop-guard-continue-max">
+                <TInput
+                  v-model.number="retry.loop_guard_continue_max" type="number" min="0" max="5"
+                  data-test="loop-guard-continue-max" @input="markDirty()"
+                />
+              </div>
+            </Field>
           </div>
+          <Field
+            label="纠正提示词"
+            hint="发给上游的纠正提示词。可用 {unit} 占位重复单元、{repeats} 占位重复次数；留空则使用内置中文提示词。提示词必须说明「为什么被打断」，否则模型容易重新开始或道歉"
+          >
+            <div data-test="loop-guard-continue-prompt">
+              <TTextarea
+                v-model="retry.loop_guard_continue_prompt" :rows="3"
+                placeholder="留空使用内置提示词：你刚才的输出出现了复读……"
+                data-test="loop-guard-continue-prompt" @input="markDirty()"
+              />
+            </div>
+          </Field>
           <p class="mt-2 text-[11.5px] leading-4 text-ink-3">
-            以上 6 项只影响退化判定，<span class="font-medium text-ink-2">不参与上面的预算校验</span>（预算公式只看重试次数与超时）。
+            以上各项只影响退化判定与纠正，<span class="font-medium text-ink-2">不参与上面的预算校验</span>（预算公式只看重试次数与超时）。
           </p>
           <p class="mt-1.5 text-[11.5px] leading-4 text-ink-3">
-            前 5 项作用于<span class="font-medium text-ink-2">提交前</span>：命中即丢弃整段、内部换候选重试，客户端零字节可见。
-            第 6 项作用于<span class="font-medium text-ink-2">提交后</span>：内容已经发出去无法收回，命中只会
-            <span class="font-medium text-ink-2">就地截断并正常收尾</span>，不再重试。
+            前 5 项作用于<span class="font-medium text-ink-2">提交前</span>：命中即保留复读前的正文，在提示词里说明原因后让同一个上游接着写；
+            只有<span class="font-medium text-ink-2">一个可用候选</span>时才会退回旧行为（丢弃整段换候选）。
+            提交后命中同样会纠正并接回同一条流；纠正次数用尽、总超时不够、或模型复读同一段内容时，
+            才<span class="font-medium text-ink-2">就地截断并正常收尾</span>。
           </p>
         </div>
 

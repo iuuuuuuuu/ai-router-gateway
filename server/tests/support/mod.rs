@@ -66,6 +66,14 @@ pub enum Behavior {
     /// B1 regression: text shorter than the holdback, then a tool call. The
     /// buffered text must be committed WITH the tool call, never dropped.
     ToolAfterShortText,
+    /// The end-to-end proof for loop CORRECTION: a normal committed prefix, then
+    /// a repetition — but ONLY when the request does not carry the correction
+    /// prompt. When the prompt is present this answers with a clean continuation,
+    /// so a request that recovers proves the prompt really reached the upstream
+    /// AND that the continuation was spliced onto the same client stream.
+    /// The decision is read from the REQUEST BODY, so the fixture is stateless
+    /// and cannot pass by accident of ordering.
+    DegenerateThenContinueOnPrompt,
     /// 200 + OpenAI-shaped model list whose ids ARE the request headers this
     /// GET really arrived with (`hdr <name>=<value>`), plus the serving path
     /// as `hdr x-upstream-prefix=<prefix>`. Lets a test assert on the wire
@@ -388,6 +396,35 @@ async fn handle_beh(beh: Behavior, body: String, hdrs: axum::http::HeaderMap, pr
             sse.push_str(&openai_tail_sse("tool_calls"));
             ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
         }
+        Behavior::DegenerateThenContinueOnPrompt => {
+            // Two behaviours in one fixture, chosen by the REQUEST BODY:
+            //   - no correction prompt  -> normal prefix, then a real repetition
+            //   - correction prompt present -> a clean continuation
+            // The gateway only adds the prompt when it decides to correct, so a
+            // recovered request is proof the whole path ran: detection, cut,
+            // prompt, upstream call, and splice.
+            // BOTH conditions are required, and that is deliberate: keying on
+            // the prompt alone would still pass if the gateway sent the reason
+            // but DROPPED the answer it was continuing (the fixture would
+            // recover either way). Requiring the kept prefix in the request
+            // makes the test fail whenever the pre-loop text is discarded.
+            if body.contains(CONTINUE_MARKER) && body.contains("abcdefghijklmnopqrstuvwxyz") {
+                let mut sse = openai_text_chunk(CONTINUED);
+                sse.push_str(&openai_tail_sse("stop"));
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+            } else {
+                let mut sse = String::new();
+                // 120 chars of normal prose: past the 64-char holdback, so the
+                // answer COMMITS and the loop below is a post-commit hit.
+                for i in 0..10usize {
+                    let frame: String = (0..12).map(|k| (b'a' + ((i * 12 + k) % 26) as u8) as char).collect();
+                    sse.push_str(&openai_text_chunk(&frame));
+                }
+                for _ in 0..40 { sse.push_str(&openai_text_chunk("好问题。")); }
+                sse.push_str(&openai_tail_sse("stop"));
+                ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+            }
+        }
         Behavior::EchoBody => {
             // Reply with the REQUEST BODY this upstream received, as one OpenAI
             // text delta. A test can then assert on the exact bytes the gateway
@@ -635,6 +672,12 @@ pub fn test_retry() -> RetryConfig {
 /// Build a gateway Config: one group ("g1"), key "gw-test-key", channels
 /// pointing at fake prefixes; tier1 = channels[..tier1], rest into tier 2.
 pub const EXPOSED: &str = "my-model";
+
+/// A phrase that appears ONLY in the gateway's correction prompt. The fixture
+/// above keys off it, so it must be a literal from the prompt text.
+pub const CONTINUE_MARKER: &str = "接着上面被打断的地方继续";
+/// The text the upstream returns once it receives the correction prompt.
+pub const CONTINUED: &str = "CONTINUED-OK";
 
 pub fn test_config(
     base: &str,

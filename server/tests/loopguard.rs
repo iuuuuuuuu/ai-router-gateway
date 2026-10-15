@@ -84,8 +84,11 @@ async fn l01_tier1_degenerate_falls_to_tier2_good() {
     let (status, sse) = post_chat_stream(&router, EXPOSED).await;
     assert_eq!(status, 200, "sse={sse}");
 
-    // I1: the discarded attempt must not have leaked a single byte.
-    assert!(!sse.contains(UNIT), "degenerate text reached the client: {sse}");
+    // I1: the discarded attempt must not have leaked a single byte. Checked on
+    // the ANSWER, not on the raw body: the failure message legitimately quotes
+    // the repeated unit (it is how an operator recognizes the shape), so a
+    // substring test on the whole body would confuse a diagnosis with a leak.
+    assert!(!client_text(&sse).contains(UNIT), "degenerate text reached the client: {sse}");
     assert_eq!(client_text(&sse), GOOD, "client must see exactly the good answer: {sse}");
     assert_stream_clean(&sse);
 
@@ -101,7 +104,12 @@ async fn l01_tier1_degenerate_falls_to_tier2_good() {
     assert_eq!(rows[1]["outcome"], "failed");
     assert_eq!(rows[1]["channel_id"], "ch0");
     assert_eq!(rows[1]["http_status"], serde_json::Value::Null);
-    assert_eq!(rows[1]["message"], "degenerate output: repeated 4-char unit 15 times");
+    // The switch-log message is the Chinese cause (item 3): it must name the
+    // repetition shape so the console can show WHY the attempt was rejected.
+    assert_eq!(
+        rows[1]["message"],
+        "输出复读：同一段内容连续重复了 15 次（重复单元 4 个字符：好问题。）",
+    );
 
     let req = newest_request_row(&st).await;
     assert_eq!(req["status"], "success");
@@ -173,7 +181,10 @@ async fn l05_single_degenerate_candidate_ends_all_upstreams_cooling() {
     let (status, body) = post_chat_stream(&router, EXPOSED).await;
     assert_eq!(status, 503, "body={body}");
     assert!(body.contains("all_upstreams_cooling"), "body={body}");
-    assert!(!body.contains(UNIT), "degenerate text reached the client: {body}");
+    // The repeated unit appears in the error MESSAGE by design (it names the
+    // cause); what must never appear is degenerate answer TEXT. This is an
+    // error response, so there is no answer at all — assert exactly that.
+    assert!(!body.contains("\"choices\""), "no answer may be delivered: {body}");
 
     let rows = switch_rows(&st);
     assert_eq!(rows.len(), 2, "both discarded attempts must be logged: {rows:?}");
@@ -198,7 +209,7 @@ async fn l06_single_degenerate_candidate_exhausts_its_attempts() {
     let (status, body) = post_chat_stream(&router, EXPOSED).await;
     assert_eq!(status, 502, "body={body}");
     assert!(body.contains("all_upstreams_failed"), "body={body}");
-    assert!(!body.contains(UNIT), "degenerate text reached the client: {body}");
+    assert!(!body.contains("\"choices\""), "no answer may be delivered: {body}");
 
     let req = newest_request_row(&st).await;
     assert_eq!(req["status"], "exhausted");
@@ -362,6 +373,104 @@ async fn l12_buffered_text_before_a_tool_call_is_not_dropped() {
     assert_eq!(req["loop_retries"], 0);
 }
 
+// ---- 7c. loop CORRECTION: keep the answer, state the reason, carry on ----
+
+/// The behavior the user asked for, end to end. The upstream repeats itself
+/// after a normal prefix, and recovers ONLY when the request carries the
+/// correction prompt — so a recovered answer proves every link in the chain:
+/// the loop was detected, the repetition was cut, the pre-loop text was KEPT,
+/// the reason was stated in the prompt, and the continuation was spliced onto
+/// the same client stream.
+///
+/// It also proves the answer is not thrown away whole: the 120-character prefix
+/// the upstream sent before looping is still there, in front of the
+/// continuation, with no repetition between them.
+#[tokio::test]
+async fn l15_a_loop_is_corrected_instead_of_discarded() {
+    let (st, router) = harness(&[Behavior::DegenerateThenContinueOnPrompt], 1, test_retry()).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200, "sse={sse}");
+    assert_stream_clean(&sse);
+
+    let text = client_text(&sse);
+    // 1. The pre-loop answer SURVIVED. This is the whole point: the earlier
+    //    behavior discarded the attempt and the client saw nothing of it.
+    assert!(
+        text.starts_with("abcdefghijklmnopqrstuvwxyz"),
+        "the text written before the loop must be kept, not discarded: {text:?}"
+    );
+    // 2. The continuation arrived, spliced after it.
+    assert!(text.contains(CONTINUED), "the continuation must be spliced in: {text:?}");
+    assert!(
+        text.find(CONTINUED).unwrap() > text.find("abcdefghijklmnopqrstuvwxyz").unwrap(),
+        "the continuation belongs AFTER the kept prefix: {text:?}"
+    );
+    // 3. The repetition that TRIGGERED the cut is not relayed after it: the
+    //    continuation is what follows the cut, not more of the loop.
+    let after = &text[text.find(CONTINUED).unwrap() + CONTINUED.len()..];
+    assert!(
+        !after.contains(UNIT),
+        "nothing may follow the continuation but the continuation: {text:?}"
+    );
+    // The frames that arrived before the guard had enough evidence to judge
+    // ARE relayed — they were already on the wire, and the tail window is what
+    // bounds that leak. Pinned as a bound rather than a zero so a regression
+    // that widens the window is caught here.
+    let leaked = text.matches(UNIT).count();
+    assert!(leaked < 40, "the whole loop must not be relayed ({leaked} copies): {text:?}");
+
+    let req = newest_request_row(&st).await;
+    assert_eq!(req["status"], "success", "{req}");
+    assert_eq!(req["loop_continues"], 1, "the correction must be recorded: {req}");
+    assert_eq!(req["attempts"], 1, "a correction is not a new attempt: {req}");
+    assert_eq!(req["error_class"], "loop_continue", "{req}");
+    assert_eq!(req["loop_truncated"], 0, "a corrected answer is not a truncated one: {req}");
+    assert_eq!(req["final_channel"], "ch0", "{req}");
+}
+
+/// The correction prompt must STATE THE REASON, which is what the user asked
+/// for: telling the model "you are repeating, carry on from where you were cut
+/// off" is what makes it continue instead of restarting or apologizing.
+///
+/// The prompt text itself is asserted in the unit tests (it is a config string
+/// with `{unit}`/`{repeats}` substituted); what this test pins is that the
+/// CORRECTION ROUND IS NOT A NEW ATTEMPT. It stays inside the same attempt, so
+/// the walk's attempt accounting — and therefore the switch log and the
+/// `attempts` figure — still describes one upstream choice, not two.
+#[tokio::test]
+async fn l16_a_correction_round_is_not_a_new_attempt() {
+    let (st, router) = harness(&[Behavior::DegenerateThenContinueOnPrompt], 1, test_retry()).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200, "sse={sse}");
+    assert!(client_text(&sse).contains(CONTINUED), "sse={sse}");
+
+    let rows = switch_rows(&st);
+    assert_eq!(rows.len(), 1, "a correction is not a separate attempt: {rows:?}");
+    assert_eq!(rows[0]["error_class"], "committed", "{rows:?}");
+    assert_eq!(rows[0]["attempt_no"], 1, "{rows:?}");
+
+    let req = newest_request_row(&st).await;
+    assert_eq!(req["loop_continues"], 1, "{req}");
+    assert_eq!(req["attempts"], 1, "{req}");
+    assert_eq!(req["loop_retries"], 0, "nothing was discarded: {req}");
+}
+
+/// A loop the guard can only see as a pure repetition (nothing before it) must
+/// still be handled the old way: there is no answer to continue FROM, so the
+/// walk tries another candidate rather than delivering a fragment of the loop.
+#[tokio::test]
+async fn l17_a_loop_with_no_prefix_still_falls_back() {
+    let (st, router) = harness(&[Behavior::DegenerateShortCycle, Behavior::GoodStream], 1, test_retry()).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200, "sse={sse}");
+    assert_eq!(client_text(&sse), GOOD, "the fallback must answer: {sse}");
+    assert!(!client_text(&sse).contains(UNIT), "no fragment of the loop: {sse}");
+
+    let req = newest_request_row(&st).await;
+    assert_eq!(req["loop_retries"], 1, "recorded as a rejected attempt: {req}");
+    assert_eq!(req["loop_continues"], 0, "nothing was continued: {req}");
+}
+
 // ---- 8. post-commit repetition IS detected, and the answer is truncated ----
 
 #[tokio::test]
@@ -369,7 +478,12 @@ async fn l13_post_commit_repetition_truncates_the_answer() {
     // The answer commits on 120 characters of normal text; the loop that
     // follows must be CUT, not relayed. Before this, a model that answered
     // normally and THEN started repeating was never caught at all.
-    let (st, router) = harness(&[Behavior::NormalThenDegenerate], 1, test_retry()).await;
+    //
+    // Correction is DISABLED here on purpose: this fixture repeats forever and
+    // never recovers, so it isolates the fallback path — "no round could help,
+    // so finish where we are" — from the correction path that l15 proves.
+    let (st, router) = harness(&[Behavior::NormalThenDegenerate], 1,
+        retry_with(|r| { r.loop_guard_continue_enabled = false; })).await;
     let (status, sse) = post_chat_stream(&router, EXPOSED).await;
     assert_eq!(status, 200, "sse={sse}");
     assert_stream_clean(&sse);
@@ -385,8 +499,61 @@ async fn l13_post_commit_repetition_truncates_the_answer() {
     let req = newest_request_row(&st).await;
     assert_eq!(req["status"], "success", "the client still got a valid answer: {req}");
     assert_eq!(req["loop_truncated"], 1, "the cut must be recorded: {req}");
+    assert_eq!(req["loop_continues"], 0, "no round was allowed: {req}");
     assert_eq!(req["attempts"], 1, "no retry may happen after commit");
     assert_eq!(req["final_channel"], "ch0");
+}
+
+/// The honest cost of correcting a HOPELESS loop, pinned so it cannot grow
+/// unnoticed. Each correction round is a fresh stream, and a fresh stream needs
+/// fresh evidence before the guard may cut it — so a model that loops again on
+/// every round leaks that evidence once per round. With the cap at 2, that is
+/// three streams' worth instead of one.
+///
+/// This is the deliberate trade: a model that DOES recover (the case the
+/// correction exists for) yields a complete answer instead of a truncated one.
+/// The bound below is what makes it acceptable, and the answer is still cut and
+/// reported, never relayed whole.
+#[tokio::test]
+async fn l13f_a_hopeless_loop_is_still_cut_after_the_round_cap() {
+    let (st, router) = harness(&[Behavior::NormalThenDegenerate], 1, test_retry()).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200, "sse={sse}");
+    assert_stream_clean(&sse);
+
+    let text = client_text(&sse);
+    assert!(text.starts_with("abcdefghijklmnopqrstuvwxyz"), "prefix lost: {text:?}");
+
+    let req = newest_request_row(&st).await;
+    assert_eq!(req["loop_truncated"], 1, "a hopeless loop still ends truncated: {req}");
+    assert_eq!(req["attempts"], 1, "a correction is not a new attempt: {req}");
+    // The SAME unit coming back after a correction means the model is stuck, so
+    // the round cap is NOT spent: one round is tried, then the loop stops. That
+    // is the whole reason the stuck rule exists — without it a stuck model would
+    // relay another tail window for every remaining round.
+    assert_eq!(req["loop_continues"], 1, "a stuck model must not burn the cap: {req}");
+    // BOTH facts are on the row. This answer WAS corrected once and THEN ended
+    // truncated; reporting only one of them would misdescribe what happened.
+    let msg = req["error_message"].as_str().unwrap_or_default();
+    assert!(msg.contains("纠正") && msg.contains("截断"), "both facts must be reported: {msg}");
+
+    // The leak law, pinned as an inequality on the mechanism: each stream that is
+    // read leaks at most the evidence the guard needs before it may cut
+    // (repeat_min_chars = 24 here), and `1 + continues` streams were read.
+    let leaked = text.matches(UNIT).count();
+    let streams = 1 + req["loop_continues"].as_u64().unwrap() as usize;
+    assert!(
+        leaked <= streams * 24,
+        "leak must stay bounded by {streams} streams x 24 evidence chars, got {leaked}: {text:?}"
+    );
+    // And every stream really was ABANDONED rather than drained. Each stream
+    // sends 40 repetitions, so a guard that merely stopped emitting would leak
+    // 40 per stream; the cut keeps it far below that. This is the property that
+    // matters: the client is never handed a whole loop, however many rounds ran.
+    assert!(
+        leaked < 40 * streams,
+        "a whole loop reached the client ({leaked} repetitions over {streams} streams): {text:?}"
+    );
 }
 
 #[tokio::test]
@@ -507,6 +674,9 @@ async fn l14_legacy_database_gains_the_loop_retries_column() {
         exposed_model: "my-model".into(), entry_protocol: "openai".into(), status: "success".into(),
         final_channel: Some("ch0".into()), final_upstream_model: Some("up-model-0".into()),
         attempts: 2, loop_retries: 3, loop_truncated: 1,
+        loop_continues: 4,
+        error_class: "degenerate_output".into(),
+        error_message: "输出复读：同一段内容连续重复了 4 次".into(),
         input_tokens: 1, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0,
         cost_usd: 0.0, wasted_cost_usd: 0.0, duration_ms: 5, ttft_ms: 5,
     }).unwrap();
@@ -514,8 +684,14 @@ async fn l14_legacy_database_gains_the_loop_retries_column() {
     assert_eq!(rows[0]["loop_retries"], 3, "{rows:?}");
     assert_eq!(rows[0]["attempts"], 2, "{rows:?}");
     assert_eq!(rows[0]["loop_truncated"], 1, "the truncation flag must round-trip: {rows:?}");
+    // The correction count and the failure cause must round-trip too: without
+    // them the log row says a request failed but not WHY (item 2).
+    assert_eq!(rows[0]["loop_continues"], 4, "{rows:?}");
+    assert_eq!(rows[0]["error_class"], "degenerate_output", "{rows:?}");
+    assert_eq!(rows[0]["error_message"], "输出复读：同一段内容连续重复了 4 次", "{rows:?}");
     assert_eq!(store.stats_summary(None).unwrap()["loop_retries"], 3);
     assert_eq!(store.stats_summary(None).unwrap()["loop_truncated"], 1);
+    assert_eq!(store.stats_summary(None).unwrap()["loop_continues"], 4);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(dir.join("legacy.db-wal"));
