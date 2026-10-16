@@ -17,6 +17,12 @@ const cfg = computed(() => state.cfg!);
 const retry = computed(() => cfg.value.retry);
 const listen = computed(() => cfg.value.listen);
 const admin = computed(() => cfg.value.admin);
+/** 访问密钥：服务端是 Option<String>（null = 不校验），输入框只吃字符串，
+ *  这里把 null 读成空串、写回时保持输入框给的原值（清空即 ""，与旧行为一致）。 */
+const adminKey = computed({
+  get: () => admin.value.key ?? "",
+  set: (v: string) => { admin.value.key = v; },
+});
 
 /* --------------------------- 重试与超时 --------------------------- */
 
@@ -537,7 +543,7 @@ onMounted(() => {
           <Field label="访问密钥" hint="留空则仅允许本机访问，不校验密钥">
             <div class="flex items-center gap-1.5">
               <TInput
-                v-model="admin.key"
+                v-model="adminKey"
                 :type="showAdminKey ? 'text' : 'password'"
                 mono
                 placeholder="留空表示不校验"

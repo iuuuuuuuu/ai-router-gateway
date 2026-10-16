@@ -27,7 +27,16 @@ export interface RetryConfig {
   loop_guard_window_chars: number;
   /** 已提交之后的判定只看回答末尾这么多字符（默认 128）。提交后无法重试，
    *  只能截断收尾，所以这个值同时决定「中段复读还能泄漏多少字」。 */
-  loop_guard_tail_chars: number;  /** 提交前等待的上限（毫秒，默认 250）。`loop_guard_min_chars` 是字符数，
+  loop_guard_tail_chars: number;
+  /** 命中退化时**纠正续写**而不是丢弃整段尝试（默认 true）。
+   *  关闭后退回旧行为：丢弃该次尝试、换候选重试。 */
+  loop_guard_continue_enabled: boolean;
+  /** 一条回答最多纠正几轮（默认 2）。0 = 从不纠正。
+   *  每轮纠正是一次额外的上游调用，所以服务端会把它夹到一个小范围。 */
+  loop_guard_continue_max: number;
+  /** 纠正续写时追加的提示词。空串表示用服务端内置的中文提示词。 */
+  loop_guard_continue_prompt: string;
+  /** 提交前等待的上限（毫秒，默认 250）。`loop_guard_min_chars` 是字符数，
    *  要等多久完全取决于模型出字速度：400 字符/秒 时 64 字是 160ms，
    *  107 字符/秒 时是 600ms，2 字符/秒 时是 32 秒。这个上限把首字延迟
    *  锁在时间上，而不是锁在生成速度上。慢模型到点就先提交，后续内容走
@@ -114,6 +123,13 @@ export interface RequestLog {
   /** 1 = 回答已开始发送后才判定为退化，网关就地截断并正常收尾。
    *  与 loop_retries 不同：这条回答客户端已经收到了，只是没给完。 */
   loop_truncated: number;
+  /** 就地纠正续写的轮数（回答已提交后命中退化，网关请模型接着写）。
+   *  与 loop_truncated 互斥：纠正成功就不截断。 */
+  loop_continues: number;
+  /** 失败时的错误分类（成功为空串）。与 error_message 配对展示。 */
+  error_class: string;
+  /** 失败原因的可读描述（成功为空串）。 */
+  error_message: string;
 }
 /** 实时并发快照："使用中" 的唯一数据来源。只含非零项，缺键即 0。 */
 export interface InflightSnapshot {

@@ -631,7 +631,7 @@ function confirmRemoveGroup() {
                       :title="memberInUse(g.id, t.level, m.model_id)
                         ? memberInUseTitle(g.id, t.level, m.model_id)
                         : '查看 ' + bindingLabel(m.model_id) + ' 的详情'"
-                      @click="openMember(g.id, t.level, m.model_id)"
+                      @click="openMember(g, t.level, m.model_id)"
                     >
                       <span
                         v-if="memberInUse(g.id, t.level, m.model_id)"
