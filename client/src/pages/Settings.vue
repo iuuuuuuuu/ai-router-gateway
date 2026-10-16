@@ -194,6 +194,7 @@ onMounted(() => {
     if (typeof r.loop_guard_continue_enabled !== "boolean") r.loop_guard_continue_enabled = true;
     if (typeof r.loop_guard_continue_max !== "number") r.loop_guard_continue_max = 2;
     if (typeof r.loop_guard_continue_prompt !== "string") r.loop_guard_continue_prompt = "";
+    if (typeof r.loop_guard_reasoning_enabled !== "boolean") r.loop_guard_reasoning_enabled = true;
   }
   void loadAutostart();
 });
@@ -447,6 +448,14 @@ onMounted(() => {
                 placeholder="留空使用内置提示词：你刚才的输出出现了复读……"
                 data-test="loop-guard-continue-prompt" @input="markDirty()"
               />
+            </div>
+          </Field>
+          <Field
+            label="思考流也做复读判定"
+            hint="模型在自己的思考里打转时永远走不到回答，而且思考会无上限地刷给客户端，所以这一路也要判。判定不占首字节：提交前的思考本来就要缓存（重试不能把已经想过的内容再放一遍），提交后命中也只是停止继续转发思考，回答照常。日志里单独记一列「思考复读」，不与「回答已截断」混为一谈"
+          >
+            <div data-test="loop-guard-reasoning-enabled">
+              <TToggle v-model="retry.loop_guard_reasoning_enabled" data-test="loop-guard-reasoning-enabled" @change="markDirty()" />
             </div>
           </Field>
           <p class="mt-2 text-[11.5px] leading-4 text-ink-3">

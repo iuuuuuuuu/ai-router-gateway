@@ -123,12 +123,52 @@ R4 的语义变成「**最近这段输出就是循环**」，泄漏量被 `tail_
 
 ---
 
+## 2b. 思考流也判复读（`loop_guard_reasoning_enabled`，默认开）
+
+### 为什么要判
+
+思考不是回答正文，所以「思考里重复」本身不构成一条坏回答。但模型在思考里打转时
+**永远走不到回答**：客户端等到的是一条永不结束的思路流，而且它没有长度上限。
+这不是理论风险——实测抓到一个真例：模型反复在「严格按后端契约」和「加个员工选择兜底」
+之间重新决策，同一段「我写。/（输出）/OK。/现在写。」以 46 字符为周期刷了上千字符。
+
+### 怎么判：第二个 `LoopGuard`，不是复用第一个
+
+- **同一套规则、不同的窗口**：`LoopGuard::new` 用的是同一个 `LoopCfg`，但实例独立。
+  两路文本混在一个滚动窗口里，「思考尾部 + 回答开头」的接缝会被当成一次跨流复读，
+  那是误报；分开之后思考复读永远不会截断回答。
+- **提交前零延迟代价**：思考在提交前本来就要缓存（`pre_reasoning`）——重试不能把已经
+  想过的内容再发给客户端一遍，否则客户端会看到两份思考。判定读的是本来就要缓的字节，
+  所以「不推迟首字节」这个约束没有被破坏。
+- **提交后只停止转发思考**：字节已经在客户端手里，收不回来。此时命中退化就停止继续
+  转发后续思考帧，回答照常发完。`ReasoningAndText` 混合帧里，即使思考那一半命中，
+  **同一帧里的正文仍然照发**——它是真实内容，没有理由因为它旁边的思考打转就丢掉。
+
+### 记在哪里：独立一列，不并进 `loop_truncated`
+
+`request_logs.reasoning_truncated`。这不是洁癖：思考打转**不代表回答被截断**，回答可能
+好得很。把它并进 `loop_truncated` 会把一条完整回答报成残缺，是误报；反过来，只报回答
+截断又会把「模型在自己的思考里卡死了」这件事藏掉。两件事都要能单独看见。
+
+同理，切换日志的 message 现在会写明是**思考**复读还是**回答**复读（`思考复读：…` / `回答复读：…`）。
+
+### 实测边界（不要指望超出这条线）
+
+R1 要求**连续**的 shift-match。散文会反复使用「让我想想」「接口」这类词，但它们在
+**不同的句子里**，从来不背靠背，所以正常思考在真实规则下产生不出任何候选——实测把
+`min_chars` 降到 8 也依然为零。也就是说这一路的误报不是调参风险，是结构上不成立。
+反过来说，周期够长、重复够多的真打转（46 字符周期 × 8 次以上）能被稳定抓住。
+
+---
+
 ## 3. `server/src/loopguard.rs`
 
 ```rust
 pub struct LoopCfg { pub enabled: bool, pub min_chars: usize, pub repeat_min_chars: usize,
                      pub repeat_ratio: f64, pub max_repeats: u32, pub window_chars: usize,
-                     pub tail_chars: usize }
+                     pub tail_chars: usize, pub hold_max_ms: u64,
+                     pub continue_enabled: bool, pub reasoning_enabled: bool,
+                     pub continue_max: u32, pub continue_prompt: String }
 impl LoopCfg { pub fn from_retry(rc: &RetryConfig) -> Self }
 pub struct LoopHit { pub unit: String, pub repeats: u32, pub chars: usize }
 pub struct LoopGuard { /* cfg + VecDeque<char> 窗口 */ }
@@ -199,7 +239,10 @@ impl LoopGuard {
 | `holdback_*`（单测，`src/loopguard.rs`） | `holdback_done` 四条边界：字符先到 / 时间先到 / 都没到 / `0` 关闭上限 / 无文本帧时上限不生效。全部确定性，不依赖调度 |
 | l17（`tests/holdback_cap.rs`） | 慢模型（1200ms/帧）下上限先到：**提交前缀 < 64 字符**，证明上限真的在缩 holdback |
 | l18 | 上限只是**天花板不是地板**：快模型（整段一次性到达）仍按 `min_chars` 判定，上限不影响 |
-| l19 | `hold_max_ms = 0` 时回到纯字符等待：**提交前缀 ≥ 64 字符**，是 l17 的对照组 |
+| l19 | `hold_max_ms = 0` 时回到纯字符等待：**提交前缀 ≥ 64 字符**，是 l17 的对照组 || l15 | 思考打转 + tier2 好候选：**回答来自健康候选**、思考不整段透传；行里 `reasoning_truncated = 1` 而 `loop_truncated = 0`（思考打转 ≠ 回答被截断） |
+| l16 | 只有思考打转这一个候选：**诚实终态**（不挂死），`status = exhausted`、`error_class = degenerate_output` |
+| l17 | 对照组：**正常思考必须原样透传**，`status = success`、`reasoning_truncated = 0`、`loop_retries = 0` |
+| l18 | `loop_guard_reasoning_enabled = false` 时回到旧行为：思考整段透传，行里 `reasoning_truncated = 0` |
 
 l17/l19 断言的是**提交前缀长度**而不是耗时：耗时断言会随机器负载漂移（实测同一份代码在空载时提交 24 字符、在 l13b/l13f 的 400 帧流同时跑时变成 72 字符），前缀长度才是这个功能真正控制的东西。三个用例互斥串行，且单独放在一个测试二进制里。
 
@@ -220,8 +263,9 @@ l17/l19 断言的是**提交前缀长度**而不是耗时：耗时断言会随�
 | `loop_guard_continue_enabled` | `true` | `d_loop_guard_continue_enabled` |
 | `loop_guard_continue_max` | `2`（上限 `LOOP_CONTINUE_MAX_CAP = 5`） | `d_loop_guard_continue_max` |
 | `loop_guard_continue_prompt` | 内置中文提示词（见下） | `d_loop_guard_continue_prompt` |
+| `loop_guard_reasoning_enabled` | `true` | `d_loop_guard_reasoning_enabled` |
 
-**三处同步**：字段声明 + `fn d_xxx()` + 手写 `impl Default for RetryConfig`。缺任何一处都会让老配置文件与默认配置走岔。
+**四处同步**：字段声明 + `fn d_xxx()` + 手写 `impl Default for RetryConfig` + `LoopCfg::from_retry` 的取值。缺任何一处都会让老配置文件与默认配置走岔。
 
 `d_loop_guard_continue_prompt()` 与 `loopguard::d_continue_prompt()` 是**同一段文案的两份拷贝**（同一句文档注释在两侧都写了「保持同步」）：
 

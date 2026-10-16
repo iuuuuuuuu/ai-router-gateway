@@ -451,7 +451,7 @@ async fn g09_group_members_reports_retry_source_and_both_configs() {
         "chunk_idle_timeout_ms", "reserve_ms", "cooldown_wait",
         "loop_guard_enabled", "loop_guard_min_chars", "loop_guard_repeat_min_chars",
         "loop_guard_repeat_ratio", "loop_guard_max_repeats", "loop_guard_window_chars",
-        "loop_guard_tail_chars", "loop_guard_hold_max_ms",
+        "loop_guard_tail_chars", "loop_guard_hold_max_ms", "loop_guard_reasoning_enabled",
     ] {
         assert!(a["retry"].get(k).is_some(), "effective retry lost {k}: {a}");
     }

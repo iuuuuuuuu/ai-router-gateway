@@ -112,6 +112,14 @@ pub struct StreamOutcome {
     /// 0 means the answer never looped. Unlike `loop_truncated` this is not a
     /// defect marker — a corrected answer is a delivered answer.
     pub loop_continues: u32,
+    /// The THINKING stream repeated itself and was stopped.
+    ///
+    /// Reported separately from `loop_truncated` on purpose: a reasoning loop
+    /// is not a shortened answer. Nothing the client received as prose was
+    /// cut, so raising the answer's flag would misreport a perfectly good
+    /// reply as defective. This one says the model's own deliberation ran in
+    /// circles and the gateway stopped relaying it.
+    pub reasoning_truncated: bool,
 }
 
 pub enum Outcome {
@@ -380,11 +388,14 @@ pub fn proxy_err_message(e: &ProxyError) -> String {
         ProxyError::ErrorBody(m) => format!("上游返回错误内容：{m}"),
         ProxyError::NotSse(m) => format!("上游返回的不是有效流：{m}"),
         ProxyError::EmptyResponse => "上游返回空内容".into(),
-        ProxyError::DegenerateOutput { unit, repeats } => format!(
-            "输出复读：同一段内容连续重复了 {repeats} 次（重复单元 {} 个字符：{}）",
-            unit.chars().count(),
-            unit.chars().take(40).collect::<String>(),
-        ),
+        ProxyError::DegenerateOutput { unit, repeats, reasoning } => {
+            let what = if *reasoning { "思考" } else { "回答" };
+            format!(
+                "{what}复读：同一段内容连续重复了 {repeats} 次（重复单元 {} 个字符：{}）",
+                unit.chars().count(),
+                unit.chars().take(40).collect::<String>(),
+            )
+        }
         ProxyError::ClientGone => "客户端已断开".into(),
     }
 }
@@ -718,6 +729,19 @@ async fn attempt_stream(
     // an ordinary short answer, and every text frame reaches the guard before
     // it reaches `pending`, so no committed character is missing from it.
     let mut guard = crate::loopguard::LoopGuard::new(&budget.loop_guard);
+    // A SECOND guard for the thinking stream. It shares the config but not the
+    // window: reasoning and prose are different texts, so mixing them would let
+    // a repetition that straddles the boundary read as an answer loop. Keeping
+    // them apart also means a thinking loop never truncates the answer.
+    //
+    // Pre-commit this guard costs NOTHING in latency: the thoughts are already
+    // buffered in `pre_reasoning` (a retry must not replay them), so judging
+    // them reads bytes that were being held anyway.
+    let mut guard_think = if budget.loop_guard.reasoning_enabled {
+        Some(crate::loopguard::LoopGuard::new(&budget.loop_guard))
+    } else {
+        None
+    };
     let mut pending = String::new();
     let hold = budget.loop_guard.min_chars;
     // Wall-clock ceiling on the holdback. `hold` counts CHARACTERS, which says
@@ -784,6 +808,12 @@ async fn attempt_stream(
     // Only when no round can start (cap reached, or no budget left) is the
     // answer wrapped up where it stands; it is never discarded whole.
     let mut continues: u32 = 0;
+    // Set when the repetition that triggered a round was in the THINKING
+    // stream rather than the answer. The round machinery is shared, but the
+    // outcome is not: a reasoning loop means no answer text existed yet, so
+    // `loop_truncated` must NOT be raised (there is no partial answer to
+    // shorten) and the retry is reported under its own counter.
+    let mut reasoning_looped = false;
     // Handed out of the inner frame loop by the loop-guard arms below.
     let mut looped: Option<crate::loopguard::LoopHit> = None;
     // Length of the frame that triggered the hit. It reached the guard but not
@@ -880,11 +910,24 @@ async fn attempt_stream(
                 return Err((ProxyError::EmptyResponse, usage_acc));
             }
             FrameClass::Reasoning(t) => {
-                // Thinking is held separately and never enters `pending`. It is
-                // not part of the answer, so a repetition inside a scratchpad is
-                // not the degenerate output the guard exists to stop (see
-                // docs/loopguard-spec.md §2). It is buffered rather than sent
-                // because this region may still end in a retry.
+                // Thinking is held separately and never enters `pending`: it is
+                // not the answer, so it must not occupy the answer's holdback.
+                // It is buffered rather than sent because this region may still
+                // end in a retry.
+                //
+                // It IS judged, on its own guard, when reasoning checking is on:
+                // a model stuck re-deciding the same thing never reaches an
+                // answer, and the thoughts would otherwise stream on unbounded.
+                // Because they are already buffered here, judging them adds no
+                // first-byte delay.
+                if let Some(g) = guard_think.as_mut() {
+                    if let Some(hit) = g.push(&t) {
+                        trigger_len = t.chars().count();
+                        looped = Some(hit);
+                        reasoning_looped = true;
+                        break Vec::new();
+                    }
+                }
                 pre_reasoning.push(StreamEvent::Reasoning { text: t });
                 continue;
             }
@@ -892,6 +935,14 @@ async fn attempt_stream(
                 // One delta, two destinations: the thought is buffered for the
                 // commit list, the text goes through the normal holdback and
                 // loop-guard path. Dropping either half loses real content.
+                if let Some(g) = guard_think.as_mut() {
+                    if let Some(hit) = g.push(&reasoning) {
+                        trigger_len = reasoning.chars().count();
+                        looped = Some(hit);
+                        reasoning_looped = true;
+                        break Vec::new();
+                    }
+                }
                 pre_reasoning.push(StreamEvent::Reasoning { text: reasoning });
                 if let Some(hit) = guard.push(&text) {
                     // Not a failure: hand the hit to the round logic, which keeps
@@ -1005,7 +1056,7 @@ async fn attempt_stream(
         // that such text is continued rather than thrown away.
         if kept.chars().count() < hold {
             return Err((
-                ProxyError::DegenerateOutput { unit: hit.unit, repeats: hit.repeats },
+                ProxyError::DegenerateOutput { unit: hit.unit, repeats: hit.repeats, reasoning: reasoning_looped },
                 usage_acc,
             ));
         }
@@ -1091,6 +1142,10 @@ async fn attempt_stream(
     let cont_cfg = budget.loop_guard.clone();
     let cont_ttfb = budget.ttfb_timeout;
     let cont_connect = budget.connect_timeout;
+    // The thinking guard joins the pump for the same reason the answer guard
+    // does: a loop can start after the commit point too, and only the pump is
+    // still relaying then. `None` when reasoning checking is off.
+    let mut guard_think = guard_think;
 
     tokio::spawn(async move {
         // The account stays "in use" until the pump stops relaying, not until
@@ -1105,6 +1160,10 @@ async fn attempt_stream(
         // only ever raise them further.
         let mut loop_truncated = loop_truncated;
         let mut loop_continues: u32 = continues;
+        // A reasoning loop found BEFORE the commit is carried in here: the
+        // attempt was discarded for it, and the caller records it whether or
+        // not a retry succeeds. Post-commit hits raise it further below.
+        let mut reasoning_truncated = reasoning_looped;
         // The repeated unit of the last correction round, for the stuck check.
         let mut last_unit: Option<String> = last_unit;
         let feed = feed_tx.clone();
@@ -1113,7 +1172,7 @@ async fn attempt_stream(
         let mut finished = committed.is_empty();
         if finished {
             feed_close_clean(&feed, entry).await;
-            if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+            if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues, reasoning_truncated }); }
             return;
         }
 
@@ -1169,24 +1228,24 @@ async fn attempt_stream(
                     }, &exposed_name).await;
                 }
                 feed_close_clean(&feed, entry).await;
-                if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+                if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues, reasoning_truncated }); }
                 return;
             }
             let next = tokio::select! {
                 ev = es.next() => ev,
                 _ = sleep_until_std(Instant::now() + idle) => {
                     feed_repair(&feed, entry, "上游分片超时，已中断").await;
-                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues, reasoning_truncated }); }
                     return;
                 }
                 _ = sleep_until_std(deadline_total) => {
                     feed_repair(&feed, entry, "总超时时间已用尽，已中断").await;
-                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues, reasoning_truncated }); }
                     return;
                 }
                 _ = client_gone.cancelled() => {
                     // client vanished: stop pumping; drop closes upstream conn
-                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues, reasoning_truncated }); }
                     return;
                 }
             };
@@ -1205,7 +1264,7 @@ async fn attempt_stream(
                 } else {
                     feed_close_clean(&feed, entry).await;
                 }
-                if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+                if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues, reasoning_truncated }); }
                 return;
             };
             let Ok(ev) = ev else { continue };
@@ -1253,19 +1312,47 @@ async fn attempt_stream(
                 FrameClass::Error(m) => {
                     // mid-stream upstream error AFTER commit: repair, never leak
                     feed_repair(&feed, entry, &m).await;
-                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues, reasoning_truncated }); }
                     return;
                 }
                 FrameClass::Reasoning(t) => {
-                    // Forward immediately: thinking is not judged and not held
-                    // back, for the same reasons as the pre-commit path.
+                    // Post-commit, thinking is forwarded immediately: it is not
+                    // the answer, so delaying it would only slow the client down.
+                    // It IS still judged, on the thinking guard — a loop that
+                    // starts here would otherwise relay thoughts forever.
+                    //
+                    // The bytes already sent cannot be recalled, so the remedy
+                    // is the same shape as for the answer: stop relaying the
+                    // repetition, let the answer carry on where it stands. The
+                    // answer itself is untouched — this flag does not raise
+                    // `loop_truncated`, because no answer text is being cut.
+                    let hit = guard_think.as_mut().and_then(|g| g.push_tail(&t));
+                    if let Some(hit) = hit {
+                        reasoning_truncated = true;
+                        tracing::warn!(
+                            unit_chars = hit.unit.chars().count(),
+                            repeats = hit.repeats,
+                            covered = hit.chars,
+                            "degenerate THINKING detected after commit; relaying stopped"
+                        );
+                        continue;
+                    }
                     feed_emit(&feed, entry, &StreamEvent::Reasoning { text: t }, &exposed_name).await;
                 }
                 FrameClass::ReasoningAndText { reasoning, text } => {
                     // Emit the thought, then run the text through the SAME
                     // post-commit detection as a plain Text frame: a mixed
                     // delta must not become a hole in the guard's coverage.
-                    feed_emit(&feed, entry, &StreamEvent::Reasoning { text: reasoning }, &exposed_name).await;
+                    //
+                    // The thought goes through the THINKING guard for the same
+                    // reason. A hit there does not stop the answer: the text in
+                    // this very frame is real and is relayed either way, and only
+                    // the thoughts that FOLLOW are suppressed.
+                    let think_hit = guard_think.as_mut().and_then(|g| g.push_tail(&reasoning));
+                    if think_hit.is_some() { reasoning_truncated = true; }
+                    if think_hit.is_none() {
+                        feed_emit(&feed, entry, &StreamEvent::Reasoning { text: reasoning }, &exposed_name).await;
+                    }
                     if let Some(hit) = guard.push_tail(&text) {
                         // Same correction path as a plain Text hit: the thought
                         // has already been relayed, and the answer must carry on
@@ -1288,7 +1375,7 @@ async fn attempt_stream(
                             &exposed_name,
                         ).await;
                         feed_close_clean(&feed, entry).await;
-                        if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+                        if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues, reasoning_truncated }); }
                         return;
                     }
                     feed_emit(&feed, entry, &StreamEvent::TextDelta { text, finish: None }, &exposed_name).await;
@@ -1330,7 +1417,7 @@ async fn attempt_stream(
                             &exposed_name,
                         ).await;
                         feed_close_clean(&feed, entry).await;
-                        if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+                        if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues, reasoning_truncated }); }
                         return;
                     }
                     feed_emit(&feed, entry, &StreamEvent::TextDelta { text: t, finish: None }, &exposed_name).await
@@ -1381,7 +1468,7 @@ async fn attempt_stream(
                     } else {
                         feed_repair(&feed, entry, "upstream closed without finish").await;
                     }
-                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues }); }
+                    if let Some(tx) = tx.take() { let _ = tx.send(StreamOutcome { usage: final_usage, loop_truncated, loop_continues, reasoning_truncated }); }
                     return;
                 }
             }

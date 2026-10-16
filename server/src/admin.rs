@@ -566,6 +566,11 @@ pub async fn group_members(State(state): State<AppState>, headers: HeaderMap, Qu
                 "requests": int("requests"),
                 "failed_attempts": int("failed_attempts"),
                 "loop_retries": int("loop_retries"),
+                // Thinking-loop discards for THIS member. Separate from
+                // loop_retries above on purpose: that one counts answer loops,
+                // and a model that merely circled in its own deliberation is a
+                // different problem with a different fix.
+                "reasoning_truncated": int("reasoning_truncated"),
                 "error_classes": classes,
                 "avg_duration_ms": num("avg_duration_ms"),
                 "avg_ttft_ms": num("avg_ttft_ms"),

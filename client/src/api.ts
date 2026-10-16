@@ -36,6 +36,10 @@ export interface RetryConfig {
   loop_guard_continue_max: number;
   /** 纠正续写时追加的提示词。空串表示用服务端内置的中文提示词。 */
   loop_guard_continue_prompt: string;
+  /** 思考流是否也做复读判定（默认 true）。思考不是回答正文，但模型在思考里
+   *  打转时永远走不到回答，而且思考会无上限地刷给客户端。判定不占首字节：
+   *  提交前的思考本来就要缓存（重试不能把已发出的思考再放一遍）。 */
+  loop_guard_reasoning_enabled: boolean;
   /** 提交前等待的上限（毫秒，默认 250）。`loop_guard_min_chars` 是字符数，
    *  要等多久完全取决于模型出字速度：400 字符/秒 时 64 字是 160ms，
    *  107 字符/秒 时是 600ms，2 字符/秒 时是 32 秒。这个上限把首字延迟
@@ -130,6 +134,9 @@ export interface RequestLog {
   error_class: string;
   /** 失败原因的可读描述（成功为空串）。 */
   error_message: string;
+  /** 1 = 模型在自己的思考里打转，网关停止继续转发思考。
+   *  与 loop_truncated 分开记：思考打转不代表回答被截断，回答可能好得很。 */
+  reasoning_truncated: number;
 }
 /** 实时并发快照："使用中" 的唯一数据来源。只含非零项，缺键即 0。 */
 export interface InflightSnapshot {

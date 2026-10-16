@@ -81,6 +81,8 @@ pub struct LoopCfg {
     pub hold_max_ms: u64,
     /// Correct-and-continue instead of discard-and-retry.
     pub continue_enabled: bool,
+    /// Whether the THINKING stream is judged on its own guard.
+    pub reasoning_enabled: bool,
     /// Upper bound on corrections for ONE answer. Clamped to a small number:
     /// each round is a full upstream call, and a model that loops three times
     /// in a row is not going to be saved by a fourth prompt.
@@ -166,6 +168,7 @@ impl LoopCfg {
             enabled, min_chars, repeat_min_chars, repeat_ratio, max_repeats, hold_max_ms,
             window_chars, tail_chars,
             continue_enabled: rc.loop_guard_continue_enabled,
+            reasoning_enabled: rc.loop_guard_reasoning_enabled,
             continue_max,
             continue_prompt,
         }
@@ -656,7 +659,8 @@ mod tests {
         LoopCfg {
             enabled: true, min_chars: 64, repeat_min_chars: 24, repeat_ratio: 0.75,
             max_repeats: 4, window_chars: 4000, tail_chars: 128, hold_max_ms: 0,
-            continue_enabled: false, continue_max: 0, continue_prompt: String::new(),
+            continue_enabled: false, reasoning_enabled: false,
+            continue_max: 0, continue_prompt: String::new(),
         }
     }
 

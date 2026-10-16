@@ -330,7 +330,11 @@ pub enum ProxyError {
     /// The stream repeated the same short unit so many times that the output is
     /// useless. Raised only before the first frame is committed, so the client
     /// has seen nothing and another candidate can answer instead.
-    DegenerateOutput { unit: String, repeats: u32 },
+    /// `reasoning` says WHICH stream circled. Not decoration: the two mean
+    /// different things to an operator, and folding them together would report
+    /// a model that merely rambled in its scratchpad as one that produced a
+    /// broken answer.
+    DegenerateOutput { unit: String, repeats: u32, reasoning: bool },
     ClientGone,
 }
 

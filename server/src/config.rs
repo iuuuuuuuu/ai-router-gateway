@@ -92,6 +92,21 @@ pub struct RetryConfig {
     /// the first byte does not wait. 0 disables the cap.
     #[serde(default = "d_loop_guard_hold_max_ms")]
     pub loop_guard_hold_max_ms: u64,
+    /// Whether the THINKING stream is judged for repetition too.
+    ///
+    /// Reasoning is not the answer, so a repetition inside it does not by
+    /// itself make the reply wrong. But a model stuck in a thinking loop
+    /// never reaches the answer at all, and the thoughts the client sees
+    /// would stream on without bound. Judging them uses the SAME window and
+    /// the SAME rules as the answer text, on its own guard, so a thought
+    /// that repeats itself is cut instead of relayed forever.
+    ///
+    /// Pre-commit it costs no latency: thinking is already buffered there
+    /// (a retry must not replay thoughts the client already saw), so the
+    /// judgement reads bytes that were being held anyway. A hit retries the
+    /// next candidate while the client has still seen zero bytes.
+    #[serde(default = "d_loop_guard_reasoning_enabled")]
+    pub loop_guard_reasoning_enabled: bool,
     /// On a repetition, correct the model instead of discarding the attempt:
     /// keep the text written BEFORE the loop and ask the model to carry on from
     /// where it was cut off. Disabling this restores the old behaviour (throw
@@ -130,6 +145,7 @@ fn d_loop_guard_max_repeats() -> u32 { 4 }
 fn d_loop_guard_window_chars() -> usize { 4000 }
 fn d_loop_guard_tail_chars() -> usize { 128 }
 fn d_loop_guard_hold_max_ms() -> u64 { 250 }
+fn d_loop_guard_reasoning_enabled() -> bool { true }
 fn d_loop_guard_continue_max() -> u32 { 2 }
 fn d_loop_guard_continue_prompt() -> String {
     // Chinese on purpose: the model that loops is usually a Chinese-speaking
@@ -158,6 +174,7 @@ impl Default for RetryConfig {
             loop_guard_window_chars: d_loop_guard_window_chars(),
             loop_guard_tail_chars: d_loop_guard_tail_chars(),
             loop_guard_hold_max_ms: d_loop_guard_hold_max_ms(),
+            loop_guard_reasoning_enabled: d_loop_guard_reasoning_enabled(),
             loop_guard_continue_enabled: true,
             loop_guard_continue_max: d_loop_guard_continue_max(),
             loop_guard_continue_prompt: d_loop_guard_continue_prompt(),

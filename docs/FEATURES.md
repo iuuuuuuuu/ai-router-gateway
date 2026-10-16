@@ -105,7 +105,12 @@ Anthropic 的 `thinking{type,budget_tokens}`、Gemini 的 `generationConfig.thin
 - 缓冲响应里 **OpenAI 的思考同样被丢弃**：不发明客户端没要的 `reasoning_content` 字段，避免改变客户端的消息解析。
   要拿思考就用流式。
 - Gemini 缓冲响应**可以**带思考（不需要签名），所以它是三者里唯一在缓冲路径也透传的。
-- 思考内容**不参与**死循环判定（它不算回答正文），也**不占用** holdback 缓冲：它一到就转发，不推迟首字节。
+- 思考内容**不占用** holdback 缓冲：它一到就转发，不推迟首字节（见 loopguard-spec.md §2 关于计时起点的说明）。
+- 思考内容**参与**死循环判定（`loop_guard_reasoning_enabled`，默认开）：模型在自己的思考里打转时永远走不到回答，
+  而且思考会无上限地刷给客户端。判定用的是**同一个 `LoopGuard` 的同一套规则**，但是**另一个独立实例**——
+  两路文本不混在一个滚动窗口里，所以「思考尾部 + 回答开头」这种接缝不会被误判成回答复读。
+  代价是零：提交前的思考本来就要缓存（重试不能把已经想过的内容再放一遍给客户端），判定读的是本来就要缓的字节。
+  提交后命中只是**停止继续转发思考**，回答照常发完——日志单独记 `reasoning_truncated`，不与 `loop_truncated` 混为一谈。
 
 设计与验收细节：[loopguard-spec.md](loopguard-spec.md) · [reasoning-passthrough-spec.md](reasoning-passthrough-spec.md)。
 

@@ -57,7 +57,17 @@ pub enum Behavior {
     /// Control: enough normal text to COMMIT, then a degenerate repetition —
     /// detection is pre-commit only, so this repetition must reach the client
     /// unchanged (the honest boundary).
-    NormalThenDegenerate,
+    NormalThenDegenerate,    /// A model stuck IN ITS THINKING: the same multi-line unit repeated across
+    /// reasoning frames, then an ordinary answer. The answer is fine — it is the
+    /// deliberation that never ends, so the gateway must cut the thoughts
+    /// instead of relaying an unbounded stream of them.
+    ReasoningLoop,
+    /// A thinking loop on the ONLY candidate: the request must end honestly
+    /// rather than hang or loop forever.
+    ReasoningLoopOnly,
+    /// Control for the reasoning guard: thinking that DELIBERATES without
+    /// repeating — a false positive here would discard a good candidate.
+    NormalReasoning,
     /// Same, but the loop runs for 400 frames so a truncation that failed to
     /// actually stop the stream is unmistakable.
     NormalThenDegenerateLong,
@@ -351,6 +361,55 @@ async fn handle_beh(beh: Behavior, body: String, hdrs: axum::http::HeaderMap, pr
                 sse.push_str(&openai_text_chunk(&frame));
             }
             for _ in 0..40 { sse.push_str(&openai_text_chunk("好问题。")); }
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::ReasoningLoop => {
+            // A realistic shape: the model re-states the same decision over
+            // and over. The unit is deliberately LONG (46 chars, measured from
+            // the real capture) because that is what a circling model looks
+            // like — short units are caught by tighter means.
+            let unit = "我写。\n（输出）\nOK。\n现在写。\n我写。\n";
+            let mut sse = String::new();
+            let frame = serde_json::json!({
+                "choices": [{"index": 0, "delta": {"reasoning_content": unit}}]
+            });
+            for _ in 0..12 { sse.push_str(&sse_frame(&frame.to_string())); }
+            sse.push_str(&openai_text_chunk("ANSWER-OK"));
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::ReasoningLoopOnly => {
+            let unit = "我写。\n（输出）\nOK。\n现在写。\n我写。\n";
+            let mut sse = String::new();
+            for _ in 0..12 { sse.push_str(&sse_frame(&serde_json::json!({"choices":[{"index":0,"delta":{"reasoning_content":unit}}]}).to_string())); }
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::NormalReasoning => {
+            // Deliberation that repeats PHRASES without ever looping.
+            //
+            // MEASURED, not assumed: with the real rules (min_chars 64,
+            // repeat_min_chars 24, ratio 0.75) this text produces NO candidate
+            // at any unit length — and it still produces none when min_chars is
+            // dropped to 8. The reason is structural: R1 needs a CONTIGUOUS
+            // shift-match, and prose repeats its phrases across different
+            // sentences, never back to back. So a false positive here is not a
+            // tuning risk this control has to defend against; what it pins is
+            // that ordinary thinking is relayed whole and never counted as a
+            // loop, which is the regression that would actually ship.
+            let thoughts = [
+                "先看入口：用户点了网站解析，走的是 parseWebsite。",
+                "再看表单：title 是必填的，这个接口其实不吃 title，只能本地用。",
+                "上传字段用原生 input，因为接口要的是原始二进制而不是 URL。",
+                "导入这一步要 taskId，解析响应里没有，先如实提示。",
+                "分页没有接口，用 NDataTable 的内置分页即可。",
+                "让我再想想：接口的契约以后端为准，前端只做展示。",
+                "好，就这样，接口不动，字段原样透出。",
+            ];
+            let mut sse = String::new();
+            for t in thoughts { sse.push_str(&sse_frame(&serde_json::json!({"choices":[{"index":0,"delta":{"reasoning_content":t}}]}).to_string())); }
+            sse.push_str(&openai_text_chunk("ANSWER-OK"));
             sse.push_str(&openai_tail_sse("stop"));
             ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
         }

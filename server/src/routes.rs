@@ -229,6 +229,15 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
     // detached task never has to borrow `result`. This is the same predicate
     // the /admin/api/logs/switch endpoint shows, so the two agree by construction.
     let loop_retries_for_log = result.records.iter().filter(|r| r.error_class == "degenerate_output").count() as u32;
+    // How many of those discards were a THINKING loop rather than an answer
+    // loop. Counted from the switch records, the same way as above, so the two
+    // agree by construction — and so it survives the retry succeeding: the fact
+    // that one candidate's deliberation circled is not undone by a later
+    // candidate answering well, which is why this cannot be read off the pump's
+    // outcome (that only ever describes the attempt that WON).
+    let reasoning_truncated_for_log = result.records.iter()
+        .filter(|r| r.error_class == "degenerate_output" && r.message.starts_with("思考复读"))
+        .count() as i64;
     // Both figures below are priced from the SAME snapshot the walk ran against
     // (the one grabbed at :122 for routing), never a fresh `state.config.get()`:
     // a console save landing mid-request must not make one number come from one
@@ -253,8 +262,12 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                 loop_retries: loop_retries_for_log,
                 // Non-stream: there is no pump, so nothing can be truncated
                 // after delivery — the whole answer arrives in one piece.
+                // Same for the thinking stream: nothing is relayed until the
+                // answer is committed, so a reasoning loop there surfaces as a
+                // discarded attempt (loop_retries), never as a truncation.
                 loop_truncated: 0,
                 loop_continues: 0,
+                reasoning_truncated: 0,
                 error_class: String::new(),
                 error_message: String::new(),
                 input_tokens: usage.input_tokens as i64,
@@ -322,6 +335,7 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                     loop_retries: lr,
                     loop_truncated: outcome.loop_truncated as i64,
                     loop_continues: outcome.loop_continues,
+                    reasoning_truncated: reasoning_truncated_for_log.max(outcome.reasoning_truncated as i64),
                     // A corrected answer is still a delivered answer, so the row
                     // stays "success"; the class records that it needed
                     // correcting, which is the whole point of showing a cause.
@@ -381,6 +395,13 @@ async fn handle_chat(state: State<crate::proxy::AppState>, headers: HeaderMap, p
                 loop_retries: loop_retries_for_log,
                 loop_truncated: 0,
                 loop_continues: 0,
+                // A THINKING loop still happened even though nothing was ever
+                // committed: the discarded attempts are the record of it, and
+                // "the only candidate's model circled in its own head" is
+                // exactly what an operator needs to see here. Nothing was
+                // relayed, so it is not a truncation of the answer — it is
+                // counted from the same switch records as above.
+                reasoning_truncated: reasoning_truncated_for_log,
                 error_class: failure_class_for_log.clone(),
                 error_message: last_cause.clone(),
                 input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0,

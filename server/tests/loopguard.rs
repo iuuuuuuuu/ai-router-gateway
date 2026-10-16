@@ -108,7 +108,7 @@ async fn l01_tier1_degenerate_falls_to_tier2_good() {
     // repetition shape so the console can show WHY the attempt was rejected.
     assert_eq!(
         rows[1]["message"],
-        "输出复读：同一段内容连续重复了 15 次（重复单元 4 个字符：好问题。）",
+        "回答复读：同一段内容连续重复了 15 次（重复单元 4 个字符：好问题。）",
     );
 
     let req = newest_request_row(&st).await;
@@ -674,7 +674,7 @@ async fn l14_legacy_database_gains_the_loop_retries_column() {
         exposed_model: "my-model".into(), entry_protocol: "openai".into(), status: "success".into(),
         final_channel: Some("ch0".into()), final_upstream_model: Some("up-model-0".into()),
         attempts: 2, loop_retries: 3, loop_truncated: 1,
-        loop_continues: 4,
+        loop_continues: 4, reasoning_truncated: 0,
         error_class: "degenerate_output".into(),
         error_message: "输出复读：同一段内容连续重复了 4 次".into(),
         input_tokens: 1, output_tokens: 2, cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -697,4 +697,101 @@ async fn l14_legacy_database_gains_the_loop_retries_column() {
     let _ = std::fs::remove_file(dir.join("legacy.db-wal"));
     let _ = std::fs::remove_file(dir.join("legacy.db-shm"));
     let _ = std::fs::remove_dir(&dir);
+}
+
+// ---- 5. the THINKING stream is judged too ----
+//
+// A model that circles in its deliberation never reaches an answer at all,
+// and before this was judged the thoughts streamed to the client without any
+// bound. The answer half of these fixtures is a perfectly good short reply, so
+// what is being pinned is: (a) the thoughts are cut, (b) the ANSWER survives,
+// and (c) the row says the deliberation circled WITHOUT saying the answer was
+// shortened — those are different facts about different streams.
+
+/// Reasoning deltas the client actually received, concatenated (OpenAI entry).
+fn client_reasoning(sse: &str) -> String {
+    let mut out = String::new();
+    for line in sse.lines() {
+        let Some(payload) = line.strip_prefix("data: ") else { continue };
+        if payload == "[DONE]" { continue }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else { continue };
+        if let Some(r) = v["choices"][0]["delta"]["reasoning_content"].as_str() { out.push_str(r); }
+    }
+    out
+}
+
+#[tokio::test]
+async fn l15_thinking_loop_is_cut_and_the_answer_survives() {
+    // tier1 = the looping thinker, tier2 = a good answer. Pre-commit the hit
+    // discards the attempt, so the client must end up with the tier2 answer and
+    // never a byte of the circling thoughts (I1 still holds).
+    let (st, router) = harness(&[Behavior::ReasoningLoop, Behavior::GoodStream], 1, test_retry()).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200, "sse={sse}");
+
+    let text = client_text(&sse);
+    assert_eq!(text, GOOD, "the answer must come from the healthy candidate");
+    let thought = client_reasoning(&sse);
+    assert!(
+        thought.len() < 400,
+        "the circling thoughts must not be relayed in full: got {} chars",
+        thought.len()
+    );
+
+    // The row must record that the DELIBERATION circled, and must NOT claim the
+    // answer was truncated — the answer was never cut, it was re-routed.
+    let row = newest_request_row(&st).await;
+    assert_eq!(row["reasoning_truncated"], 1, "{row}");
+    assert_eq!(row["loop_truncated"], 0, "the answer itself was never cut: {row}");
+    assert!(row["loop_retries"].as_u64().unwrap() >= 1, "{row}");
+    let sw = switch_rows(&st);
+    assert!(
+        sw.iter().any(|r| r["error_class"] == "degenerate_output"),
+        "the discarded attempt must say why: {sw:?}"
+    );
+}
+
+#[tokio::test]
+async fn l16_thinking_loop_on_the_only_candidate_ends_honestly() {
+    // No other candidate: the request must terminate, not hang. The client
+    // gets an ordinary error and the row explains the cause.
+    let (st, router) = harness(&[Behavior::ReasoningLoopOnly], 1, test_retry()).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert!(status >= 400, "a stuck thinker must not look like success: {status} sse={sse}");
+    assert!(client_text(&sse).is_empty(), "no answer text may leak: {sse}");
+    assert!(client_reasoning(&sse).len() < 400, "the thoughts must not stream on: {sse}");
+
+    let row = newest_request_row(&st).await;
+    assert_eq!(row["status"], "exhausted", "{row}");
+    assert_eq!(row["error_class"], "degenerate_output", "{row}");
+}
+
+#[tokio::test]
+async fn l17_normal_thinking_is_never_mistaken_for_a_loop() {
+    // The control: deliberation that never repeats must reach the client
+    // whole. A false positive here is worse than the bug this fixes.
+    let (st, router) = harness(&[Behavior::NormalReasoning], 1, test_retry()).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200, "sse={sse}");
+    assert_eq!(client_text(&sse), "ANSWER-OK", "sse={sse}");
+    assert!(client_reasoning(&sse).len() > 100, "the real thoughts must be relayed: {sse}");
+    let row = newest_request_row(&st).await;
+    assert_eq!(row["status"], "success", "{row}");
+    assert_eq!(row["reasoning_truncated"], 0, "{row}");
+    assert_eq!(row["loop_retries"], 0, "{row}");
+}
+
+#[tokio::test]
+async fn l18_reasoning_judging_can_be_switched_off() {
+    // With the flag off the old behaviour returns: thoughts are relayed
+    // untouched, whatever they contain. The switch must be honoured.
+    let rc = retry_with(|r| r.loop_guard_reasoning_enabled = false);
+    let (st, router) = harness(&[Behavior::ReasoningLoop], 1, rc).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200, "sse={sse}");
+    assert_eq!(client_text(&sse), "ANSWER-OK", "sse={sse}");
+    assert!(client_reasoning(&sse).len() > 400, "the loop must pass through when disabled: {sse}");
+    let row = newest_request_row(&st).await;
+    assert_eq!(row["status"], "success", "{row}");
+    assert_eq!(row["reasoning_truncated"], 0, "{row}");
 }

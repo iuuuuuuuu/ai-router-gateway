@@ -78,7 +78,7 @@ function errorClass(v: unknown): { text: string; tone: Tone } {
   if (low === "degenerate_output") return { text: "输出退化", tone: "warn" };
   return { text: s, tone: "warn" };
 }
-function statusInfo(row: { status?: unknown; loop_truncated?: unknown; loop_continues?: unknown }): { label: string; tone: Tone } {
+function statusInfo(row: { status?: unknown; loop_truncated?: unknown; loop_continues?: unknown; reasoning_truncated?: unknown }): { label: string; tone: Tone } {
   // 提交后截断（server/src/proxy.rs）：客户端确实收到了一条完整合法的流，所以 status 仍是
   // success（I2 终态互斥），但内容是被截掉的 —— 直接显示「成功」会把一次退化回答说成好回答，
   // 所以这里单独标出来。loop_retries 不参与：那是提交前拦截，客户端根本没看到。
@@ -87,6 +87,10 @@ function statusInfo(row: { status?: unknown; loop_truncated?: unknown; loop_cont
   // 在提示词里说明原因后让它接着写，并把续写接回同一条流。客户端拿到的是完整回答，不是截断的；
   // 标记成 warn 只是为了让「这条回答被纠正过」在运维时看得见。
   if (Number(row?.loop_continues) > 0) return { label: "成功（已纠正复读）", tone: "warn" };
+  // 思考复读（server/src/proxy.rs 的 thinking guard）：模型在自己的思考里打转，网关停止
+  // 继续转发思考。注意它**不**复用上面的「已截断」——回答可能好得很，被截的是思考。
+  // 把它显示成「已截断」会把一条正常回答报成残缺，是误报。
+  if (Number(row?.reasoning_truncated) > 0) return { label: "成功（思考曾打转）", tone: "warn" };
   switch (String(row?.status ?? "").toLowerCase()) {
     case "success": return { label: "成功", tone: "ok" };
     case "exhausted": return { label: "全部失败", tone: "err" };
@@ -420,7 +424,9 @@ onUnmounted(() => {
                     ? '回答已经开始发送后检测到输出退化（死循环），网关就地截断并正常收尾：客户端收到的是截断后的内容'
                     : Number(row.loop_continues) > 0
                       ? ('检测到输出复读：网关保留了复读前的正文，在提示词里说明原因后让模型接着写，已自动纠正 ' + row.loop_continues + ' 次；客户端收到的是完整回答')
-                      : undefined"
+                      : Number(row.reasoning_truncated) > 0
+                        ? '模型在自己的思考里打转，网关停止继续转发思考。回答本身没有被截断，客户端收到的是完整回答'
+                        : undefined"
                 >{{ statusInfo(row).label }}</Badge>
               </td>
               <td class="px-3 py-2 text-[11.5px] text-ink-2 max-w-[420px] truncate" :title="row.error_message || undefined">
