@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "gw-client"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "serde",
  "serde_json",
