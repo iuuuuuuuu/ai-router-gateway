@@ -6,7 +6,8 @@ import { channelName, groups } from "../store";
 import { fmtSec, fmtTps, tpsOf } from "../format";
 import { toast } from "../toast";
 import {
-  Alert, Badge, Btn, Card, Empty, Spinner, TInput, TPager, TSelect, TToggle,
+  Alert, Badge, Btn, Card, Empty, Spinner, TInput, TPager, TSelect, TToggle, TRange,
+  DEFAULT_DAYS,
 } from "../components/ui";
 
 type Tone = "gray" | "teal" | "ok" | "warn" | "err" | "brand";
@@ -128,7 +129,8 @@ function rowKey(row: any, i: number): string {
 /* --------------------------------- 状态 --------------------------------- */
 const tab = ref<TabKey>("switch");
 const q = ref<string>("");
-const autoRefresh = ref(false);
+// 自动刷新默认开启：日志是「看现在发生了什么」的界面，默认不刷会让人对着旧数据判断。
+const autoRefresh = ref(true);
 const loading = ref(false);
 const err = ref("");
 const lastAt = ref(0);
@@ -151,6 +153,10 @@ const groupOptions = computed(() => [
 ]);
 const scopeId = computed(() => (groupId.value === ALL_GROUPS ? undefined : groupId.value));
 
+// 时间范围（天）。默认 1 天，见 DEFAULT_DAYS；undefined 表示「不设下限」，
+// 但控制台永远传一个具体天数，所以这里不做哨兵值。
+const days = ref<number>(DEFAULT_DAYS);
+
 const tabs: { key: TabKey; label: string }[] = [
   { key: "switch", label: "切换日志" },
   { key: "request", label: "请求日志" },
@@ -162,6 +168,7 @@ const total = computed(() => (tab.value === "switch" ? switchTotal.value : reque
 const pageCount = computed(() => (tab.value === "switch" ? switchRows.value.length : requestRows.value.length));
 const filterLabel = computed(() => {
   const parts: string[] = [];
+  parts.push(`时间范围：最近 ${days.value} 天`);
   if (groupId.value !== ALL_GROUPS) parts.push(`分组：${groupName(groupId.value)}`);
   const kw = q.value.trim();
   if (kw) parts.push(`过滤 request_id：${kw}`);
@@ -177,11 +184,11 @@ async function load(silent = false) {
   try {
     const offset = (page.value - 1) * pageSize.value;
     if (tab.value === "switch") {
-      const res: LogPage<SwitchLog> = await api.switchLogsPage(pageSize.value, offset, q.value.trim() || undefined, scopeId.value);
+      const res: LogPage<SwitchLog> = await api.switchLogsPage(pageSize.value, offset, q.value.trim() || undefined, scopeId.value, days.value);
       switchRows.value = Array.isArray(res?.rows) ? res.rows : [];
       switchTotal.value = Number(res?.total ?? 0) || 0;
     } else {
-      const res: LogPage<RequestLog> = await api.requestLogsPage(pageSize.value, offset, q.value.trim() || undefined, scopeId.value);
+      const res: LogPage<RequestLog> = await api.requestLogsPage(pageSize.value, offset, q.value.trim() || undefined, scopeId.value, days.value);
       requestRows.value = Array.isArray(res?.rows) ? res.rows : [];
       requestTotal.value = Number(res?.total ?? 0) || 0;
     }
@@ -221,6 +228,8 @@ watch(q, () => {
 watch(tab, () => { page.value = 1; void load(); });
 // 切换分组同样重新拉取（api 侧按 group_id 过滤）
 watch(groupId, () => { page.value = 1; void load(); });
+// 换时间范围同样回到第 1 页：新范围下行数会变，停在第 5 页很可能已经是空页。
+watch(days, () => { page.value = 1; void load(); });
 // 翻页 / 改页大小：页大小变化时 TPager 已经把 page 归 1，这里只负责重新拉取。
 watch([page, pageSize], () => { void load(); });
 
@@ -275,13 +284,18 @@ onUnmounted(() => {
   <div>
     <!-- 工具条：左侧统计文字 + request_id 过滤，右侧刷新 / 自动刷新 -->
     <div class="mb-3 flex flex-wrap items-center gap-2">
-      <div class="text-[12px] text-ink-3">
+      <div class="text-[12px] text-ink-3" data-test="log-counts">
         共 {{ total }} 条记录<template v-if="pageCount"> · 本页 {{ pageCount }} 条</template><template v-if="filterLabel"> · {{ filterLabel }}</template>
         <span v-if="lastAt" class="ml-1 font-mono text-[11.5px]">· 最后更新 {{ fmtClock(lastAt) }}</span>
       </div>
       <!-- data-test 必须挂在包裹 div 上：reka-ui 的 SelectRoot 是 inheritAttrs:false 且未 v-bind="$attrs"，
            挂在 <TSelect> 上的 attrs 会在 SelectRoot 处被丢掉，不会到达 button[role=combobox]。
            包裹 div 是稳定的真实 DOM 节点，探针用 [data-test=log-group-filter] button[role=combobox] 定位。 -->
+      <!-- data-test 挂包裹 div：reka-ui 的 SelectRoot 是 inheritAttrs:false，
+           挂在 <TRange> 上的 attrs 会被丢掉。 -->
+      <div class="w-[110px]" data-test="log-range-filter">
+        <TRange v-model="days" />
+      </div>
       <div class="w-[150px]" data-test="log-group-filter">
         <TSelect v-model="groupId" size="sm" :options="groupOptions" placeholder="全部分组" />
       </div>
@@ -331,7 +345,6 @@ onUnmounted(() => {
             <tr>
               <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">时间</th>
               <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">request_id</th>
-              <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">分组</th>
               <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">尝试#</th>
               <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">层级</th>
               <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">渠道</th>
@@ -358,7 +371,6 @@ onUnmounted(() => {
                 >{{ row.request_id }}</button>
                 <span v-else class="text-ink-3">—</span>
               </td>
-              <td class="whitespace-nowrap px-3 py-2">{{ groupName(row.group_id) }}</td>
               <td class="whitespace-nowrap px-3 py-2 text-right font-mono">{{ fmtInt(row.attempt_no) }}</td>
               <td class="whitespace-nowrap px-3 py-2">
                 <Badge :tone="tierInfo(row.tier).tone">{{ tierInfo(row.tier).label }}</Badge>
@@ -388,7 +400,6 @@ onUnmounted(() => {
             <tr>
               <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">时间</th>
               <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">request_id</th>
-              <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">分组</th>
               <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3 min-w-[200px]">暴露模型</th>
               <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">状态</th>
               <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3 min-w-[240px]" title="失败原因：网关把这次请求失败的真实原因直接记在这里，不用再去切换日志里逐条查">失败原因</th>
@@ -415,7 +426,6 @@ onUnmounted(() => {
                 >{{ row.request_id }}</button>
                 <span v-else class="text-ink-3">—</span>
               </td>
-              <td class="whitespace-nowrap px-3 py-2">{{ groupName(row.group_id) }}</td>
               <td class="whitespace-nowrap px-3 py-2 font-mono text-[11.5px] text-ink-2 min-w-[200px]">{{ fmtText(row.exposed_model) }}</td>
               <td class="whitespace-nowrap px-3 py-2">
                 <Badge

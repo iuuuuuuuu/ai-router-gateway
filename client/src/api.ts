@@ -261,15 +261,21 @@ export const api = {
   // Log rows always come back paged: { rows, total, limit, offset }. Every caller
   // (Logs.vue page buttons, GroupDetail.vue and ModelDetail.vue "newest N" lists)
   // goes through these two; there is no array-only variant left to keep in sync.
-  switchLogsPage: (limit = 200, offset = 0, requestId?: string, groupId?: string): Promise<LogPage<SwitchLog>> =>
-    req("GET", `/admin/api/logs/switch?limit=${limit}&offset=${offset}` + qs({ request_id: requestId, group_id: groupId })),
-  requestLogsPage: (limit = 200, offset = 0, requestId?: string, groupId?: string): Promise<LogPage<RequestLog>> =>
-    req("GET", `/admin/api/logs/requests?limit=${limit}&offset=${offset}` + qs({ request_id: requestId, group_id: groupId })),
+  // `days` = 回溯天数（控制台的 1/2/3/7/14/30 天快捷范围）。undefined 表示不设下限，
+  // 服务端就把整个表算进来 —— 这正是加这个参数之前的行为，所以老调用方不受影响。
+  switchLogsPage: (limit = 200, offset = 0, requestId?: string, groupId?: string, days?: number): Promise<LogPage<SwitchLog>> =>
+    req("GET", `/admin/api/logs/switch?limit=${limit}&offset=${offset}` + qs({ request_id: requestId, group_id: groupId, days: days === undefined ? undefined : String(days) })),
+  requestLogsPage: (limit = 200, offset = 0, requestId?: string, groupId?: string, days?: number): Promise<LogPage<RequestLog>> =>
+    req("GET", `/admin/api/logs/requests?limit=${limit}&offset=${offset}` + qs({ request_id: requestId, group_id: groupId, days: days === undefined ? undefined : String(days) })),
   // NOTE: the other endpoints already carry "?limit=", so qs()'s leading "&"
   // works there. /stats has no other parameter, so the "?" has to be explicit
   // here — otherwise the URL becomes "/admin/api/stats&group_id=..." → 404.
-  stats: (groupId?: string): Promise<StatsPayload> =>
-    req("GET", "/admin/api/stats" + (groupId ? "?group_id=" + encodeURIComponent(groupId) : "")),
+  // /stats 原来没有别的参数，所以 "?" 必须显式写。加了 days 之后仍然自己拼，
+  // 且两者都可能缺省，所以用 qs() 生成 "&a=b" 再自己决定前缀。
+  stats: (groupId?: string, days?: number): Promise<StatsPayload> => {
+    const p = qs({ group_id: groupId, days: days === undefined ? undefined : String(days) });
+    return req("GET", "/admin/api/stats" + (p ? "?" + p.slice(1) : ""));
+  },
   // Same trap as /stats above: this endpoint has no other parameter, so the
   // "?" is explicit here — qs() returns a leading "&".
   groupMembers: (groupId: string): Promise<GroupMembersPayload> =>

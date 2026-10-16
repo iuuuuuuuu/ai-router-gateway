@@ -116,7 +116,17 @@ pub struct RequestLog {
 /// clause (with a leading space, or "" when unfiltered) plus the bind values
 /// in positional order; the caller appends `LIMIT`/`OFFSET` with the next
 /// indexes so a filtered and an unfiltered query share one code path.
-fn build_filters(request_id: Option<&str>, group_id: Option<&str>) -> (String, Vec<String>) {
+/// `since` is a lower bound on `ts`, as an RFC3339 string in the SAME format
+/// `routes::iso_now` writes (`2026-10-16T19:13:38.123+08:00`).
+///
+/// It is compared as a STRING, not parsed: every row is written by this same
+/// process with `chrono::Local`, so all rows share one fixed UTC offset and
+/// lexicographic order is chronological order. That keeps the comparison on
+/// `idx_rl_ts` / `idx_sl_ts`; wrapping the column in `julianday()` would be
+/// offset-proof but would force a full scan of the log table on every poll.
+/// The assumption is therefore "this machine's UTC offset does not change
+/// mid-life", which holds for the desktop tool this ships as.
+fn build_filters(request_id: Option<&str>, group_id: Option<&str>, since: Option<&str>) -> (String, Vec<String>) {
     let mut clauses: Vec<&str> = Vec::new();
     let mut binds: Vec<String> = Vec::new();
     if let Some(rid) = request_id {
@@ -131,11 +141,37 @@ fn build_filters(request_id: Option<&str>, group_id: Option<&str>) -> (String, V
             binds.push(gid.to_string());
         }
     }
+    if let Some(s) = since {
+        if !s.is_empty() {
+            clauses.push("ts >= ?");
+            binds.push(s.to_string());
+        }
+    }
     if clauses.is_empty() {
         (String::new(), binds)
     } else {
         (format!(" WHERE {}", clauses.join(" AND ")), binds)
     }
+}
+
+/// The inclusive lower bound of a `days`-long lookback window, in the SAME
+/// RFC3339-millis format `routes::iso_now` writes.
+///
+/// `None` (or a non-positive value) means "no lower bound" — the whole table.
+/// That is the honest default for a caller that did not ask for a window: it
+/// matches every pre-existing caller and every pre-existing test, so adding
+/// this parameter cannot silently change what an old query returns.
+///
+/// Kept as a pure function of an explicit `now` so the boundary is unit
+/// testable without a clock: a test that called `Local::now()` itself would
+/// race the millisecond it asserts on.
+pub fn since_from_days(days: Option<u32>, now: chrono::DateTime<chrono::Local>) -> Option<String> {
+    let d = days?;
+    if d == 0 {
+        return None;
+    }
+    let cutoff = now - chrono::Duration::days(d as i64);
+    Some(cutoff.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
 }
 
 /// Clamps a paging request into something the SQL layer can always execute:
@@ -148,8 +184,8 @@ fn page_bounds(limit: i64, offset: i64) -> (i64, i64) {
 /// Total number of rows a log filter matches, ignoring the page window — what
 /// the console needs to draw "第 X / Y 页". It shares `build_filters` with the
 /// page queries so a count can never disagree with the rows it labels.
-fn count_rows(conn: &Connection, table: &str, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<i64> {
-    let (where_sql, binds) = build_filters(request_id, group_id);
+fn count_rows(conn: &Connection, table: &str, request_id: Option<&str>, group_id: Option<&str>, since: Option<&str>) -> anyhow::Result<i64> {
+    let (where_sql, binds) = build_filters(request_id, group_id, since);
     let sql = format!("SELECT COUNT(*) FROM {table}{where_sql}");
     let n: i64 = conn.query_row(&sql, rusqlite::params_from_iter(binds.iter()), |r| r.get(0))?;
     Ok(n)
@@ -382,17 +418,17 @@ impl Store {
     /// Unpaged entry point: the newest `limit` rows. Kept for the test-suite;
     /// the console always goes through `list_switch_logs_page` so it can page.
     pub fn list_switch_logs(&self, limit: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
-        Ok(self.list_switch_logs_page(limit, 0, request_id, group_id)?.rows)
+        Ok(self.list_switch_logs_page(limit, 0, request_id, group_id, None)?.rows)
     }
 
     /// One page of switch logs: the newest `limit` rows after skipping `offset`,
     /// plus the total number of rows the very same filter matches.
-    pub fn list_switch_logs_page(&self, limit: i64, offset: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<LogPage> {
+    pub fn list_switch_logs_page(&self, limit: i64, offset: i64, request_id: Option<&str>, group_id: Option<&str>, since: Option<&str>) -> anyhow::Result<LogPage> {
         let (limit, offset) = page_bounds(limit, offset);
         let conn = self.conn.lock().unwrap();
         let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'attempt_no',attempt_no,'tier',tier,'channel_id',channel_id,'channel_name',channel_name,'upstream_model',upstream_model,'outcome',outcome,'error_class',error_class,'http_status',http_status,'latency_ms',latency_ms,'message',message)";
-        let total = count_rows(&conn, "switch_logs", request_id, group_id)?;
-        let (where_sql, mut binds) = build_filters(request_id, group_id);
+        let total = count_rows(&conn, "switch_logs", request_id, group_id, since)?;
+        let (where_sql, mut binds) = build_filters(request_id, group_id, since);
         let n = binds.len();
         binds.push(limit.to_string());
         binds.push(offset.to_string());
@@ -407,17 +443,17 @@ impl Store {
 
     /// Unpaged entry point for request logs (see `list_switch_logs`).
     pub fn list_request_logs(&self, limit: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
-        Ok(self.list_request_logs_page(limit, 0, request_id, group_id)?.rows)
+        Ok(self.list_request_logs_page(limit, 0, request_id, group_id, None)?.rows)
     }
 
     /// One page of request logs: the newest `limit` rows after skipping `offset`,
     /// plus the total number of rows the very same filter matches.
-    pub fn list_request_logs_page(&self, limit: i64, offset: i64, request_id: Option<&str>, group_id: Option<&str>) -> anyhow::Result<LogPage> {
+    pub fn list_request_logs_page(&self, limit: i64, offset: i64, request_id: Option<&str>, group_id: Option<&str>, since: Option<&str>) -> anyhow::Result<LogPage> {
         let (limit, offset) = page_bounds(limit, offset);
         let conn = self.conn.lock().unwrap();
         let cols = "json_object('id',id,'ts',ts,'request_id',request_id,'group_id',group_id,'exposed_model',exposed_model,'entry_protocol',entry_protocol,'status',status,'final_channel',final_channel,'final_upstream_model',final_upstream_model,'attempts',attempts,'loop_retries',loop_retries,'loop_truncated',loop_truncated,'loop_continues',loop_continues,'reasoning_truncated',reasoning_truncated,'error_class',error_class,'error_message',error_message,'input_tokens',input_tokens,'output_tokens',output_tokens,'cache_read_tokens',cache_read_tokens,'cache_creation_tokens',cache_creation_tokens,'cost_usd',cost_usd,'wasted_cost_usd',wasted_cost_usd,'duration_ms',duration_ms,'ttft_ms',ttft_ms)";
-        let total = count_rows(&conn, "request_logs", request_id, group_id)?;
-        let (where_sql, mut binds) = build_filters(request_id, group_id);
+        let total = count_rows(&conn, "request_logs", request_id, group_id, since)?;
+        let (where_sql, mut binds) = build_filters(request_id, group_id, since);
         let n = binds.len();
         binds.push(limit.to_string());
         binds.push(offset.to_string());
@@ -562,9 +598,25 @@ impl Store {
     }
 
     /// `group_id` narrows every figure to one routing group; `None` = global.
-    pub fn stats_summary(&self, group_id: Option<&str>) -> anyhow::Result<serde_json::Value> {
+    pub fn stats_summary(&self, group_id: Option<&str>, since: Option<&str>) -> anyhow::Result<serde_json::Value> {
         let conn = self.conn.lock().unwrap();
-        let scope = if group_id.map(|g| !g.is_empty()).unwrap_or(false) { " WHERE group_id = ?1" } else { "" };
+        // Both filters are optional and combine, so the WHERE is assembled
+        // rather than hard-coded to one of them (a group-scoped 7-day view is
+        // the common case in the console).
+        // Numbered placeholders assigned in bind order, so ONE `params_from_iter`
+        // works whether 0, 1 or 2 filters are present. (`?` followed by `?2`
+        // would make SQLite expect a gap at ?1 -- caught by the window test.)
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        if group_id.map(|g| !g.is_empty()).unwrap_or(false) {
+            binds.push(group_id.unwrap().to_string());
+            clauses.push(format!("group_id = ?{}", binds.len()));
+        }
+        if since.map(|x| !x.is_empty()).unwrap_or(false) {
+            binds.push(since.unwrap().to_string());
+            clauses.push(format!("ts >= ?{}", binds.len()));
+        }
+        let scope = if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) };
         let mut stmt = conn.prepare(&format!(
             // Sums are COALESCEd to 0 so an empty table renders as 0, not blank.
             // avg_* are deliberately NOT COALESCEd: they average only SUCCESSFUL
@@ -573,10 +625,7 @@ impl Store {
             // NULL so the console shows "—" instead of a bogus 0ms.
             "SELECT json_object('requests',COUNT(*),'success',COALESCE(SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),0),'exhausted',COALESCE(SUM(CASE WHEN status='exhausted' THEN 1 ELSE 0 END),0),'aborted',COALESCE(SUM(CASE WHEN status='aborted' THEN 1 ELSE 0 END),0),'loop_retries',COALESCE(SUM(loop_retries),0),'loop_truncated',COALESCE(SUM(loop_truncated),0),'loop_continues',COALESCE(SUM(loop_continues),0),'reasoning_truncated',COALESCE(SUM(reasoning_truncated),0),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cache_read_tokens',COALESCE(SUM(cache_read_tokens),0),'cache_creation_tokens',COALESCE(SUM(cache_creation_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'avg_ttft_ms',ROUND(AVG(CASE WHEN status='success' THEN ttft_ms END))) FROM request_logs{scope}"
         ))?;
-        let v: String = match group_id {
-            Some(g) if !g.is_empty() => stmt.query_row(params![g], |r| r.get(0))?,
-            _ => stmt.query_row([], |r| r.get(0))?,
-        };
+        let v: String = stmt.query_row(rusqlite::params_from_iter(binds.iter()), |r| r.get(0))?;
         Ok(serde_json::from_str(&v).unwrap())
     }
 
@@ -619,13 +668,27 @@ impl Store {
     ///      attempt's cost is already reported by `wasted_cost_usd`; adding it to
     ///      the attempt row would double-count it against the group total. This is
     ///      also why the unrouted/attempted rows carry 0 tokens.
-    pub fn stats_by_model(&self, group_id: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
+    pub fn stats_by_model(&self, group_id: Option<&str>, since: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
         // Appended after an explicit "WHERE 1=1" so the SAME fragment works for
         // both scopes. (Emitting a bare " WHERE rl.group_id = ?1" and then
         // appending " AND …" to it produced invalid SQL without a WHERE in the
         // global case — caught by w06, which exercises both scopes.)
-        let scope = if group_id.map(|g| !g.is_empty()).unwrap_or(false) { " AND rl.group_id = ?1" } else { "" };
+        //
+        // The fragment is interpolated into THREE branches below, so the two
+        // filters are assembled once here and reused verbatim: `?1`/`?2` are
+        // named, and SQLite resolves a repeated `?1` to the same bind value, so
+        // one `params!` list serves every occurrence.
+        let mut scope = String::new();
+        let mut binds: Vec<String> = Vec::new();
+        if group_id.map(|g| !g.is_empty()).unwrap_or(false) {
+            binds.push(group_id.unwrap().to_string());
+            scope.push_str(&format!(" AND rl.group_id = ?{}", binds.len()));
+        }
+        if since.map(|x| !x.is_empty()).unwrap_or(false) {
+            binds.push(since.unwrap().to_string());
+            scope.push_str(&format!(" AND rl.ts >= ?{}", binds.len()));
+        }
         // Row shape is shared by all three branches so the console never has to
         // guess which keys exist.
         let sql = format!(
@@ -669,14 +732,12 @@ impl Store {
              LIMIT 200"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = match group_id {
-            Some(g) if !g.is_empty() => stmt
-                .query_map(params![g], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => stmt
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?,
-        };
+        // Numbering is dense (1..=binds.len()), so one iter binds them all --
+        // and the same fragment is interpolated into all three UNION branches,
+        // where SQLite resolves a repeated `?n` to the same value.
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows.into_iter().map(|s| serde_json::from_str(&s).unwrap()).collect())
     }
 
@@ -688,21 +749,28 @@ impl Store {
     /// The two scopes share one SQL template on purpose: a scoped call is the
     /// same overview with a `WHERE`, so the picker and the selected group can
     /// never disagree about what a column means.
-    pub fn stats_by_group(&self, group_id: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
+    pub fn stats_by_group(&self, group_id: Option<&str>, since: Option<&str>) -> anyhow::Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().unwrap();
-        let scope = if group_id.map(|g| !g.is_empty()).unwrap_or(false) { " WHERE group_id = ?1" } else { "" };
+        // Same assembly rule as `stats_summary`: both filters are optional and
+        // combine, so a scoped 7-day view is expressible.
+        let mut clauses: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::new();
+        if group_id.map(|g| !g.is_empty()).unwrap_or(false) {
+            binds.push(group_id.unwrap().to_string());
+            clauses.push(format!("group_id = ?{}", binds.len()));
+        }
+        if since.map(|x| !x.is_empty()).unwrap_or(false) {
+            binds.push(since.unwrap().to_string());
+            clauses.push(format!("ts >= ?{}", binds.len()));
+        }
+        let scope = if clauses.is_empty() { String::new() } else { format!(" WHERE {}", clauses.join(" AND ")) };
         let sql = format!(
             "SELECT json_object('group_id',group_id,'requests',COUNT(*),'success',SUM(CASE WHEN status='success' THEN 1 ELSE 0 END),'input_tokens',COALESCE(SUM(input_tokens),0),'output_tokens',COALESCE(SUM(output_tokens),0),'cost_usd',COALESCE(ROUND(SUM(cost_usd),6),0),'wasted_cost_usd',COALESCE(ROUND(SUM(wasted_cost_usd),6),0),'avg_duration_ms',ROUND(AVG(CASE WHEN status='success' THEN duration_ms END)),'models',COUNT(DISTINCT final_channel || '::' || final_upstream_model)) FROM request_logs{scope} GROUP BY group_id ORDER BY SUM(cost_usd) DESC LIMIT 200"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = match group_id {
-            Some(g) if !g.is_empty() => stmt
-                .query_map(params![g], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => stmt
-                .query_map([], |r| r.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?,
-        };
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(binds.iter()), |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(rows.into_iter().map(|s| serde_json::from_str(&s).unwrap()).collect())
     }
 
@@ -950,10 +1018,10 @@ mod tests {
         st.insert_request_log(&req_log("g1", "c1", "m1", 1.0, 0.5)).unwrap();
         st.insert_request_log(&req_log("g2", "c2", "m2", 2.0, 0.25)).unwrap();
 
-        let all = st.stats_by_group(None).unwrap();
+        let all = st.stats_by_group(None, None).unwrap();
         assert_eq!(all.len(), 2, "None must return every group: {all:?}");
 
-        let only = st.stats_by_group(Some("g1")).unwrap();
+        let only = st.stats_by_group(Some("g1"), None).unwrap();
         assert_eq!(only.len(), 1, "Some(g1) must return exactly one row: {only:?}");
         assert_eq!(only[0]["group_id"], "g1");
         assert_eq!(only[0]["requests"], 1);
@@ -961,18 +1029,149 @@ mod tests {
 
         // An empty string is "no scope" (the picker sends it when nothing is
         // selected), NOT a group whose id happens to be empty.
-        let blank = st.stats_by_group(Some("")).unwrap();
+        let blank = st.stats_by_group(Some(""), None).unwrap();
         assert_eq!(blank.len(), 2, "an empty group_id is the global overview: {blank:?}");
 
         // The other two blocks take the same scope; a fix that only touched
         // by_group would leave the summary and by_model unscoped.
-        let sum = st.stats_summary(Some("g1")).unwrap();
+        let sum = st.stats_summary(Some("g1"), None).unwrap();
         assert_eq!(sum["requests"], 1);
         assert_eq!(sum["cost_usd"].as_f64(), Some(1.0));
-        let by_model = st.stats_by_model(Some("g2")).unwrap();
+        let by_model = st.stats_by_model(Some("g2"), None).unwrap();
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0]["channel_id"], "c2");
     }
+
+    /// A log row with an explicit timestamp, so a window can be exercised
+    /// without waiting for wall-clock time to pass.
+    fn req_log_at(ts: &str, group: &str, cost: f64) -> RequestLog {
+        RequestLog { ts: ts.to_string(), ..req_log(group, "c1", "m1", cost, 0.0) }
+    }
+
+    /// `since_from_days` is the whole time-filter boundary: it must produce a
+    /// cutoff that is EXACTLY `days` before `now`, in the same RFC3339-millis
+    /// shape `routes::iso_now` writes (the string comparison depends on it).
+    #[test]
+    fn since_from_days_is_an_exact_rfc3339_boundary() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-16T12:00:00.000+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let one = since_from_days(Some(1), now).unwrap();
+        assert_eq!(one, "2026-10-15T12:00:00.000+08:00");
+        let seven = since_from_days(Some(7), now).unwrap();
+        assert_eq!(seven, "2026-10-09T12:00:00.000+08:00");
+        // 0 and None both mean "no lower bound" -- the honest default that
+        // keeps every pre-existing caller's result identical.
+        assert_eq!(since_from_days(None, now), None);
+        assert_eq!(since_from_days(Some(0), now), None);
+    }
+
+    /// The window really excludes older rows, and really keeps newer ones.
+    /// Without this the filter could be a no-op and every other test would
+    /// still pass (the default is "no bound").
+    #[test]
+    fn a_days_window_includes_recent_rows_and_excludes_old_ones() {
+        let st = Store::open_memory().unwrap();
+        // Fixed instants; the cutoff is computed from a fixed `now` too, so the
+        // assertion cannot race the clock.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-16T12:00:00.000+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        st.insert_request_log(&req_log_at("2026-10-16T11:00:00.000+08:00", "g1", 1.0)).unwrap(); // 1h ago
+        st.insert_request_log(&req_log_at("2026-10-10T12:00:00.000+08:00", "g1", 8.0)).unwrap(); // 6d ago
+        st.insert_request_log(&req_log_at("2026-09-01T12:00:00.000+08:00", "g1", 64.0)).unwrap(); // 45d ago
+
+        // No window: everything, including the 45-day-old row.
+        let all = st.stats_summary(None, None).unwrap();
+        assert_eq!(all["requests"], 3, "{all}");
+
+        // 7 days: the 1h and the 6d rows, NOT the 45d one.
+        let seven = since_from_days(Some(7), now);
+        let w7 = st.stats_summary(None, seven.as_deref()).unwrap();
+        assert_eq!(w7["requests"], 2, "7-day window must drop the 45-day row: {w7}");
+        assert_eq!(w7["cost_usd"].as_f64(), Some(9.0), "1.0 + 8.0, not + 64.0: {w7}");
+
+        // 1 day: only the 1h row.
+        let one = since_from_days(Some(1), now);
+        let w1 = st.stats_summary(None, one.as_deref()).unwrap();
+        assert_eq!(w1["requests"], 1, "1-day window keeps only the newest row: {w1}");
+
+        // The other two blocks must honour the SAME window, or the console
+        // would show a filtered total above an unfiltered table.
+        let by_model = st.stats_by_model(None, one.as_deref()).unwrap();
+        assert_eq!(by_model.len(), 1, "by_model must be windowed too: {by_model:?}");
+        assert_eq!(by_model[0]["requests"], 1);
+        let by_group = st.stats_by_group(None, one.as_deref()).unwrap();
+        assert_eq!(by_group.len(), 1, "by_group must be windowed too: {by_group:?}");
+        assert_eq!(by_group[0]["requests"], 1);
+
+        // And the window COMBINES with a group scope rather than replacing it.
+        st.insert_request_log(&req_log_at("2026-10-16T11:30:00.000+08:00", "g2", 2.0)).unwrap();
+        let scoped = st.stats_summary(Some("g1"), one.as_deref()).unwrap();
+        assert_eq!(scoped["requests"], 1, "g1 only: {scoped}");
+        let both = st.stats_summary(None, one.as_deref()).unwrap();
+        assert_eq!(both["requests"], 2, "both groups in the window: {both}");
+    }
+
+    /// The LOG-PAGE path must honour the window as well as the stats path.
+    ///
+    /// This test exists because fault injection proved the stats-only test
+    /// could not see it: making `build_filters` ignore `since` left the suite
+    /// GREEN, i.e. the log pages could have shipped with a filter that does
+    /// nothing and nothing would have said so.
+    ///
+    /// It also pins `total` against the same filter as the rows: if the count
+    /// query and the page query ever disagree, the console draws a page count
+    /// that its own rows cannot fill.
+    #[test]
+    fn a_days_window_also_filters_the_log_pages_and_their_total() {
+        let st = Store::open_memory().unwrap();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-16T12:00:00.000+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Local);
+        let one = since_from_days(Some(1), now);
+        st.insert_request_log(&req_log_at("2026-10-16T11:00:00.000+08:00", "g1", 1.0)).unwrap();
+        st.insert_request_log(&req_log_at("2026-09-01T12:00:00.000+08:00", "g1", 64.0)).unwrap();
+
+        // Unfiltered: both rows, and `total` agrees with them.
+        let all = st.list_request_logs_page(50, 0, None, None, None).unwrap();
+        assert_eq!(all.rows.len(), 2, "unfiltered must return both rows");
+        assert_eq!(all.total, 2);
+
+        // Windowed: only the recent row, and `total` is windowed too.
+        let win = st.list_request_logs_page(50, 0, None, None, one.as_deref()).unwrap();
+        assert_eq!(win.rows.len(), 1, "window must drop the 45-day-old row: {:?}", win.rows);
+        assert_eq!(win.total, 1, "total must be windowed with the rows, not the whole table");
+        assert!(
+            win.rows[0]["ts"].as_str().unwrap().starts_with("2026-10-16"),
+            "the surviving row must be the RECENT one: {:?}",
+            win.rows[0]
+        );
+
+        // The switch-log page shares `build_filters`, so it must behave the same.
+        let sw_row = |ts: &str, rid: &str| SwitchLog {
+            ts: ts.to_string(),
+            request_id: rid.to_string(),
+            group_id: "g1".to_string(),
+            attempt_no: 1,
+            tier: 1,
+            channel_id: "c1".to_string(),
+            channel_name: "c1".to_string(),
+            upstream_model: "m1".to_string(),
+            outcome: "success".to_string(),
+            error_class: String::new(),
+            http_status: Some(200),
+            latency_ms: 5,
+            message: String::new(),
+        };
+        st.insert_switch_log(&sw_row("2026-10-16T11:05:00.000+08:00", "r-new")).unwrap();
+        st.insert_switch_log(&sw_row("2026-09-01T12:00:00.000+08:00", "r-old")).unwrap();
+        let sw_all = st.list_switch_logs_page(50, 0, None, None, None).unwrap();
+        assert_eq!(sw_all.total, 2, "unfiltered switch log sees both");
+        let sw = st.list_switch_logs_page(50, 0, None, None, one.as_deref()).unwrap();
+        assert_eq!(sw.total, 1, "switch-log total must be windowed: {:?}", sw.rows);
+        assert_eq!(sw.rows.len(), 1);
+        assert_eq!(sw.rows[0]["request_id"], "r-new", "only the recent attempt survives");    }
 
     /// The credential must leave config_json and live in the secrets table.
     #[test]

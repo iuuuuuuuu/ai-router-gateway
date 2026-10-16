@@ -120,6 +120,9 @@ pub struct LogQuery {
     pub request_id: Option<String>,
     /// Scopes the log to one routing group; omitted = every group.
     pub group_id: Option<String>,
+    /// Lookback window in days (1/2/3/7/14/30 in the console). Omitted or 0 =
+    /// no lower bound, which is what every pre-existing caller gets.
+    pub days: Option<u32>,
 }
 
 /// Answers `{"rows":[...],"total":N,"limit":L,"offset":O}`. `total` is the row
@@ -130,7 +133,8 @@ pub async fn switch_logs(State(state): State<AppState>, headers: HeaderMap, Quer
     if let Err(r) = authorize(&state, &headers) { return r }
     let limit = q.limit.unwrap_or(100) as i64;
     let offset = q.offset.unwrap_or(0) as i64;
-    match state.store.list_switch_logs_page(limit, offset, q.request_id.as_deref(), q.group_id.as_deref()) {
+    let since = crate::store::since_from_days(q.days, chrono::Local::now());
+    match state.store.list_switch_logs_page(limit, offset, q.request_id.as_deref(), q.group_id.as_deref(), since.as_deref()) {
         Ok(page) => Json(page.into_json()).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
@@ -140,7 +144,8 @@ pub async fn request_logs(State(state): State<AppState>, headers: HeaderMap, Que
     if let Err(r) = authorize(&state, &headers) { return r }
     let limit = q.limit.unwrap_or(100) as i64;
     let offset = q.offset.unwrap_or(0) as i64;
-    match state.store.list_request_logs_page(limit, offset, q.request_id.as_deref(), q.group_id.as_deref()) {
+    let since = crate::store::since_from_days(q.days, chrono::Local::now());
+    match state.store.list_request_logs_page(limit, offset, q.request_id.as_deref(), q.group_id.as_deref(), since.as_deref()) {
         Ok(page) => Json(page.into_json()).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
@@ -154,16 +159,21 @@ pub struct StatsQuery {
     /// draws it. A non-empty value narrows summary, by_model AND by_group to
     /// that one group.
     pub group_id: Option<String>,
+    /// Lookback window in days, same semantics as `LogQuery::days`. The console
+    /// sends the SAME value it sends to the log endpoints, so the summary and
+    /// the rows it summarises always describe one window.
+    pub days: Option<u32>,
 }
 
 pub async fn stats(State(state): State<AppState>, headers: HeaderMap, Query(q): Query<StatsQuery>) -> Response {
     if let Err(r) = authorize(&state, &headers) { return r }
     let scope = q.group_id.as_deref().filter(|g| !g.is_empty());
-    let summary = state.store.stats_summary(scope).unwrap_or_else(|_| json!({}));
-    let by_model = state.store.stats_by_model(scope).unwrap_or_else(|_| vec![]);
-    let by_group = state.store.stats_by_group(scope).unwrap_or_else(|_| vec![]);
+    let since = crate::store::since_from_days(q.days, chrono::Local::now());
+    let summary = state.store.stats_summary(scope, since.as_deref()).unwrap_or_else(|_| json!({}));
+    let by_model = state.store.stats_by_model(scope, since.as_deref()).unwrap_or_else(|_| vec![]);
+    let by_group = state.store.stats_by_group(scope, since.as_deref()).unwrap_or_else(|_| vec![]);
     let health: Vec<Value> = state.health.snapshot_summary().into_iter().map(cooldown_json).collect();
-    Json(json!({ "summary": summary, "by_model": by_model, "by_group": by_group, "group_id": scope, "health": health })).into_response()
+    Json(json!({ "summary": summary, "by_model": by_model, "by_group": by_group, "group_id": scope, "days": q.days, "health": health })).into_response()
 }
 
 /// POST /admin/api/test-channel — REAL minimal request (never a fake probe).

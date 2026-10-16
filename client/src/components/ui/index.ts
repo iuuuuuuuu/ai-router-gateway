@@ -14,3 +14,5 @@ export { default as Empty } from "./Empty.vue";
 export { default as Spinner } from "./Spinner.vue";
 export { default as Modal } from "./Modal.vue";
 export { default as TPager } from "./TPager.vue";
+export { default as TRange } from "./TRange.vue";
+export { DAY_RANGES, DEFAULT_DAYS, normalizeDays } from "./dayRange";

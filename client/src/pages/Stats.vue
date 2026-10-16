@@ -9,7 +9,8 @@ import { fmtSec } from "../format";
 import { chartPalette, chartTheme } from "../chart-theme";
 import EChart from "../components/EChart.vue";
 import {
-  Alert, Badge, Btn, Card, Empty, Spinner, TPager, TSelect, TToggle,
+  Alert, Badge, Btn, Card, Empty, Spinner, TPager, TSelect, TToggle, TRange,
+  DEFAULT_DAYS,
 } from "../components/ui";
 
 type Tone = "gray" | "teal" | "ok" | "warn" | "err" | "brand";
@@ -57,6 +58,9 @@ const groupOptions = computed(() => [
 // 只在真正选了某个分组时才带参，避免任何一层把参数拼成字面量 "undefined"。
 const scopedId = computed(() => (groupId.value === ALL_GROUPS ? "" : groupId.value));
 
+// 时间范围（天）。默认 1 天；与日志页用同一个默认值，否则两页数字对不上会像 bug。
+const days = ref<number>(DEFAULT_DAYS);
+
 const data = ref<StatsPayload | null>(null);
 const loading = ref(false);
 const err = ref("");
@@ -88,7 +92,8 @@ async function load(silent = false) {
   err.value = "";
   try {
     // api.stats 自己会拼 "?group_id=..."；传 undefined 即全局统计。
-    const payload = (await api.stats(scopedId.value || undefined)) as StatsPayload;
+    // group_id 与 days 一起发，服务端把 summary / by_model / by_group 三块同时收窄。
+    const payload = (await api.stats(scopedId.value || undefined, days.value)) as StatsPayload;
     data.value = payload;
     palette.value = chartPalette(chartTheme());
     lastAt.value = Date.now();
@@ -472,6 +477,8 @@ function startPoll() {
 watch(autoRefresh, startPoll);
 // 统计范围切换（选择器或点「分组用量」行）都要立刻重新拉取分组作用域的数据。
 watch(groupId, () => { void load(); });
+// 换时间范围要重新拉：天数变了服务端返回的是另一批聚合结果。
+watch(days, () => { void load(); });
 
 onMounted(() => {
   void load();
@@ -493,6 +500,7 @@ onUnmounted(() => {
     <div class="mb-3 flex flex-wrap items-center gap-2">
       <div class="text-[12px] text-ink-3">
         统计范围：<span class="font-medium text-ink-2">{{ scopedId ? groupLabel(scopedId) : "全部分组" }}</span>
+        · 最近 <span class="font-medium text-ink-2">{{ days }}</span> 天
         · 共 {{ byModel.length }} 个模型 · 合计 {{ fmtCost(costTotal) }}
         <Badge
           v-if="loopRetries !== null && loopRetries > 0"
@@ -518,6 +526,10 @@ onUnmounted(() => {
       </div>
       <div class="ml-auto flex flex-wrap items-center gap-2">
         <!-- 同 Logs.vue：attrs 在 SelectRoot（inheritAttrs:false）处被丢弃，钩子必须挂在包裹 div 上。 -->
+        <!-- 时间范围与分组并列：两个筛选都是「这次统计的范围」，放一起才读得通。 -->
+        <div class="w-[110px]" data-test="stats-range-filter">
+          <TRange v-model="days" />
+        </div>
         <div class="w-[150px]" data-test="stats-group-filter">
           <TSelect v-model="groupId" size="sm" :options="groupOptions" placeholder="全部分组" />
         </div>
@@ -615,6 +627,7 @@ onUnmounted(() => {
           <table class="w-full text-[12.5px]">
             <thead>
               <tr>
+                <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">状态</th>
                 <th class="px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">模型</th>
                 <th class="whitespace-nowrap px-3 py-2 text-left text-[11.5px] font-medium uppercase tracking-wide text-ink-3">渠道</th>
                 <th class="whitespace-nowrap px-3 py-2 text-right text-[11.5px] font-medium uppercase tracking-wide text-ink-3">请求数</th>

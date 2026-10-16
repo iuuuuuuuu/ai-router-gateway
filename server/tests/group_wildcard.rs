@@ -441,7 +441,7 @@ async fn w06_stats_are_keyed_on_the_routed_model_not_the_group_alias() {
     // Another group must never leak into a scoped call.
     insert_request_as(&store, "gB", EXPOSED, "success", Some(("chZ", "upZ")), 6);
 
-    let rows = store.stats_by_model(Some(GROUP_ID)).unwrap();
+    let rows = store.stats_by_model(Some(GROUP_ID), None).unwrap();
 
     // (1) The group alias must NOT be a model identity any more. This is the
     //     assertion the old code failed hardest: it produced 3 alias rows here.
@@ -481,7 +481,7 @@ async fn w06_stats_are_keyed_on_the_routed_model_not_the_group_alias() {
 
     // (6) by_group's 模型数 must count ROUTED pairs, not request aliases. The
     //     old COUNT(DISTINCT exposed_model) said 3 here for 2 real models.
-    let by_group = store.stats_by_group(Some(GROUP_ID)).unwrap();
+    let by_group = store.stats_by_group(Some(GROUP_ID), None).unwrap();
     let row = &by_group[0];
     assert_eq!(row["group_id"].as_str(), Some(GROUP_ID), "{row}");
     assert_eq!(row["requests"].as_i64(), Some(5), "{row}");
@@ -492,7 +492,7 @@ async fn w06_stats_are_keyed_on_the_routed_model_not_the_group_alias() {
     );
 
     // (7) The global scope aggregates the same way and keeps groups apart.
-    let all = store.stats_by_model(None).unwrap();
+    let all = store.stats_by_model(None, None).unwrap();
     let chz = all.iter().find(|r| r["channel_id"] == "chZ").expect("gB row present globally");
     assert_eq!(chz["requests"].as_i64(), Some(1), "{chz}");
     assert_eq!(all.iter().filter(|r| r["channel_id"] == "ch0").count(), 1, "no duplicate ch0 rows: {all:?}");
@@ -525,7 +525,7 @@ async fn w07_failed_requests_are_shown_per_attempted_channel_and_model() {
     // (D) 成功请求照旧一行 routed，且带成本。
     insert_request_as(&store, GROUP_ID, EXPOSED, "success", Some(("chC", "up-c")), 4);
 
-    let rows = store.stats_by_model(Some(GROUP_ID)).unwrap();
+    let rows = store.stats_by_model(Some(GROUP_ID), None).unwrap();
     let kind_of = |ch: &str, up: &str| -> Option<String> {
         rows.iter()
             .find(|r| r["channel_id"] == ch && r["upstream_model"] == up)
@@ -559,7 +559,7 @@ async fn w07_failed_requests_are_shown_per_attempted_channel_and_model() {
     //    不得回流到分组维度」的判据。insert_request_as 给每次请求 10 input / 5 output，
     //    本测试共 4 次请求、5 条 switch_log 尝试（req-1 有 2 条）。
     //    按尝试计会得到 50；正确值是 40。
-    let by_group = store.stats_by_group(Some(GROUP_ID)).unwrap();
+    let by_group = store.stats_by_group(Some(GROUP_ID), None).unwrap();
     assert_eq!(
         by_group[0]["input_tokens"].as_i64(),
         Some(40),
@@ -584,9 +584,9 @@ async fn w07b_per_attempt_expansion_may_exceed_the_request_total_by_design() {
     insert_switch_as(&store, GROUP_ID, "req-1", "chB", "up-b", "auth_error");
     insert_switch_as(&store, GROUP_ID, "req-1", "chC", "up-c", "auth_error");
 
-    let rows = store.stats_by_model(Some(GROUP_ID)).unwrap();
+    let rows = store.stats_by_model(Some(GROUP_ID), None).unwrap();
     let sum: i64 = rows.iter().map(|r| r["requests"].as_i64().unwrap()).sum();
-    let total = store.stats_by_group(Some(GROUP_ID)).unwrap()[0]["requests"].as_i64().unwrap();
+    let total = store.stats_by_group(Some(GROUP_ID), None).unwrap()[0]["requests"].as_i64().unwrap();
 
     assert_eq!(total, 1, "真机只有 1 次请求");
     assert_eq!(sum, 3, "但展开成 3 行尝试 —— 这是 Owner 选定的语义，不是 bug: {rows:?}");

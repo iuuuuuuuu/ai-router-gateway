@@ -311,7 +311,7 @@ async fn l10_two_degenerate_candidates_count_two_loop_retries() {
     assert!(cooling.iter().all(|c| c.kind != "auth"), "a degenerate hit must never look like an auth failure: {cooling:?}");
 
     // store-level aggregate
-    let summary = st.store.stats_summary(None).unwrap();
+    let summary = st.store.stats_summary(None, None).unwrap();
     assert_eq!(summary["loop_retries"], 2, "{summary}");
 }
 
@@ -666,7 +666,7 @@ async fn l14_legacy_database_gains_the_loop_retries_column() {
     // The historical row reads as "no loop retries", as a REAL number.
     assert_eq!(rows[0]["loop_retries"], 0, "{rows:?}");
     assert_eq!(rows[0]["loop_retries"].as_u64(), Some(0), "{rows:?}");
-    assert_eq!(store.stats_summary(None).unwrap()["loop_retries"], 0);
+    assert_eq!(store.stats_summary(None, None).unwrap()["loop_retries"], 0);
 
     // And a freshly written row lands in the backfilled column.
     store.insert_request_log(&gw_server::store::RequestLog {
@@ -689,9 +689,9 @@ async fn l14_legacy_database_gains_the_loop_retries_column() {
     assert_eq!(rows[0]["loop_continues"], 4, "{rows:?}");
     assert_eq!(rows[0]["error_class"], "degenerate_output", "{rows:?}");
     assert_eq!(rows[0]["error_message"], "输出复读：同一段内容连续重复了 4 次", "{rows:?}");
-    assert_eq!(store.stats_summary(None).unwrap()["loop_retries"], 3);
-    assert_eq!(store.stats_summary(None).unwrap()["loop_truncated"], 1);
-    assert_eq!(store.stats_summary(None).unwrap()["loop_continues"], 4);
+    assert_eq!(store.stats_summary(None, None).unwrap()["loop_retries"], 3);
+    assert_eq!(store.stats_summary(None, None).unwrap()["loop_truncated"], 1);
+    assert_eq!(store.stats_summary(None, None).unwrap()["loop_continues"], 4);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(dir.join("legacy.db-wal"));

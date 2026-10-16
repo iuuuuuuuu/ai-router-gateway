@@ -240,7 +240,7 @@ async fn t13_switch_logs_recorded() {
         assert!(reqs[0].get(k).is_some(), "request_logs projection missing {k}: {}", reqs[0]);
     }
     // 成本必须能回答"落到哪个渠道的哪个模型"
-    let by_model = st.store.stats_by_model(None).unwrap();
+    let by_model = st.store.stats_by_model(None, None).unwrap();
     assert!(!by_model.is_empty(), "stats_by_model empty");
     // `routed` replaced `exposed_model`: a row is keyed on the ROUTED model, and
     // a group alias must never be charted as one (see w06 in group_wildcard.rs).
@@ -249,7 +249,7 @@ async fn t13_switch_logs_recorded() {
     }
     // 统计页顶部卡片直接读 summary 的这些键；缺键会静默退化成 "—"，
     // 所以必须断言键存在（曾经 avg_duration_ms 缺失导致「平均耗时」永远显示 —）。
-    let summary = st.store.stats_summary(None).unwrap();
+    let summary = st.store.stats_summary(None, None).unwrap();
     for k in [
         "requests",
         "success",
@@ -283,7 +283,7 @@ async fn t19_empty_store_summary_is_zeroed() {
     let (base, prefixes) = spawn_fake_upstreams(&[Behavior::GoodJson]).await;
     let cfg = test_config(&base, &prefixes, &[gw_server::config::Protocol::Openai], 1, EXPOSED, test_retry());
     let (st, _router) = gateway(cfg).await;
-    let s = st.store.stats_summary(None).unwrap();
+    let s = st.store.stats_summary(None, None).unwrap();
     assert_eq!(s["requests"], 0);
     for k in ["input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "cost_usd", "wasted_cost_usd"] {
         assert_eq!(s[k], 0, "empty store {k} must be 0, got {}", s[k]);
@@ -433,17 +433,17 @@ async fn t20_group_scoped_logs_and_stats() {
     assert!(st.store.list_request_logs(100, None, Some("g2")).unwrap().is_empty());
 
     // stats scoped to a group vs global
-    let g1 = st.store.stats_summary(Some("g1")).unwrap();
+    let g1 = st.store.stats_summary(Some("g1"), None).unwrap();
     assert_eq!(g1["requests"], 1, "g1 summary counts only its own: {g1}");
-    let g2 = st.store.stats_summary(Some("g2")).unwrap();
+    let g2 = st.store.stats_summary(Some("g2"), None).unwrap();
     assert_eq!(g2["requests"], 0, "quiet group summary is empty: {g2}");
-    assert!(st.store.stats_by_model(Some("g2")).unwrap().is_empty(), "quiet group has no model rows");
-    assert_eq!(st.store.stats_by_model(Some("g1")).unwrap().len(), 1);
+    assert!(st.store.stats_by_model(Some("g2"), None).unwrap().is_empty(), "quiet group has no model rows");
+    assert_eq!(st.store.stats_by_model(Some("g1"), None).unwrap().len(), 1);
 
     // the cross-group overview always lists every group that saw traffic
     // Signature change (task-43 defect 1): `None` is the cross-group overview
     // this assertion has always been about.
-    let by_group = st.store.stats_by_group(None).unwrap();
+    let by_group = st.store.stats_by_group(None, None).unwrap();
     let row = by_group.iter().find(|r| r["group_id"] == "g1").expect("g1 row present");
     assert_eq!(row["requests"], 1, "by_group counts g1: {by_group:?}");
     assert!(by_group.iter().all(|r| r["group_id"] != "g2"), "a group with no traffic has no row: {by_group:?}");

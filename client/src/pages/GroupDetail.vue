@@ -27,7 +27,7 @@ import { chartPalette, chartTheme } from "../chart-theme";
 import EChart from "../components/EChart.vue";
 import {
   Alert, Badge, Btn, Card, Empty, Field, IconBtn, PageHeader, SecInput, Spinner, TInput, TPager,
-  TSelect, TToggle,
+  TSelect, TToggle, TRange, DEFAULT_DAYS,
 } from "../components/ui";
 
 type Tone = "gray" | "teal" | "ok" | "warn" | "err" | "brand";
@@ -307,6 +307,9 @@ async function copyKey(v: unknown) {
 /* --------------------------------- 状态 --------------------------------- */
 const tab = ref<TabKey>("overview");
 const autoRefresh = ref(true);
+// 时间范围（天）：作用于本页的**用量 / 请求日志 / 切换日志**三个页签。
+// 冷却状态不参与 —— 它是「此刻正在冷却」的实时快照，没有历史时间戳可筛。
+const days = ref<number>(DEFAULT_DAYS);
 const loading = ref(false);
 const err = ref("");
 const lastAt = ref(0);
@@ -349,11 +352,11 @@ async function load(silent = false) {
   loadInflight = true;
   try {
     const [s, sw, rq, hl, gm] = await Promise.all([
-      api.stats(g.id),
+      api.stats(g.id, days.value),
       // v0.4.4 起这两个接口返回 { rows, total, limit, offset }：total 是忽略分页窗口的
       // 过滤命中总数，页签右侧与分页条都读它，翻页时不会变小。offset 由页签页码算出来。
-      api.switchLogsPage(switchSize.value, (switchPage.value - 1) * switchSize.value, undefined, g.id),
-      api.requestLogsPage(requestSize.value, (requestPage.value - 1) * requestSize.value, undefined, g.id),
+      api.switchLogsPage(switchSize.value, (switchPage.value - 1) * switchSize.value, undefined, g.id, days.value),
+      api.requestLogsPage(requestSize.value, (requestPage.value - 1) * requestSize.value, undefined, g.id, days.value),
       api.health(),
       // 成员数据失败不拖垮整页：单独吞掉错误，退化成「0 次 + 无使用中（并发未知）」。
       api.groupMembers(g.id).catch(() => null),
@@ -428,6 +431,8 @@ watch(autoRefresh, () => { startTimer(); });
 // 冷却页是本地分片，换页不需要请求，所以不挂在这个 watch 上；
 // silent = true 让翻页时不要整页变成「正在加载…」骨架，表格就地替换。
 watch([requestPage, requestSize, switchPage, switchSize], () => { void load(true); });
+// 换时间范围：行数会变，页码必须回到第 1 页，否则会停在旧范围的第 N 页上。
+watch(days, () => { requestPage.value = 1; switchPage.value = 1; void load(true); });
 
 /** Esc = 返回分组路由（保留弹窗版按 Esc 关闭的习惯）。
  *  ★ 模型配置卡里正在拖动排序时不吃这一下：onDragKey 只放弃拖动，页面留在原地。 */
@@ -1365,8 +1370,20 @@ function saveTiers() {
           : 'border-transparent text-ink-3 hover:text-ink-2'"
         @click="tab = t.key"
       >{{ t.label }}</button>
-      <div class="ml-auto text-[12px] text-ink-3" data-test="gd-tab-counts">
-        请求日志 {{ requestTotal }} 条 · 切换日志 {{ switchTotal }} 条
+      <!-- 时间范围只影响「用量 / 请求日志 / 切换日志」三个页签，所以只在它们上面出现：
+           冷却状态是「此刻正在冷却」的实时快照，没有历史时间戳可筛，摆出来会骗人。
+           data-test 挂包裹 div：attrs 在 reka-ui 的 SelectRoot（inheritAttrs:false）处会被丢掉。 -->
+      <div
+        v-if="tab === 'usage' || tab === 'request' || tab === 'switch'"
+        class="ml-auto w-[110px]" data-test="gd-range-filter"
+      >
+        <TRange v-model="days" />
+      </div>
+      <div class="text-[12px] text-ink-3" :class="tab === 'overview' || tab === 'cooldown' ? 'ml-auto' : ''" data-test="gd-tab-counts">
+        <!-- 这两个数是被时间范围筛过的（服务端 total 就是筛选命中数），而概览/冷却两个页签上
+             看不到范围选择器 —— 不注明范围的话「请求日志 0 条」会被读成「这个分组从没请求过」。
+             所以范围写在文案里，任何页签上都自解释。 -->
+        请求日志 {{ requestTotal }} 条 · 切换日志 {{ switchTotal }} 条（最近 {{ days }} 天）
         <span v-if="lastAt" class="ml-1 font-mono text-[11.5px]">· 最后更新 {{ fmtClock(lastAt) }}</span>
       </div>
     </div>
