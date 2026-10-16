@@ -86,6 +86,9 @@ export interface GroupMember {
   channel_id: string; channel_name: string; upstream_model: string; exposed_model: string;
   enabled: boolean; cooling: boolean; cooling_until_ms: number | null; cooldown_kind: string | null;
   requests: number; failed_attempts: number; loop_retries: number;
+  /** 该候选在自己的思考里打转、被网关掐断继续转发思考的次数。
+   *  与 loop_retries 分开：那是回答复读，这是思考复读，是两种不同的问题。 */
+  reasoning_truncated?: number;
   /** 该候选提交后被截断的次数。 */
   loop_truncated?: number;
   error_classes: { error_class: string; n: number }[];

@@ -84,6 +84,15 @@ function memberRequests(tierLevel: number, modelId: string): number {
 function memberFailed(tierLevel: number, modelId: string): number {
   return memberOf(tierLevel, modelId)?.failed_attempts ?? 0;
 }
+/** 该成员思考打转、被掐断继续转发思考的次数。0 = 没发生过。 */
+function memberReasoningLoops(tierLevel: number, modelId: string): number {
+  return memberOf(tierLevel, modelId)?.reasoning_truncated ?? 0;
+}
+/** 徽章 title：说明是「思考」打转而不是「回答」被截断，两者不是一回事。 */
+function memberReasoningTitle(tierLevel: number, modelId: string): string {
+  const n = memberReasoningLoops(tierLevel, modelId);
+  return `该模型在自己的思考里打转 ${n} 次，网关掐断了继续转发的思考；回答本身没有被截断`;
+}
 /** 数字徽章的 title：把「成员数据不可用」和「真的是 0 次」分开说。 */
 function memberRequestsTitle(tierLevel: number, modelId: string): string {
   if (!memberPayload.value) return "成员数据不可用";
@@ -1818,7 +1827,12 @@ function saveTiers() {
                       >{{ memberRequests(t.level, m.model_id) }} 次</Badge>
                       <Badge v-if="memberFailed(t.level, m.model_id) > 0" tone="err" data-test="gd-member-failed">
                         失败 {{ memberFailed(t.level, m.model_id) }}
-                      </Badge>
+                      </Badge>                      <Badge
+                        v-if="memberReasoningLoops(t.level, m.model_id) > 0"
+                        tone="warn"
+                        data-test="gd-member-reasoning-loops"
+                        :title="memberReasoningTitle(t.level, m.model_id)"
+                      >思考打转 {{ memberReasoningLoops(t.level, m.model_id) }}</Badge>
                       <span
                         v-if="isMemberInUse(t.level, m.model_id)"
                         data-test="gd-member-active"

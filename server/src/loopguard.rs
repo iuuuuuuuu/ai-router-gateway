@@ -688,6 +688,48 @@ mod tests {
         assert!(h.repeats >= 4);
     }
 
+    /// R2's exact boundary, measured rather than assumed.
+    ///
+    /// `match_span` compares `W[len-1-j]` against `W[len-1-unit_len-j]`, so N
+    /// consecutive copies of a unit of length L produce a span of (N-1)*L and
+    /// therefore `repeats = N-1`. With `max_repeats = 4` the threshold is
+    /// consequently "FIVE copies fire, FOUR do not".
+    ///
+    /// This pins the tolerance the default config actually buys, and it is the
+    /// only falsifiable boundary in R2: the failure it exists to catch is a
+    /// guard tuned one notch too eager, which is precisely the shape that would
+    /// cut legitimate text. (Lowering `min_chars` or `repeat_ratio` instead was
+    /// measured NOT to change this outcome -- R4's ratio is exactly 0.75 at four
+    /// copies, and R2 still has the last word -- so `max_repeats` is the only
+    /// knob this test can and should pin.)
+    #[test]
+    fn t02b_repeat_threshold_boundary_is_five_copies_not_four() {
+        // Distinct characters, so the scan cannot collapse onto unit_len = 1.
+        let unit = "第一步要先确认接口返回的字段结构";
+        assert_eq!(unit.chars().count(), 16, "the arithmetic below depends on L=16");
+        assert_eq!(
+            unit.chars().collect::<std::collections::HashSet<_>>().len(),
+            16,
+            "every character must be distinct or the boundary moves"
+        );
+
+        // FOUR copies (64 chars) are inside the tolerance: the client must see
+        // them, so a guard that fires here is over-eager and this is where it
+        // gets caught.
+        let four = unit.repeat(4);
+        assert_eq!(four.chars().count(), 64);
+        assert!(
+            hit(&four).is_none(),
+            "4 copies of a 16-char unit must NOT be judged a loop (max_repeats=4 counts 4 repeats, i.e. 5 copies); a hit here is the over-eager-guard bug"
+        );
+
+        // FIVE copies (80 chars) exceed it and must fire -- otherwise the test
+        // above could be satisfied by a guard that simply never fires.
+        let five = unit.repeat(5);
+        let h = hit(&five).expect("5 copies must be judged a loop");
+        assert_eq!(h.repeats, 4, "5 copies == 4 repeats");
+        assert_eq!(h.unit.chars().count(), 16);
+    }
     #[test]
     fn t03_pure_newline_repeat_does_not_hit() {
         assert!(hit(&"\n".repeat(200)).is_none(), "R5: blank-only repetition is not degenerate output");

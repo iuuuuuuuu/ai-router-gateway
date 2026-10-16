@@ -67,7 +67,12 @@ pub enum Behavior {
     ReasoningLoopOnly,
     /// Control for the reasoning guard: thinking that DELIBERATES without
     /// repeating — a false positive here would discard a good candidate.
-    NormalReasoning,
+    NormalReasoning,    /// Control for the reasoning guard AT THE THRESHOLD: four copies of a
+    /// 16-char unit (64 chars) sit exactly inside `max_repeats = 4` — the rule
+    /// counts N-1 repeats — so they must reach the client untouched. This is
+    /// the fixture a guard tuned one notch too eager fails, which the
+    /// never-repeating control above cannot detect (measured).
+    ReasoningAtThreshold,
     /// Same, but the loop runs for 400 frames so a truncation that failed to
     /// actually stop the stream is unmistakable.
     NormalThenDegenerateLong,
@@ -386,18 +391,34 @@ async fn handle_beh(beh: Behavior, body: String, hdrs: axum::http::HeaderMap, pr
             sse.push_str(&openai_tail_sse("stop"));
             ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
         }
+        Behavior::ReasoningAtThreshold => {
+            // L=16 distinct chars x4 copies = 64 chars. `match_span` compares
+            // at shift unit_len, so four copies yield reps = 3, which is below
+            // `max_repeats = 4`: the correct guard tolerates it. Five copies
+            // yield reps = 4 and must fire (pinned by the unit test).
+            let unit = "第一步要先确认接口返回的字段结构";
+            let mut sse = String::new();
+            for _ in 0..4 { sse.push_str(&sse_frame(&serde_json::json!({"choices":[{"index":0,"delta":{"reasoning_content":unit}}]}).to_string())); }
+            sse.push_str(&openai_text_chunk("ANSWER-OK"));
+            sse.push_str(&openai_tail_sse("stop"));
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
         Behavior::NormalReasoning => {
             // Deliberation that repeats PHRASES without ever looping.
             //
             // MEASURED, not assumed: with the real rules (min_chars 64,
             // repeat_min_chars 24, ratio 0.75) this text produces NO candidate
             // at any unit length — and it still produces none when min_chars is
-            // dropped to 8. The reason is structural: R1 needs a CONTIGUOUS
-            // shift-match, and prose repeats its phrases across different
-            // sentences, never back to back. So a false positive here is not a
-            // tuning risk this control has to defend against; what it pins is
-            // that ordinary thinking is relayed whole and never counted as a
-            // loop, which is the regression that would actually ship.
+            // dropped to 8. R1 needs a CONTIGUOUS shift-match, and prose repeats
+            // its phrases across different sentences, never back to back.
+            //
+            // ★ This fixture ALONE has no teeth against an over-eager guard:
+            // lowering max_repeats/min_chars here left every test green. Nothing
+            // repeated is present, so no threshold can fire on it. That gap is
+            // what ReasoningAtThreshold closes, at the measured R2 boundary
+            // (N copies give repeats = N-1, so max_repeats=4 tolerates 5 copies).
+            // What this one genuinely pins is that ordinary deliberation is
+            // relayed whole and never counted as a loop.
             let thoughts = [
                 "先看入口：用户点了网站解析，走的是 parseWebsite。",
                 "再看表单：title 是必填的，这个接口其实不吃 title，只能本地用。",

@@ -782,6 +782,34 @@ async fn l17_normal_thinking_is_never_mistaken_for_a_loop() {
 }
 
 #[tokio::test]
+async fn l19b_thinking_at_the_threshold_reaches_the_client_whole() {
+    // The control with teeth. Four copies of a 16-char unit are exactly inside
+    // `max_repeats = 4` (the rule counts N-1 repeats, so tolerance is 5 copies),
+    // and the unit test t02b pins that boundary directly. This fixture is what
+    // an over-eager guard fails: the never-repeating control cannot detect one
+    // (measured -- lowering max_repeats/min_chars left every test green there,
+    // so it had no teeth). 64 chars of real repetition is delivered verbatim.
+    let (st, router) = harness(&[Behavior::ReasoningAtThreshold], 1, test_retry()).await;
+    let (status, sse) = post_chat_stream(&router, EXPOSED).await;
+    assert_eq!(status, 200, "sse={sse}");
+    assert_eq!(client_text(&sse), "ANSWER-OK", "sse={sse}");
+    // 4 x 16 = 64 chars of thinking, all of it real content.
+    let thinking = client_reasoning(&sse);
+    assert_eq!(
+        thinking.chars().count(),
+        64,
+        "all 64 chars of threshold-adjacent thinking must be relayed, got {} chars: {sse}",
+        thinking.chars().count()
+    );
+    let row = newest_request_row(&st).await;
+    assert_eq!(row["status"], "success", "{row}");
+    assert_eq!(
+        row["reasoning_truncated"], 0,
+        "a tolerated repetition must not be counted as a thinking loop: {row}"
+    );
+    assert_eq!(row["loop_retries"], 0, "{row}");
+}
+#[tokio::test]
 async fn l18_reasoning_judging_can_be_switched_off() {
     // With the flag off the old behaviour returns: thoughts are relayed
     // untouched, whatever they contain. The switch must be honoured.
