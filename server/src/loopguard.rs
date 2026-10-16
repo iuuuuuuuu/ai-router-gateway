@@ -74,6 +74,11 @@ pub struct LoopCfg {
     /// has taken over a 4000-character window", which would let the loop run for
     /// thousands of characters before it is caught.
     pub tail_chars: usize,
+    /// Wall-clock ceiling on the pre-commit holdback, in milliseconds. 0 means
+    /// no cap (the holdback is then purely `min_chars` characters). See
+    /// `config.rs` for why this exists: the character count says nothing about
+    /// how long filling it will take.
+    pub hold_max_ms: u64,
     /// Correct-and-continue instead of discard-and-retry.
     pub continue_enabled: bool,
     /// Upper bound on corrections for ONE answer. Clamped to a small number:
@@ -131,6 +136,14 @@ impl LoopCfg {
             tracing::warn!(configured = rc.loop_guard_tail_chars, used = tail_chars, "loop_guard_tail_chars out of range; clamped");
         }
 
+        // 0 disables the cap. An absurdly large value is clamped rather than
+        // rejected: a config typo must never cost a client request, and a cap
+        // of 60 s is already longer than any sane holdback.
+        let hold_max_ms = if rc.loop_guard_hold_max_ms == 0 { 0 } else { rc.loop_guard_hold_max_ms.clamp(1, 60_000) };
+        if hold_max_ms != rc.loop_guard_hold_max_ms {
+            tracing::warn!(configured = rc.loop_guard_hold_max_ms, used = hold_max_ms, "loop_guard_hold_max_ms out of range; clamped");
+        }
+
         // A correction round is an extra upstream call per answer, so the cap
         // is clamped rather than trusted: 0 means "never continue" (the old
         // discard-and-retry behaviour), and the upper bound keeps one looping
@@ -150,7 +163,7 @@ impl LoopCfg {
         };
 
         Self {
-            enabled, min_chars, repeat_min_chars, repeat_ratio, max_repeats,
+            enabled, min_chars, repeat_min_chars, repeat_ratio, max_repeats, hold_max_ms,
             window_chars, tail_chars,
             continue_enabled: rc.loop_guard_continue_enabled,
             continue_max,
@@ -553,14 +566,96 @@ impl LoopGuard {
     }
 }
 
+/// May the pre-commit holdback end?
+///
+/// The holdback exists so the guard has EVIDENCE before the first byte leaves:
+/// a repetition can only be judged from characters that have actually arrived.
+/// `min_chars` alone therefore makes the first-byte delay a function of the
+/// model's generation speed — 64 characters is 160 ms at 400 chars/s but 32 s
+/// at 2 chars/s. This returns true when EITHER
+///
+///   * `pending_len >= min_chars` — the evidence the guard needs has arrived, or
+///   * `elapsed >= hold_max` — the client has waited long enough.
+///
+/// `hold_max == 0` disables the ceiling (the old, purely character-counted
+/// behaviour). `elapsed == None` means no text frame has arrived yet, so there
+/// is no wait to bound. When the ceiling wins, the text that arrives afterwards
+/// is judged post-commit, which tier 2 of `judge_tail` still covers — detection
+/// quality degrades, the first byte does not wait.
+///
+/// Kept as a pure function rather than an inline closure so the decision is
+/// unit-testable without real time: an integration test would have to rely on
+/// wall-clock scheduling, which is exactly the kind of test that passes or
+/// fails by luck on a loaded machine.
+pub fn holdback_done(
+    pending_len: usize,
+    min_chars: usize,
+    hold_max: std::time::Duration,
+    elapsed: Option<std::time::Duration>,
+) -> bool {
+    if pending_len >= min_chars {
+        return true;
+    }
+    match (hold_max.is_zero(), elapsed) {
+        (true, _) => false,          // ceiling disabled: wait for the characters
+        (false, None) => false,      // no text yet, so no wait to bound
+        (false, Some(e)) => e >= hold_max,
+    }
+}
 #[cfg(test)]
 mod tests {
+    // ---- holdback ceiling (pure, no wall-clock dependency) ----
+
+    /// The character target still wins when it is reached first: the ceiling
+    /// must never cut the evidence short for a model fast enough to supply it.
+    #[test]
+    fn holdback_char_target_wins_when_reached_first() {
+        let cap = std::time::Duration::from_millis(250);
+        assert!(holdback_done(64, 64, cap, Some(std::time::Duration::from_millis(0))));
+        assert!(holdback_done(65, 64, cap, Some(std::time::Duration::from_millis(10))));
+    }
+
+    /// The ceiling wins when the characters have not arrived in time — this is
+    /// the whole point of the field, and the case a slow model hits.
+    #[test]
+    fn holdback_ceiling_wins_for_a_slow_model() {
+        let cap = std::time::Duration::from_millis(250);
+        assert!(holdback_done(12, 64, cap, Some(std::time::Duration::from_millis(250))));
+        assert!(holdback_done(12, 64, cap, Some(std::time::Duration::from_millis(9999))));
+    }
+
+    /// Below both thresholds the answer is still being assembled: neither the
+    /// evidence nor the clock has arrived, so the holdback must continue.
+    #[test]
+    fn holdback_continues_when_neither_threshold_is_met() {
+        let cap = std::time::Duration::from_millis(250);
+        assert!(!holdback_done(12, 64, cap, Some(std::time::Duration::from_millis(249))));
+        assert!(!holdback_done(0, 64, cap, Some(std::time::Duration::from_millis(0))));
+    }
+
+    /// 0 disables the ceiling: the wait is then purely `min_chars` characters,
+    /// which is the pre-existing behaviour and must stay reachable.
+    #[test]
+    fn holdback_zero_disables_the_ceiling() {
+        let off = std::time::Duration::from_millis(0);
+        assert!(!holdback_done(12, 64, off, Some(std::time::Duration::from_secs(3600))));
+        assert!(holdback_done(64, 64, off, Some(std::time::Duration::from_secs(3600))));
+    }
+
+    /// Before any text frame arrives there is no wait to bound, so the ceiling
+    /// cannot fire — otherwise the clock would start at the attempt and charge
+    /// the client for upstream thinking time.
+    #[test]
+    fn holdback_ceiling_needs_a_first_text_frame() {
+        let cap = std::time::Duration::from_millis(1);
+        assert!(!holdback_done(0, 64, cap, None));
+    }
     use super::*;
 
     fn cfg() -> LoopCfg {
         LoopCfg {
             enabled: true, min_chars: 64, repeat_min_chars: 24, repeat_ratio: 0.75,
-            max_repeats: 4, window_chars: 4000, tail_chars: 128,
+            max_repeats: 4, window_chars: 4000, tail_chars: 128, hold_max_ms: 0,
             continue_enabled: false, continue_max: 0, continue_prompt: String::new(),
         }
     }

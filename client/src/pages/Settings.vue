@@ -179,6 +179,7 @@ onMounted(() => {
   if (r) {
     if (typeof r.loop_guard_enabled !== "boolean") r.loop_guard_enabled = true;
     if (typeof r.loop_guard_min_chars !== "number") r.loop_guard_min_chars = 64;
+    if (typeof r.loop_guard_hold_max_ms !== "number") r.loop_guard_hold_max_ms = 250;
     if (typeof r.loop_guard_repeat_min_chars !== "number") r.loop_guard_repeat_min_chars = 24;
     if (typeof r.loop_guard_repeat_ratio !== "number") r.loop_guard_repeat_ratio = 0.75;
     if (typeof r.loop_guard_max_repeats !== "number") r.loop_guard_max_repeats = 4;
@@ -353,6 +354,17 @@ onMounted(() => {
                 <TInput
                   v-model.number="retry.loop_guard_min_chars" type="number" min="1"
                   data-test="loop-guard-min-chars" @input="markDirty()"
+                />
+              </div>
+            </Field>
+            <Field
+              label="首字节等待上限 (毫秒)"
+              hint="检测起点是字符数，要等多久取决于模型出字速度：快模型 160ms 就攒够，慢模型可能要好几秒。这里给它一个时间上限，到点先提交，后续内容交给已提交后的判定。0 = 不设上限（只按字符数等）"
+            >
+              <div data-test="loop-guard-hold-max-ms">
+                <TInput
+                  v-model.number="retry.loop_guard_hold_max_ms" type="number" min="0"
+                  data-test="loop-guard-hold-max-ms" @input="markDirty()"
                 />
               </div>
             </Field>

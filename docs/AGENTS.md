@@ -87,7 +87,7 @@ loop guard 另加一条 **I6**：提交后命中退化时，客户端已收到�
 | 提交后一定泄漏一小段 | 已经发给客户端的字节收不回来。提交后命中退化**必然**泄漏一段复读文本，泄漏量受 `loop_guard_tail_chars`（默认 128）与纠正轮数共同约束，不等式钉在测试 `l13f`：`leaked <= (1 + loop_continues) * repeat_min_chars` |
 | 提交后单元长度窗口 | 默认阈值下，提交后能拦下约 24–54 字符的重复单元（两层判定：128 字符/4 次 → 25；384 字符/6 次 → 54）；55 字符以上的单元在提交后整段泄漏（提交前仍能拦）。硬边界，见 [loopguard-spec.md](loopguard-spec.md) §8 |
 | 只有流式路径检测 | `stream: false` 一次拿完整 JSON，没有增量帧，**不检测**退化 |
-| loop guard 代价 | 开启后首字节推迟约 `loop_guard_min_chars`（默认 64）个字符；关掉立即返回但不再拦截 |
+| loop guard 代价 | 开启后首字节推迟 `min(loop_guard_min_chars 个字符（默认 64）, loop_guard_hold_max_ms（默认 250ms）)`。字符数换算成时间取决于模型出字速度，所以慢模型由时间上限先提交，后续走提交后判定；关掉立即返回但不再拦截 |
 | 思考透传：Anthropic 缓冲路径丢思考块 | Anthropic 校验思考块的 `signature`，网关不携带签名，回放无签名块会把下一轮请求变成 400，所以**缓冲响应里丢弃**；流式照常透传 |
 | 思考透传：OpenAI 缓冲路径丢思考 | 不发明客户端没要的 `reasoning_content` 字段。要拿思考就用流式 |
 | 密钥**未加密** | 密钥只是从 `config_json` **搬到了 `secrets` 表**（存储分离），库里仍是明文；拿到 `gateway.db` 就能读。DPAPI/OS 级加密**仍未做** |

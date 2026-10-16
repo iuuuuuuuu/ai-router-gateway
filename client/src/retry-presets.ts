@@ -19,6 +19,7 @@ export type RetryNumbers = Pick<
   | "chunk_idle_timeout_ms" | "reserve_ms" | "cooldown_wait"
   | "loop_guard_min_chars" | "loop_guard_repeat_min_chars" | "loop_guard_repeat_ratio"
   | "loop_guard_max_repeats" | "loop_guard_window_chars" | "loop_guard_tail_chars"
+  | "loop_guard_hold_max_ms"
 >;
 
 export interface RetryPreset {
@@ -37,6 +38,7 @@ export const RETRY_PRESETS: RetryPreset[] = [
       chunk_idle_timeout_ms: 15000, reserve_ms: 3000, cooldown_wait: true,
       loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
       loop_guard_max_repeats: 4, loop_guard_window_chars: 4000, loop_guard_tail_chars: 128,
+      loop_guard_hold_max_ms: 250,
     },
   },
   {
@@ -47,6 +49,7 @@ export const RETRY_PRESETS: RetryPreset[] = [
       chunk_idle_timeout_ms: 10000, reserve_ms: 5000, cooldown_wait: false,
       loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
       loop_guard_max_repeats: 4, loop_guard_window_chars: 4000, loop_guard_tail_chars: 128,
+      loop_guard_hold_max_ms: 250,
     },
   },
   {
@@ -57,6 +60,7 @@ export const RETRY_PRESETS: RetryPreset[] = [
       chunk_idle_timeout_ms: 120000, reserve_ms: 10000, cooldown_wait: true,
       loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
       loop_guard_max_repeats: 4, loop_guard_window_chars: 4000, loop_guard_tail_chars: 128,
+      loop_guard_hold_max_ms: 250,
     },
   },
   {
@@ -67,6 +71,7 @@ export const RETRY_PRESETS: RetryPreset[] = [
       chunk_idle_timeout_ms: 20000, reserve_ms: 10000, cooldown_wait: true,
       loop_guard_min_chars: 64, loop_guard_repeat_min_chars: 24, loop_guard_repeat_ratio: 0.75,
       loop_guard_max_repeats: 4, loop_guard_window_chars: 4000, loop_guard_tail_chars: 128,
+      loop_guard_hold_max_ms: 250,
     },
   },
 ];

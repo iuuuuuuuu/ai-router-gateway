@@ -1557,6 +1557,11 @@ function saveTiers() {
                     <TInput v-model.number="sRetry.loop_guard_min_chars" type="number" min="1" data-test="group-retry-loop-guard-min-chars" />
                   </div>
                 </Field>
+                <Field label="首字节等待上限 (毫秒)" hint="检测起点是字符数，要等多久取决于模型出字速度。这里给它一个时间上限，到点先提交，后续内容交给已提交后的判定。0 = 不设上限">
+                  <div data-test="group-retry-loop-guard-hold-max-ms">
+                    <TInput v-model.number="sRetry.loop_guard_hold_max_ms" type="number" min="0" data-test="group-retry-loop-guard-hold-max-ms" />
+                  </div>
+                </Field>
                 <Field label="重复单元下限 (字符)" hint="被重复的那一段至少多长才算「无意义重复」，太短会把正常的中文/标点重复算进去">
                   <div data-test="group-retry-loop-guard-repeat-min-chars">
                     <TInput v-model.number="sRetry.loop_guard_repeat_min_chars" type="number" min="1" data-test="group-retry-loop-guard-repeat-min-chars" />

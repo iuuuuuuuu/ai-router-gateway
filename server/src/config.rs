@@ -76,6 +76,22 @@ pub struct RetryConfig {
     /// false-positive rate.
     #[serde(default = "d_loop_guard_tail_chars")]
     pub loop_guard_tail_chars: usize,
+    /// Wall-clock ceiling on the PRE-COMMIT holdback, in milliseconds.
+    ///
+    /// `loop_guard_min_chars` is a CHARACTER count, so how long it takes to
+    /// fill depends entirely on how fast the model generates: at 400 chars/s
+    /// 64 characters is 160 ms, at the measured median of ~107 chars/s it is
+    /// ~600 ms, and a 2 chars/s model would take 32 seconds. This cap bounds
+    /// that wait so a slow model cannot turn the holdback into a multi-second
+    /// first-byte delay.
+    ///
+    /// The trade-off is explicit and worth stating: the evidence needed to
+    /// judge a repetition is CHARACTERS, so a model too slow to fill
+    /// `min_chars` inside the cap commits early and is judged post-commit
+    /// (tier 2 of `judge_tail` still applies). Detection quality degrades;
+    /// the first byte does not wait. 0 disables the cap.
+    #[serde(default = "d_loop_guard_hold_max_ms")]
+    pub loop_guard_hold_max_ms: u64,
     /// On a repetition, correct the model instead of discarding the attempt:
     /// keep the text written BEFORE the loop and ask the model to carry on from
     /// where it was cut off. Disabling this restores the old behaviour (throw
@@ -113,6 +129,7 @@ fn d_loop_guard_repeat_ratio() -> f64 { 0.75 }
 fn d_loop_guard_max_repeats() -> u32 { 4 }
 fn d_loop_guard_window_chars() -> usize { 4000 }
 fn d_loop_guard_tail_chars() -> usize { 128 }
+fn d_loop_guard_hold_max_ms() -> u64 { 250 }
 fn d_loop_guard_continue_max() -> u32 { 2 }
 fn d_loop_guard_continue_prompt() -> String {
     // Chinese on purpose: the model that loops is usually a Chinese-speaking
@@ -140,6 +157,7 @@ impl Default for RetryConfig {
             loop_guard_max_repeats: d_loop_guard_max_repeats(),
             loop_guard_window_chars: d_loop_guard_window_chars(),
             loop_guard_tail_chars: d_loop_guard_tail_chars(),
+            loop_guard_hold_max_ms: d_loop_guard_hold_max_ms(),
             loop_guard_continue_enabled: true,
             loop_guard_continue_max: d_loop_guard_continue_max(),
             loop_guard_continue_prompt: d_loop_guard_continue_prompt(),

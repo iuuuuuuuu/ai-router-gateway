@@ -63,6 +63,13 @@ pub enum Behavior {
     NormalThenDegenerateLong,
     /// Control: a committed answer that continues normally — must never be cut.
     NormalOnlyStream,
+    /// NORMAL text dripped one 12-char frame at a time with a deliberate gap, so
+    /// the wall-clock holdback cap fires long before `min_chars` characters have
+    /// arrived. This is the fixture that makes the cap TESTABLE: every other
+    /// stream fixture emits its whole body at once, so a cap measured in
+    /// milliseconds would never trigger and the test would be green for the
+    /// wrong reason.
+    SlowDripNormalText,
     /// B1 regression: text shorter than the holdback, then a tool call. The
     /// buffered text must be committed WITH the tool call, never dropped.
     ToolAfterShortText,
@@ -385,6 +392,45 @@ async fn handle_beh(beh: Behavior, body: String, hdrs: axum::http::HeaderMap, pr
             }
             sse.push_str(&openai_tail_sse("stop"));
             ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+        }
+        Behavior::SlowDripNormalText => {
+            // Normal, non-repeating prose (same generator as NormalOnlyStream, so
+            // the guard has no repetition to find) delivered SLOWLY: one 12-char
+            // frame every `gap_ms`. The gap comes from the REQUEST BODY, not from
+            // an env var: tests run concurrently in one process, and a global
+            // variable would let one test's drip timing leak into another's.
+            //
+            // The default cap is 250 ms, so a 60 ms gap lets ~4 frames through
+            // before the ceiling forces a commit — which is exactly the
+            // slow-model case the cap exists for.
+            // The gap is a CONSTANT of this behaviour rather than a parameter
+            // read from the request or an env var. Both of those leak: the
+            // gateway rebuilds the upstream request and drops unknown fields,
+            // and tests share one process, so a global variable would let one
+            // test's timing contaminate another's. A per-behaviour constant is
+            // isolated by construction.
+            //
+            // 1200 ms per 12-char frame puts the two outcomes far apart: with a
+            // 250 ms cap the commit lands on frame 2 (~1.2 s), while waiting for
+            // the 64-character target takes frame 6 (~6 s). The gap has to exceed
+            // any plausible coalescing window: when frames are batched into one
+            // read the proxy sees them at the same instant, the elapsed time never
+            // crosses the ceiling, and a smaller gap lets that flip the result.
+            const GAP_MS: u64 = 1200;
+            let s = async_stream::stream! {
+                for i in 0..6usize {
+                    let frame: String = (0..12)
+                        .map(|k| {
+                            let n = i * 12 + k;
+                            char::from_u32(0x4E00 + ((n * 37) % 2000) as u32).unwrap()
+                        })
+                        .collect();
+                    yield Ok::<_, std::convert::Infallible>(bytes::Bytes::from(openai_text_chunk(&frame)));
+                    tokio::time::sleep(Duration::from_millis(GAP_MS)).await;
+                }
+                yield Ok(bytes::Bytes::from(openai_tail_sse("stop")));
+            };
+            ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], axum::body::Body::from_stream(s)).into_response()
         }
         Behavior::ToolAfterShortText => {
             // B1 regression fixture: a text prefix SHORTER than the holdback,

@@ -451,7 +451,7 @@ async fn g09_group_members_reports_retry_source_and_both_configs() {
         "chunk_idle_timeout_ms", "reserve_ms", "cooldown_wait",
         "loop_guard_enabled", "loop_guard_min_chars", "loop_guard_repeat_min_chars",
         "loop_guard_repeat_ratio", "loop_guard_max_repeats", "loop_guard_window_chars",
-        "loop_guard_tail_chars",
+        "loop_guard_tail_chars", "loop_guard_hold_max_ms",
     ] {
         assert!(a["retry"].get(k).is_some(), "effective retry lost {k}: {a}");
     }
@@ -459,12 +459,14 @@ async fn g09_group_members_reports_retry_source_and_both_configs() {
     // "跟随全局" without another request.
     assert_eq!(a["global_retry"]["max_attempts"], 6, "{a}");
     assert_eq!(a["global_retry"]["loop_guard_min_chars"], 64, "{a}");
+    assert_eq!(a["global_retry"]["loop_guard_hold_max_ms"], 250, "the holdback ceiling must reach the console: {a}");
 
     let (code, b) = admin_get(&st, "/admin/api/group-members?group_id=gB").await;
     assert_eq!(code, 200, "{b}");
     assert_eq!(b["retry_source"], "global", "{b}");
     assert_eq!(b["retry"]["max_attempts"], 6, "{b}");
     assert_eq!(b["retry"]["loop_guard_min_chars"], 64, "{b}");
+    assert_eq!(b["retry"]["loop_guard_hold_max_ms"], 250, "{b}");
     assert_eq!(b["global_retry"], a["global_retry"], "both groups must report the same global copy");
 
     // The task-27 keys must survive the addition.

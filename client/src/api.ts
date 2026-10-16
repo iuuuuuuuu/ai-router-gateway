@@ -27,7 +27,12 @@ export interface RetryConfig {
   loop_guard_window_chars: number;
   /** 已提交之后的判定只看回答末尾这么多字符（默认 128）。提交后无法重试，
    *  只能截断收尾，所以这个值同时决定「中段复读还能泄漏多少字」。 */
-  loop_guard_tail_chars: number;
+  loop_guard_tail_chars: number;  /** 提交前等待的上限（毫秒，默认 250）。`loop_guard_min_chars` 是字符数，
+   *  要等多久完全取决于模型出字速度：400 字符/秒 时 64 字是 160ms，
+   *  107 字符/秒 时是 600ms，2 字符/秒 时是 32 秒。这个上限把首字延迟
+   *  锁在时间上，而不是锁在生成速度上。慢模型到点就先提交，后续内容走
+   *  提交后判定（仍有第二层兜底）。0 表示不设上限。 */
+  loop_guard_hold_max_ms: number;
 }
 export interface AdminConfig {
   listen: ListenConfig;

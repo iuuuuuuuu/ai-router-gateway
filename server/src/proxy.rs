@@ -720,6 +720,18 @@ async fn attempt_stream(
     let mut guard = crate::loopguard::LoopGuard::new(&budget.loop_guard);
     let mut pending = String::new();
     let hold = budget.loop_guard.min_chars;
+    // Wall-clock ceiling on the holdback. `hold` counts CHARACTERS, which says
+    // nothing about how long filling them takes: a fast model fills 64 in 160 ms
+    // while a 2 chars/s model would take 32 s. The cap is what keeps a slow model
+    // from turning the holdback into a multi-second first-byte delay, and it is
+    // why the first byte is bounded by TIME rather than by generation speed.
+    //
+    // The clock starts at the FIRST TEXT FRAME, not at the attempt: time spent
+    // waiting for the upstream to think is not the holdback's doing, and a model
+    // that thinks for five seconds should not then also be charged the full
+    // character holdback before the client sees anything.
+    let hold_max = Duration::from_millis(budget.loop_guard.hold_max_ms);
+    let mut hold_started: Option<Instant> = None;
     // The finish reason the commit itself carried, when the frame that flushed
     // the holdback buffer was also the frame that ended the answer.
     let mut commit_finish: Option<ir::FinishReason> = None;
@@ -889,8 +901,11 @@ async fn attempt_stream(
                     looped = Some(hit);
                     break Vec::new();
                 }
+                if hold_started.is_none() { hold_started = Some(Instant::now()); }
                 pending.push_str(&text);
-                if pending.chars().count() >= hold {
+                if crate::loopguard::holdback_done(
+                    pending.chars().count(), hold, hold_max, hold_started.map(|t| t.elapsed()),
+                ) {
                     // The post-loop merge prepends `pre_reasoning`, so this
                     // commit list carries the thinking in front of the text.
                     break vec![StreamEvent::TextDelta {
@@ -909,8 +924,11 @@ async fn attempt_stream(
                     looped = Some(hit);
                     break Vec::new();
                 }
+                if hold_started.is_none() { hold_started = Some(Instant::now()); }
                 pending.push_str(&t);
-                if pending.chars().count() >= hold {
+                if crate::loopguard::holdback_done(
+                    pending.chars().count(), hold, hold_max, hold_started.map(|t| t.elapsed()),
+                ) {
                     break vec![StreamEvent::TextDelta {
                         text: std::mem::take(&mut pending),
                         finish: None,

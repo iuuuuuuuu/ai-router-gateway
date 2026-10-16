@@ -92,7 +92,12 @@ R4 的语义变成「**最近这段输出就是循环**」，泄漏量被 `tail_
 
 - 网关的**提交点**：流式响应在收到第一个合法内容帧之后才向客户端写首字节（I1）。
 - loop guard 只在 **PRE-COMMIT 窗口**生效：尚未提交前，文本增量先攒在 `pending` 里，不写客户端。
-- `hold = LoopCfg::min_chars`（默认 64 字符）：`pending` 达到 `hold` 且期间没有命中退化 → 一次性提交，客户端才开始收字节。
+- 提交条件是**两个门槛取先到者**：
+  - `pending` 达到 `min_chars`（默认 64 字符）——判定所需的**证据**已经到位；
+  - 或者已经等了 `hold_max_ms`（默认 250ms）——客户端**等够了**。
+- ★`min_chars` 是**字符数**，要等多久完全取决于模型出字速度：400 字符/秒 时 64 字是 160ms，实测中位数 107 字符/秒 时是 ~600ms，2 字符/秒 的模型要 32 秒。只按字符数等，等于把首字节延迟交给模型的生成速度。`hold_max_ms` 把它重新锁在时间上。
+- 计时从**第一个文本帧**开始，不是从 attempt 开始：等待上游思考的时间不是 holdback 造成的，一个想了 5 秒的模型不该再被收一遍完整的字符 holdback。
+- `hold_max_ms == 0` 表示不设上限，退化为纯字符数等待（旧行为）。上限先到的情况下，之后到达的内容走**提交后判定**（`judge_tail` 第二层仍然兜底）：检测质量下降，首字节不等。
 - 命中退化 → **保留复读之前的正文**（`LoopHit::real_span` 指出复读占了尾部多少字符，`LoopGuard::text_before` 取回前面的正文），
   并把复读整段从 `pending` 里切掉。切掉后有两种出路：
   1. **纠正**（默认开）：对**同一个候选**发一次纠正请求——把正文尾部（≤4000 字符）作为 assistant 消息、
@@ -104,7 +109,7 @@ R4 的语义变成「**最近这段输出就是循环**」，泄漏量被 `tail_
   纠正次数单独记在 `loop_continues`。
 - ★`LoopCfg::from_retry` 在 `enabled == false` 时**强制 `min_chars = 0`**：关闭功能 = 不缓冲 = 第一帧立即提交（等于本功能不存在时的行为）。
   保持缓冲却不检测等于「白白推迟首字节」，是欺骗。
-- 代价（必须如实写进 README）：开启时首字节推迟约 `min_chars` 个字符（默认 64）。
+- 代价（必须如实写进 README）：开启时首字节推迟为 `min(min_chars 个字符, hold_max_ms)`。默认配置下，快模型按字符数（64 字符），慢模型按 250ms 封顶。
 - **提交后**（I6）：字节已在客户端手里，**不能重新开始**——重试等于把前缀再发一遍。此时命中退化会：
   1. 先把已装配但未发出的 tool call 冲出去（避免把参数截半）；
   2. **纠正**（默认开）：对同一候选发一次纠正请求，把续写**接回同一条流**——客户端看到的是一条连续的回答，
@@ -148,6 +153,7 @@ impl LoopGuard {
 |---|---|---|
 | `window_chars` | `[64, 65_536]` | 取边界值 |
 | `min_chars` | `min(configured, window_chars)`；`enabled == false` 时强制 0 | 取窗口上限 / 0 |
+| `hold_max_ms` | `0`（不设上限）或 `[1, 60000]` | 0 / 60000 |
 | `repeat_min_chars` | `[1, window_chars]` | 取边界值 |
 | `max_repeats` | `≥ 2` | 取 2 |
 | `repeat_ratio` | 必须 `is_finite()` 且 `(0, 1]` | 取 0.75 |
@@ -184,6 +190,18 @@ impl LoopGuard {
 | t32 | 提交后**两层**的单元长度上限都钉住（第一层 `25`、第二层 `54`），并验证 24/45/54 命中、`54+8` 不命中、同一长单元提交前命中 |
 | t33 | 两层判定**不得**扩大误判面：全同表格/互异散文/互异配置块不命中；**5 行同内容的正常回答**必须保留（这一条专门守住 `TIER2_EXTRA_REPS`，去掉它这三例会变红） |
 | t34 | 第二层确实在干活：45 字符单元在**第一层范围内**（前 128 字符）不命中、越过后命中，证明缺口是被第二层补上的 |
+### 3.3 首字节等待上限（`hold_max_ms`）
+
+判定本身是纯函数，不需要真实时间；端到端只证明「配置值确实到达代理并真的移动了首字节」。
+
+| 编号 | 覆盖 |
+|---|---|
+| `holdback_*`（单测，`src/loopguard.rs`） | `holdback_done` 四条边界：字符先到 / 时间先到 / 都没到 / `0` 关闭上限 / 无文本帧时上限不生效。全部确定性，不依赖调度 |
+| l17（`tests/holdback_cap.rs`） | 慢模型（1200ms/帧）下上限先到：**提交前缀 < 64 字符**，证明上限真的在缩 holdback |
+| l18 | 上限只是**天花板不是地板**：快模型（整段一次性到达）仍按 `min_chars` 判定，上限不影响 |
+| l19 | `hold_max_ms = 0` 时回到纯字符等待：**提交前缀 ≥ 64 字符**，是 l17 的对照组 |
+
+l17/l19 断言的是**提交前缀长度**而不是耗时：耗时断言会随机器负载漂移（实测同一份代码在空载时提交 24 字符、在 l13b/l13f 的 400 帧流同时跑时变成 72 字符），前缀长度才是这个功能真正控制的东西。三个用例互斥串行，且单独放在一个测试二进制里。
 
 ---
 
@@ -193,6 +211,7 @@ impl LoopGuard {
 |---|---|---|
 | `loop_guard_enabled` | `true` | `d_loop_guard_enabled` |
 | `loop_guard_min_chars` | `64` | `d_loop_guard_min_chars` |
+| `loop_guard_hold_max_ms` | `250` | `d_loop_guard_hold_max_ms` |
 | `loop_guard_repeat_min_chars` | `24` | `d_loop_guard_repeat_min_chars` |
 | `loop_guard_repeat_ratio` | `0.75` | `d_loop_guard_repeat_ratio` |
 | `loop_guard_max_repeats` | `4` | `d_loop_guard_max_repeats` |
@@ -225,7 +244,7 @@ impl LoopGuard {
 
 ## 6. `server/src/proxy.rs`
 
-- `attempt_stream` 增加 `LoopGuard` / `pending` / `hold`（`hold = budget.loop_guard.min_chars`）。
+- `attempt_stream` 增加 `LoopGuard` / `pending` / `hold`（`hold = budget.loop_guard.min_chars`）与 `hold_max`；提交判定走纯函数 `loopguard::holdback_done(pending_len, min_chars, hold_max, elapsed)`，两个提交点共用同一个定义。
 - PRE-COMMIT 循环四分支：
   1. **文本帧**：先 `guard.push(&t)`，命中 → 返回 `Err((ProxyError::DegenerateOutput { unit, repeats }, usage))`；
      未命中则攒进 `pending`，`pending.chars().count() >= hold` 时才 `break` 出循环并提交；
@@ -307,7 +326,7 @@ impl LoopGuard {
    卡住判定把它压回一次纠正。l13f 把这条不等式钉在测试里（`leaked <= (1 + loop_continues) * 24`）。
    这是物理限制（字节已在客户端手里），不是实现缺陷；把它说成「客户端看不到」是错的。
    注意这与旧行为不同：旧版本对提交后的复读**完全不检测**（只有把整段尝试丢掉才安全，所以当时干脆不看）。
-3. 开启 loop guard 的代价是首字节推迟约 `min_chars` 个字符；关掉它首字节立即返回，但退化不再被拦截。
+3. 开启 loop guard 的代价是首字节推迟 `min(min_chars 个字符, hold_max_ms)`；关掉它首字节立即返回，但退化不再被拦截。
 4. 误判是可能的（长文里恰好出现高比例重复，例如代码里连续空行/重复分隔线）。阈值可配；命中只影响该次尝试，会被内部重试吸收。
 
 ---

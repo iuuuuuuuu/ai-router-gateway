@@ -131,7 +131,7 @@ node tools/start-client.mjs client/src-tauri/target/release 9223
 | 分组「使用中」高亮不消失 | `/admin/api/inflight` | 高亮只由实时并发驱动；渠道卡片上的「使用中」是**最近成功过**的活跃标记，两者不是一回事 |
 | 某渠道一直冷却 | `/admin/api/health` 的归因 | 401/403 = **整渠道隔离**（密钥问题，要重配，不重试不冷却其他渠道）；404 = 只隔离该模型 6h；429/5xx = 指数退避 15s→300s |
 | 全部渠道冷却、请求 503 | 响应头 `retry-after` | 值应为**裸秒数**（如 `30`）。历史上曾出现整行 `retry-after: 30` 被当成值插入的畸形（v0.4.6 修复），客户端按 RFC 解析会失败 |
-| 首字节很慢 | 设置页 loop guard 开关 | 开启后首字节推迟约 `loop_guard_min_chars`（默认 64）个字符 |
+| 首字节很慢 | 设置页 loop guard 开关 / `loop_guard_hold_max_ms` | 开启后首字节推迟 `min(loop_guard_min_chars 个字符（默认 64）, loop_guard_hold_max_ms（默认 250ms）)`。只按字符数等会让慢模型等很久（64 字符在 2 字符/秒 的模型上要 32 秒），把 `hold_max_ms` 调小可强制早提交 |
 | 回答被截断 | `logs/requests` 的 `loop_truncated` | 提交后命中退化且纠正不可用 → 就地截断。日志状态是「成功（已截断）」，**不是**完好回答 |
 | 回答里有「已纠正复读」 | `loop_continues` | 正常路径：保留了正文并续写。不是错误 |
 | 拉取上游模型列表失败 | 弹窗状态区 | 失败**一定**可见地报出来（如 `HTTP 401`），不会假装成功返回空列表 |
