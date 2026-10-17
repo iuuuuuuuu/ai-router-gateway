@@ -24,6 +24,27 @@ pub const TIER2_SPAN_MULT: usize = 3;
 /// so tier 2 pays for the wider net with strictly more repetitions. This is
 /// what keeps the false-positive rate flat as the span grows.
 pub const TIER2_EXTRA_REPS: u32 = 2;
+/// The post-commit ladder: `(span multiplier over tail_chars, extra repeats)`.
+///
+/// A single fixed span is a hard ceiling on the unit length the post-commit
+/// path can ever see. `N` contiguous copies of a unit of `U` chars yield
+/// `repeats = N - 1` (see `match_span`), and R4 requires the repetition to
+/// dominate the span, so a span of `tail * m` cannot report any unit longer
+/// than about `tail * m / (max_repeats + extra + 1)`. Every longer unit leaks
+/// IN FULL, however many times it repeats -- the failure is total, not gradual.
+///
+/// Each further tier buys a wider span and pays for it with MORE required
+/// repetitions. That payment is the point: R4 ("the repetition must dominate
+/// the judged span") gets easier as the span grows, so widening the span
+/// without raising the bar would quietly lower the evidence standard.
+///
+/// Unit-length ceiling per tier at the defaults (`tail_chars` 128,
+/// `max_repeats` 4): **25 / 54 / 128 / 314**. The final ceiling is structural:
+/// covering `U` needs a span of about `U * (reps + 1)`, and raising `reps`
+/// further raises that span again, so with `window_chars` 4000 the bar cannot
+/// be pushed much past ~314 without dropping below tier 3's evidence standard.
+pub const LADDER: [(usize, u32); 4] =
+    [(1, 0), (TIER2_SPAN_MULT, TIER2_EXTRA_REPS), (9, 4), (27, 6)];
 
 /// Diagnostics only: at most this many characters of the repeated unit are
 /// copied into `LoopHit::unit` (char-boundary safe by construction).
@@ -342,7 +363,9 @@ impl LoopGuard {
         if !self.cfg.enabled {
             return None;
         }
-        if self.window.len() < self.cfg.tail_chars {
+        let tail = self.cfg.tail_chars;
+        let len = self.window.len();
+        if len < tail {
             return None;
         }
         // R1 is deliberately NOT `min_chars` here: that threshold exists to
@@ -350,19 +373,39 @@ impl LoopGuard {
         // saturated tail is already the evidence. Reusing it would make a
         // `tail_chars` smaller than `min_chars` (e.g. 32 vs 64) silently
         // impossible to satisfy.
-        let tail = self.cfg.tail_chars;
-        if let Some(h) = self
-            .detect_span(tail, 2, self.cfg.max_repeats)
-            .or_else(|| self.detect_loose(tail, 2, self.cfg.max_repeats))
-        {
-            return Some(h);
+        //
+        // Narrowest tier first, returning on the first hit, so the leak stays
+        // bounded by the narrowest span that can see the unit: a 24-char loop
+        // is still cut at exactly the same place it was. Only units that no
+        // narrower tier can see pay for the wider scan.
+        let mut unit_lo = 1usize;
+        for (mult, extra) in LADDER {
+            let span = len.min(tail.saturating_mul(mult));
+            let reps = self.cfg.max_repeats + extra;
+            // The longest unit this span can report. Above it R2 cannot hold:
+            // `N` copies give `repeats = N - 1 <= span / unit_len - 1`.
+            let unit_hi = span / (reps as usize + 1);
+            if unit_hi >= unit_lo {
+                // Each tier scans only the band it newly covers. That is sound,
+                // not merely cheap: a unit short enough for a narrower tier needs
+                // FEWER copies there (`reps` grows with the tier), so a unit missed
+                // by the narrow tier is missed by every wider one as well. The
+                // ladder therefore costs about one scan of the widest span in
+                // total, instead of one full scan per tier.
+                if let Some(h) = self
+                    .detect_span_band(span, 2, reps, unit_lo, unit_hi)
+                    .or_else(|| self.detect_loose_band(span, 2, reps, unit_lo))
+                {
+                    return Some(h);
+                }
+            }
+            if span == len {
+                break; // the window is the binding constraint; wider is impossible
+            }
+            unit_lo = unit_hi.saturating_add(1).max(unit_lo);
         }
-        let span = self.window.len().min(tail.saturating_mul(TIER2_SPAN_MULT));
-        let reps = self.cfg.max_repeats + TIER2_EXTRA_REPS;
-        self.detect_span(span, 2, reps)
-            .or_else(|| self.detect_loose(span, 2, reps))
+        None
     }
-
     /// R6, the whitespace-tolerant fallback for R1-R5.
     ///
     /// The suffix rule needs the repeated unit to sit *contiguously* at the
@@ -391,6 +434,21 @@ impl LoopGuard {
     ///     as a self-summary. Without it, the remark would hide the loop behind
     ///     itself -- the exact failure this rule exists to fix.
     fn detect_loose(&self, n: usize, min_span: usize, min_repeats: u32) -> Option<LoopHit> {
+        self.detect_loose_band(n, min_span, min_repeats, 1)
+    }
+
+    /// `detect_loose` restricted to units of at least `unit_lo` characters.
+    ///
+    /// R6 keeps its own natural cap (half the span, `LOOSE_UNIT_MAX_CHARS`):
+    /// R2 already makes a longer unit impossible, so tightening it here would
+    /// only lose coverage. Only the lower bound is needed for banding.
+    fn detect_loose_band(
+        &self,
+        n: usize,
+        min_span: usize,
+        min_repeats: u32,
+        unit_lo: usize,
+    ) -> Option<LoopHit> {
         let len = self.window.len();
         let n = n.min(len);
         if n < 2 || n < min_span {
@@ -425,7 +483,7 @@ impl LoopGuard {
         let mut best: Option<(usize, usize, usize)> = None; // (covered, unit_len, tail_end)
         for end in (m - trailer_max)..=m {
             let max_unit = (end / 2).min(LOOSE_UNIT_MAX_CHARS);
-            for unit_len in 1..=max_unit {
+            for unit_len in unit_lo..=max_unit {
                 // Cheap pre-filter, exactly as in detect_span.
                 if dense[end - 1] != dense[end - 1 - unit_len] {
                     continue;
@@ -484,13 +542,31 @@ impl LoopGuard {
     /// The rules themselves, end-relative: every index below counts backwards
     /// from the window tail, so `n` is how many trailing characters are judged
     /// and `len` is how many the window actually holds (`n <= len`).
+    /// R1-R5 over every candidate `unit_len` of the last `n` characters.
     fn detect_span(&self, n: usize, min_span: usize, min_repeats: u32) -> Option<LoopHit> {
+        self.detect_span_band(n, min_span, min_repeats, 1, usize::MAX)
+    }
+
+    /// `detect_span` restricted to a band of candidate unit lengths.
+    ///
+    /// The ladder uses this to skip unit lengths a narrower tier already
+    /// covered. `unit_hi` may only exclude units that this span could not
+    /// report anyway (see `LADDER`), so the result matches `detect_span`
+    /// whenever the band is wide enough.
+    fn detect_span_band(
+        &self,
+        n: usize,
+        min_span: usize,
+        min_repeats: u32,
+        unit_lo: usize,
+        unit_hi: usize,
+    ) -> Option<LoopHit> {
         let len = self.window.len();
         debug_assert!(n <= len, "judged span {n} exceeds the window {len}");
         if n < 2 || n < min_span {
             return None; // R1
         }
-        let max_unit = n / 2;
+        let max_unit = (n / 2).min(unit_hi);
         // R5, cheaply: a unit that lies entirely inside the trailing whitespace
         // run cannot contain a non-whitespace character, so the scan can start
         // above that run. Without this, a long run of blanks (indentation,
@@ -499,6 +575,7 @@ impl LoopGuard {
         // that ends inside a blank run is skipped for the same reason the
         // whole-window scan skips it.
         let first_unit_len = self.trailing_whitespace_within(n) + 1;
+        let first_unit_len = first_unit_len.max(unit_lo);
         let mut best: Option<(usize, usize)> = None; // (characters covered, unit_len)
         for unit_len in first_unit_len..=max_unit {
             // Cheap pre-filter: the unit must repeat at the very tail, otherwise
@@ -730,6 +807,33 @@ mod tests {
         assert_eq!(h.repeats, 4, "5 copies == 4 repeats");
         assert_eq!(h.unit.chars().count(), 16);
     }
+    /// The ladder must stay cheap enough to run on EVERY frame.
+    ///
+    /// `push_tail` calls this per delta, so a wide scan cannot be allowed to
+    /// cost milliseconds. The worst case is a tiny period (every candidate
+    /// multiple matches), which is what the timing below uses. The budget is
+    /// deliberately loose (an order of magnitude above the measured value) so
+    /// it flags a real regression rather than CI jitter.
+    #[test]
+    fn t39_ladder_stays_fast_on_every_frame() {
+        use std::time::Instant;
+        let cfg = cfg();
+        for (name, period) in [("period=4 (worst case)", 4usize), ("period=300", 300)] {
+            let unit = distinct_chars(period, 1);
+            let text = unit.repeat(cfg.window_chars / period + 8);
+            let mut g = LoopGuard::new(&cfg);
+            g.push_tail(&text); // fill the window once
+            let iters = 50;
+            let t = Instant::now();
+            for _ in 0..iters {
+                let _ = g.judge_tail();
+            }
+            let per_call = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            println!("{name}: {per_call:.1} us per frame (budget 1000)");
+            assert!(per_call < 1_000.0, "{name}: {per_call:.0} us per frame is over the 1 ms budget");
+        }
+    }
+
     #[test]
     fn t03_pure_newline_repeat_does_not_hit() {
         assert!(hit(&"\n".repeat(200)).is_none(), "R5: blank-only repetition is not degenerate output");
@@ -1414,17 +1518,132 @@ mod tests {
             );
         }
 
-        // Above the tier-2 bound: not detectable post-commit, by construction.
-        let long = distinct_chars(bound2 + 8, 1);
+        // ABOVE the tier-2 bound. This used to be the end of the story: a unit
+        // longer than `bound2` was undetectable post-commit and leaked in full,
+        // however many times it repeated. `LADDER` extends post-commit coverage
+        // to ~314 chars at the defaults, so the assertion is now the opposite:
+        // the unit must be CAUGHT, and by a tier wider than tier 2.
+        for u in [bound2 + 1, bound2 + 8, 100, 128] {
+            let long = distinct_chars(u, 1);
+            let mut g2 = LoopGuard::new(&cfg);
+            let h = g2
+                .push_tail(&long.repeat(40))
+                .unwrap_or_else(|| panic!("unit {u} must be caught post-commit by the ladder"));
+            assert!(
+                h.repeats >= cfg.max_repeats,
+                "a hit must clear the base evidence bar: {h:?}"
+            );
+        }
+
+        // The same long unit is caught pre-commit too, where the whole window is
+        // judged. Both paths must agree that a long unit is a loop.
+        let mut g3 = LoopGuard::new(&cfg);
+        assert!(g3.push(&distinct_chars(bound2 + 8, 1).repeat(40)).is_some()) ;
+    }
+
+    /// The ladder's unit-length ceilings, tier by tier, pinned as numbers.
+    ///
+    /// `t32` proves the wide tiers can SEE a long unit. This proves each tier's
+    /// reach is where `LADDER`'s arithmetic says it is, so a future edit that
+    /// silently narrows coverage turns this red instead of quietly regressing.
+    #[test]
+    fn t35_ladder_unit_length_ceilings_are_pinned() {
+        let cfg = cfg();
+        let tail = cfg.tail_chars as usize;
+        let reps0 = cfg.max_repeats as usize;
+        let ceilings: Vec<usize> = LADDER
+            .iter()
+            .map(|(m, e)| (tail * m) / (reps0 + *e as usize + 1))
+            .collect();
+        assert_eq!(ceilings, vec![25, 54, 128, 314], "LADDER coverage moved");
+
+        // Every ceiling must be reachable: a unit exactly at it is caught.
+        for (i, ceil) in ceilings.iter().enumerate() {
+            if *ceil > 300 {
+                continue; // needs more copies than a realistic stream would send
+            }
+            let unit = distinct_chars(*ceil, 1);
+            let mut g = LoopGuard::new(&cfg);
+            assert!(
+                g.push_tail(&unit.repeat(40)).is_some(),
+                "tier {i} ceiling {ceil} must be catchable; otherwise the ceiling is a lie"
+            );
+        }
+    }
+
+    /// EVERY unit length the ladder claims to cover must actually be covered.
+    ///
+    /// `t35` only checks the ceilings. The ladder also SKIPS the bands each
+    /// narrower tier already scanned, and a bug in that skip silently drops a
+    /// slice of unit lengths while every ceiling still looks right -- which is
+    /// exactly what fault injection found (skipping 9 instead of 0 extra left
+    /// the whole suite green). This sweeps every length, so a hole cannot hide
+    /// between two pinned numbers.
+    #[test]
+    fn t37_every_covered_unit_length_is_caught() {
+        let cfg = cfg();
+        let mut missed = Vec::new();
+        for u in 24usize..=130 {
+            let unit = distinct_chars(u, 1);
+            let mut g = LoopGuard::new(&cfg);
+            if g.push_tail(&unit.repeat(40)).is_none() {
+                missed.push(u);
+            }
+        }
+        assert!(missed.is_empty(), "the ladder claims 24..=130 is covered, but {missed:?} leaked");
+    }
+
+    /// The evidence ratchet: a wider span must not lower the repeat bar.
+    ///
+    /// R4 ("the repetition must dominate the judged span") is trivially
+    /// satisfied when the whole window IS the repetition, so on a short window
+    /// R2 alone decides -- and the ladder's higher tiers are the only thing
+    /// demanding more copies. Fault injection confirms the point: lowering the
+    /// wide tiers' bar to `max_repeats` cuts this text, which is why it is
+    /// pinned. The count below is the widest tier's requirement minus one
+    /// copy, so it sits just under the ratified bar on purpose.
+    #[test]
+    fn t38_wide_tiers_keep_their_higher_repeat_bar() {
+        let cfg = cfg();
+        let unit = distinct_chars(120, 1);
+        // Tier 3 demands `max_repeats + 4` repeats (9 copies). One copy short
+        // must NOT be cut: R4 holds (the window is the repetition), so only the
+        // raised bar saves it.
+        let mut g = LoopGuard::new(&cfg);
+        assert!(
+            g.push_tail(&unit.repeat(8)).is_none(),
+            "8 copies of a 120-char unit is one short of tier 3's bar and must survive"
+        );
+        // At the bar it must fire, so the test is a threshold and not a wall.
         let mut g2 = LoopGuard::new(&cfg);
         assert!(
-            g2.push_tail(&long.repeat(40)).is_none(),
-            "units longer than {bound2} cannot reach R2 inside {span2} chars"
+            g2.push_tail(&unit.repeat(9)).is_some(),
+            "9 copies meets tier 3's bar and must be cut"
         );
+    }
 
-        // The SAME long unit IS caught before commit, where the whole window is
-        // judged. That asymmetry is why this gap is post-commit only.
+    /// The widest tier must not cut text that is NOT a repetition.
+    #[test]
+    fn t36_wide_tiers_do_not_cut_distinct_long_text() {
+        let cfg = cfg();
+        // Long-form prose where no unit repeats. The wide tiers scan up to 314
+        // characters of unit length, which is exactly where a real document
+        // could accidentally look periodic, so this case is the one that
+        // matters for the widened net.
+        let prose: String = (0..300)
+            .map(|i| format!("第 {i} 段落说明编号 {i} 的渠道在 {} 毫秒内完成了第 {i} 次重试。", i * 13))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut g = LoopGuard::new(&cfg);
+        assert!(g.push_tail(&prose).is_none(), "distinct prose must survive the wide tiers");
+
+        // A long unit repeated only twice is NOT a loop at any tier: R2's bar
+        // rises with the span precisely so this stays true.
+        let unit = distinct_chars(120, 1);
+        let mut g2 = LoopGuard::new(&cfg);
+        assert!(g2.push_tail(&unit.repeat(2)).is_none(), "2 copies is not a loop");
+        let unit3 = distinct_chars(120, 1);
         let mut g3 = LoopGuard::new(&cfg);
-        assert!(g3.push(&long.repeat(40)).is_some(), "pre-commit judges the whole window");
+        assert!(g3.push_tail(&unit3.repeat(3)).is_none(), "3 copies must not be cut");
     }
 }
