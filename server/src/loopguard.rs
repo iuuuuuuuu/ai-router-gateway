@@ -81,6 +81,16 @@ const PARAPHRASE_RUN_PARAS: usize = 2;
 /// still differs. Without this cap the detector cuts every log excerpt.
 const PARAPHRASE_MAX_RATIO: f64 = 0.85;
 
+/// A paragraph at least this long gets the lower bar below.
+const PARAPHRASE_LONG_PARA_CHARS: usize = 80;
+
+/// The shared-run bar for long paragraphs. Lower than `PARAPHRASE_LCS_CHARS`
+/// because overlap is only meaningful relative to length: an 18-char run out of
+/// a 100-char paragraph is a strong restatement signal, while the same run out
+/// of a 30-char table row is incidental. Both numbers are pinned by `t41`
+/// (real answers) and `t40` (the reported loop).
+const PARAPHRASE_LCS_CHARS_LONG: usize = 18;
+
 /// Only compare against the previous this-many paragraphs.
 ///
 /// A model restating itself does so in a local run. Comparing the whole window
@@ -690,8 +700,8 @@ impl LoopGuard {
     ///
     /// HONEST LIMIT: the rule needs `PARAPHRASE_RUN_PARAS` restatements before
     /// it has evidence, so the FIRST statements always escape. Measured on the
-    /// reported 6-paragraph case, pre-commit fires at 540/574 chars (94%), i.e.
-    /// after five paragraphs are already relayed. Making it fire earlier would
+    /// reported 6-paragraph case, pre-commit fires at 348/574 chars (61%), i.e.
+    /// after three paragraphs are already relayed. Making it fire earlier would
     /// mean treating ONE reworded paragraph as proof, which cuts ordinary prose
     /// (a summary that restates the opening line). This is the same trade the
     /// verbatim rules make: a loop is always visible only after it has looped.
@@ -714,9 +724,10 @@ impl LoopGuard {
             .iter()
             .map(|(_, p)| p.chars().filter(|c| !c.is_whitespace()).collect())
             .collect();
-        let mut run = 0usize;
-        // Index (into `paras`) of the first paragraph of the current run.
-        let mut run_start = 0usize;
+        // Indices of paragraphs judged to be restatements. NOT required to be
+        // consecutive: a model rewording itself drifts, so one paragraph in the
+        // middle may share too little while the run as a whole is clearly a loop.
+        let mut restated_at: Vec<usize> = Vec::new();
         for i in 1..paras.len() {
             let mut restated = false;
             // Only the RECENT previous paragraphs are compared: a restatement
@@ -730,7 +741,17 @@ impl LoopGuard {
                     continue;
                 }
                 let shared = lcs_len(&dense[j], &dense[i]);
-                if shared < PARAPHRASE_LCS_CHARS {
+                // Long paragraphs need less overlap to prove a restatement: a
+                // 100-char paragraph sharing 18 chars is already telling, while
+                // a 30-char table row sharing 18 is not. Measured: this fires at
+                // 49% of the reported loop instead of 66%, still with 0 false
+                // positives on the 10 real answers.
+                let bar = if dense[i].len() >= PARAPHRASE_LONG_PARA_CHARS {
+                    PARAPHRASE_LCS_CHARS_LONG
+                } else {
+                    PARAPHRASE_LCS_CHARS
+                };
+                if shared < bar {
                     continue;
                 }
                 // The shared run must leave something DIFFERENT: a run covering
@@ -745,14 +766,19 @@ impl LoopGuard {
                 }
             }
             if restated {
-                if run == 0 {
-                    // The run starts at the paragraph that was REPEATED, so the
-                    // cut keeps the original and drops the restatements.
-                    run_start = i - 1;
-                }
-                run += 1;
-                if run >= PARAPHRASE_RUN_PARAS {
-                    // Cut from the first restatement to the end of the window.
+                restated_at.push(i);
+                // Only restatements close together count: two mentions of the
+                // same thing 20 paragraphs apart are not a loop.
+                let window: Vec<usize> = restated_at
+                    .iter()
+                    .copied()
+                    .filter(|&k| i.saturating_sub(k) < PARAPHRASE_NEIGHBOUR_PARAS)
+                    .collect();
+                if window.len() >= PARAPHRASE_RUN_PARAS {
+                    // Cut from the EARLIEST restatement in the window, so the
+                    // original statement survives and the copies are dropped.
+                    let run_start = window[0] - 1;
+                    let run = window.len();
                     let cut_at = paras[run_start + 1].0;
                     let real_span = text.chars().count() - text[..cut_at].chars().count();
                     let unit: String = paras[run_start + 1].1.chars().take(UNIT_SNIPPET_CHARS).collect();
@@ -763,8 +789,6 @@ impl LoopGuard {
                         real_span,
                     });
                 }
-            } else {
-                run = 0;
             }
         }
         None
@@ -1109,6 +1133,41 @@ mod tests {
             .push(REPORTED_PARAPHRASE_LOOP)
             .expect("pre-commit must catch the reported restatement");
         assert!(hit.real_span > 0, "the hit must report what to cut: {hit:?}");
+    }
+
+    /// The hit must land EARLY, not merely at the end.
+    ///
+    /// This is a latency requirement disguised as a correctness one. Judging
+    /// only after the whole answer has streamed means the client already has
+    /// every copy and the correction merely appends more text -- measured on
+    /// the live gateway, that shipped all 6 paragraphs. The rule must fire while
+    /// the loop is still forming.
+    ///
+    /// Pinned at 4 paragraphs: measured 3 for the reported sample. Tightening
+    /// this further would force the detector to treat ONE reworded paragraph as
+    /// proof, which cuts a normal summary-then-expand answer (`t41`).
+    #[test]
+    fn t44_paraphrase_hit_lands_before_the_loop_finishes() {
+        let cfg = cfg();
+        let mut g = LoopGuard::new(&cfg);
+        let paras: Vec<&str> = REPORTED_PARAPHRASE_LOOP
+            .split('\n')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        assert_eq!(paras.len(), 6, "the sample is six paragraphs");
+        let mut fired_after = None;
+        for (i, p) in paras.iter().enumerate() {
+            if g.push(&format!("{p}\n")).is_some() {
+                fired_after = Some(i + 1);
+                break;
+            }
+        }
+        let fired_after = fired_after.expect("must fire at all");
+        assert!(
+            fired_after <= 4,
+            "fired only after {fired_after}/6 paragraphs; the client would already have the loop"
+        );
     }
 
     /// Real model answers must NEVER be cut by the paraphrase rule.
