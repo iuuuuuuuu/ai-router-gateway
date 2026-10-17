@@ -137,6 +137,7 @@ Desktop.ini
 /tools/_accept-midloop.mjs
 /tools/_accept-range.mjs
 /tools/_accept-range2.mjs
+/tools/_loopup-upstream.mjs
 /tools/_verify-task43.mjs
 /tools/_verify-d2-cost.mjs
 /tools/_tmp-logs.mjs
