@@ -46,6 +46,53 @@ pub const TIER2_EXTRA_REPS: u32 = 2;
 pub const LADDER: [(usize, u32); 4] =
     [(1, 0), (TIER2_SPAN_MULT, TIER2_EXTRA_REPS), (9, 4), (27, 6)];
 
+/// Paraphrase repetition: how long a character run two paragraphs must SHARE
+/// before they count as the same sentence reworded rather than two paragraphs
+/// that merely share a template.
+///
+/// This is the discriminator, and it was chosen by measurement. Counting
+/// repeated n-grams does NOT work: a real 4287-char answer contains a 12-char
+/// unit 67 times (indentation and table rules), far more than a genuine
+/// paraphrase loop. Longest-common-substring does work, because the two cases
+/// differ structurally:
+///
+///   * paraphrase -> the SAME sentence is re-said, so a long run survives;
+///   * table / code / checklist -> the same SKELETON is refilled with different
+///     values, so the shared run stops at the skeleton.
+///
+/// Measured on 10 real model answers (933..4287 chars) and on the reported
+/// 6-paragraph loop: every real answer peaked at 30 or below (a template line),
+/// while the loop reached 52. 24 sits between them with margin on both sides.
+const PARAPHRASE_LCS_CHARS: usize = 24;
+
+/// How many CONSECUTIVE paragraphs must look paraphrased before it is a loop.
+/// Two is deliberate: the reported case repeats six times, and demanding three
+/// would let a model that re-says itself three times through unfixed. One
+/// paragraph is never enough -- a single reworded paragraph is normal prose.
+const PARAPHRASE_RUN_PARAS: usize = 2;
+
+/// Two paragraphs count as restatements only if the shared run is NOT almost
+/// the whole paragraph. `ratio > this` means the paragraphs are essentially
+/// identical, which is a TABLE ROW, a LOG LINE or a CODE LINE -- legitimate
+/// output that repeats a template with different values.
+///
+/// Measured: identical log/template lines sit at 0.95-1.00, while a genuine
+/// rewording peaks at 0.67 (the reported loop) because the reworded half
+/// still differs. Without this cap the detector cuts every log excerpt.
+const PARAPHRASE_MAX_RATIO: f64 = 0.85;
+
+/// Only compare against the previous this-many paragraphs.
+///
+/// A model restating itself does so in a local run. Comparing the whole window
+/// instead lets two far-apart paragraphs collide on a shared phrase: measured
+/// on a real answer, p11 and p21 both contain `Content-Type: text/event-stream`
+/// and share a 30-char run -- 10 paragraphs apart, and not a loop at all.
+const PARAPHRASE_NEIGHBOUR_PARAS: usize = 6;
+
+/// Paragraphs shorter than this are not compared: a short line cannot carry a
+/// long shared run, so including them only adds cost without evidence.
+const PARAPHRASE_MIN_PARA_CHARS: usize = 20;
+
 /// Diagnostics only: at most this many characters of the repeated unit are
 /// copied into `LoopHit::unit` (char-boundary safe by construction).
 const UNIT_SNIPPET_CHARS: usize = 120;
@@ -270,7 +317,15 @@ impl LoopGuard {
         // The strict suffix rule first -- it is the cheaper scan and the one the
         // existing tests pin down -- then the whitespace-tolerant rule it cannot
         // see. Both stay PRE-COMMIT: here a hit costs the client zero bytes.
-        self.detect().or_else(|| self.detect_loose(self.window.len(), self.cfg.min_chars, self.cfg.max_repeats))
+        self.detect()
+            .or_else(|| self.detect_loose(self.window.len(), self.cfg.min_chars, self.cfg.max_repeats))
+            // Paraphrase repetition belongs here too, and NOT only post-commit.
+            // A model that restates its plan six times does so at the very start
+            // of the answer, so a post-commit-only rule fires after all six have
+            // already been relayed: the client keeps the whole loop and the
+            // correction merely appends more text. Judged here, a hit costs the
+            // client zero bytes and the retry picks a different attempt.
+            .or_else(|| self.detect_paraphrase())
     }
 
     /// Post-commit counterpart of `push`: accumulate the delta and judge only
@@ -404,7 +459,11 @@ impl LoopGuard {
             }
             unit_lo = unit_hi.saturating_add(1).max(unit_lo);
         }
-        None
+        // Last, and only after every verbatim rung missed: the same content
+        // re-said in different words. Kept separate from the ladder because it
+        // answers a different question (longest SHARED RUN, not an exact shift)
+        // and must never pre-empt a precise hit, which reports a tighter cut.
+        self.detect_paraphrase()
     }
     /// R6, the whitespace-tolerant fallback for R1-R5.
     ///
@@ -616,6 +675,101 @@ impl LoopGuard {
         })
     }
 
+    /// Paraphrase repetition: the same thing re-said in different words.
+    ///
+    /// The R1-R6 rules compare characters at an exact shift, so they can only
+    /// see a unit repeated VERBATIM. A model that restates its whole plan six
+    /// times with slightly different wording defeats all of them: no two
+    /// paragraphs are identical, and the longest run any two of them share is
+    /// ~26 chars, which is far below `repeat_min_chars`.
+    ///
+    /// The signal that survives rewording is the longest common substring:
+    /// re-saying one sentence keeps a long spine intact, while two paragraphs
+    /// that merely share a table/code skeleton stop matching at the skeleton
+    /// (measured: 12-16 chars). See `PARAPHRASE_LCS_CHARS` for the numbers.
+    ///
+    /// HONEST LIMIT: the rule needs `PARAPHRASE_RUN_PARAS` restatements before
+    /// it has evidence, so the FIRST statements always escape. Measured on the
+    /// reported 6-paragraph case, pre-commit fires at 540/574 chars (94%), i.e.
+    /// after five paragraphs are already relayed. Making it fire earlier would
+    /// mean treating ONE reworded paragraph as proof, which cuts ordinary prose
+    /// (a summary that restates the opening line). This is the same trade the
+    /// verbatim rules make: a loop is always visible only after it has looped.
+    ///
+    /// Reports a hit only after `PARAPHRASE_RUN_PARAS` CONSECUTIVE paragraphs
+    /// look paraphrased. `real_span` covers those paragraphs so the caller cuts
+    /// exactly the redundant restatement and keeps the first one.
+    fn detect_paraphrase(&self) -> Option<LoopHit> {
+        let text: String = self.window.iter().copied().collect();
+        // Paragraph boundaries: a blank line, or a line break. Both are what a
+        // model uses to separate "one attempt at saying it" from the next.
+        let paras: Vec<(usize, String)> = split_paragraphs(&text)
+            .into_iter()
+            .filter(|(_, p)| p.chars().count() >= PARAPHRASE_MIN_PARA_CHARS)
+            .collect();
+        if paras.len() <= PARAPHRASE_RUN_PARAS {
+            return None;
+        }
+        let dense: Vec<Vec<char>> = paras
+            .iter()
+            .map(|(_, p)| p.chars().filter(|c| !c.is_whitespace()).collect())
+            .collect();
+        let mut run = 0usize;
+        // Index (into `paras`) of the first paragraph of the current run.
+        let mut run_start = 0usize;
+        for i in 1..paras.len() {
+            let mut restated = false;
+            // Only the RECENT previous paragraphs are compared: a restatement
+            // is a local run, and a wider net starts matching shared phrases
+            // across unrelated sections (see PARAPHRASE_NEIGHBOUR_PARAS).
+            let from = i.saturating_sub(PARAPHRASE_NEIGHBOUR_PARAS);
+            for j in from..i {
+                if dense[j].len() < PARAPHRASE_LCS_CHARS
+                    || dense[i].len() < PARAPHRASE_LCS_CHARS
+                {
+                    continue;
+                }
+                let shared = lcs_len(&dense[j], &dense[i]);
+                if shared < PARAPHRASE_LCS_CHARS {
+                    continue;
+                }
+                // The shared run must leave something DIFFERENT: a run covering
+                // (almost) the whole paragraph means the same template refilled
+                // with new values, which is a table row or a log line, not a
+                // restatement. See PARAPHRASE_MAX_RATIO.
+                let shorter = dense[j].len().min(dense[i].len());
+                let ratio = shared as f64 / shorter as f64;
+                if ratio <= PARAPHRASE_MAX_RATIO {
+                    restated = true;
+                    break;
+                }
+            }
+            if restated {
+                if run == 0 {
+                    // The run starts at the paragraph that was REPEATED, so the
+                    // cut keeps the original and drops the restatements.
+                    run_start = i - 1;
+                }
+                run += 1;
+                if run >= PARAPHRASE_RUN_PARAS {
+                    // Cut from the first restatement to the end of the window.
+                    let cut_at = paras[run_start + 1].0;
+                    let real_span = text.chars().count() - text[..cut_at].chars().count();
+                    let unit: String = paras[run_start + 1].1.chars().take(UNIT_SNIPPET_CHARS).collect();
+                    return Some(LoopHit {
+                        unit,
+                        repeats: (run + 1) as u32,
+                        chars: real_span,
+                        real_span,
+                    });
+                }
+            } else {
+                run = 0;
+            }
+        }
+        None
+    }
+
     /// Number of characters at the window tail that are all whitespace.
     fn trailing_whitespace(&self) -> usize {
         self.trailing_whitespace_within(self.window.len())
@@ -682,6 +836,64 @@ pub fn holdback_done(
         (false, Some(e)) => e >= hold_max,
     }
 }
+/// Split `text` into paragraphs, returning each paragraph's byte offset too.
+///
+/// A paragraph ends at a blank line or a single newline: both separate one
+/// attempt at saying something from the next, and a model that restates itself
+/// uses whichever its formatting calls for.
+fn split_paragraphs(text: &str) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            let para = text[start..i].trim();
+            if !para.is_empty() {
+                out.push((start, para.to_string()));
+            }
+            i += 1;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    let para = text[start..].trim();
+    if !para.is_empty() {
+        out.push((start, para.to_string()));
+    }
+    out
+}
+
+/// Longest common substring length of two char slices.
+///
+/// Deliberately a substring (contiguous) rather than a subsequence: a reworded
+/// sentence keeps whole phrases verbatim, whereas scattered shared characters
+/// would match almost any two Chinese sentences on the same topic.
+fn lcs_len(a: &[char], b: &[char]) -> usize {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let mut prev = vec![0usize; b.len() + 1];
+    let mut cur = vec![0usize; b.len() + 1];
+    let mut best = 0usize;
+    for i in 1..=a.len() {
+        cur[0] = 0;
+        for j in 1..=b.len() {
+            if a[i - 1] == b[j - 1] {
+                cur[j] = prev[j - 1] + 1;
+                if cur[j] > best {
+                    best = cur[j];
+                }
+            } else {
+                cur[j] = 0;
+            }
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     // ---- holdback ceiling (pure, no wall-clock dependency) ----
@@ -834,8 +1046,149 @@ mod tests {
         }
     }
 
+    /// The REAL reported case: one answer restating the same plan six times
+    /// in slightly different words. Every R1-R6 rule misses it by construction
+    /// (no two paragraphs are identical), which is exactly why this test exists.
+    const REPORTED_PARAPHRASE_LOOP: &str = concat!(
+        "好，提醒间隔最小设为 5 分钟，默认 10 分钟，保留现有约每 5 分钟检查一次的节奏。接下来按 ts-standards 和 TDD 补配置、提醒计数与回归测试，设置界面沿用现有样式。",
+        "\n",
+        "明白，提醒间隔最小 5 分钟，默认 10 分钟，保留现有约每 5 分钟的检查节奏。我会在配置输入和任务执行两处都加限制，并补测提醒次数、发送失败及签出后停止的行为。",
+        "\n",
+        "好，提醒间隔最小设为 5 分钟，默认 10 分钟，保留现有每 5 分钟检查一次的节奏。我会按 ts-standards 接入配置，并用测试覆盖次数、间隔和签出后停止的行为。",
+        "\n",
+        "好，提醒间隔最小设为 5 分钟，默认仍是 10 分钟，检查频率就保留现有的每 5 分钟一次。我会按 ts-standards 和 TDD 补齐账号配置、设置界面及重复提醒逻辑，并在运行时兜住小于 5 分钟的无效应配置。",
+        "\n",
+        "好，提醒间隔最小设为 5 分钟，默认 10 分钟，保留现有每 5 分钟检查一次的节奏。我会按 ts-standards 和 TDD 补齐配置与提醒计数，并在设置输入和任务执行两处限制最小间隔。",
+        "\n",
+        "好的，提醒间隔最小设为 5 分钟，默认仍为 10 分钟，检查节奏保留现有约每 5 分钟一次。接下来按 ts-standards 和 TDD 补配置、设置项及重复提醒逻辑，并验证发送失败不计次、签出后停止。",
+        "\n",
+    );
+
     #[test]
-    fn t03_pure_newline_repeat_does_not_hit() {
+    fn t40_paraphrased_restatement_is_caught() {
+        let cfg = cfg();
+        // Precondition: the verbatim rules MUST miss this text. If this ever
+        // starts hitting, the sample changed and the test below proves nothing.
+        let mut verbatim = LoopGuard::new(&cfg);
+        verbatim.append(REPORTED_PARAPHRASE_LOOP);
+        assert!(
+            verbatim.detect().is_none(),
+            "sample no longer needs the paraphrase rule; pick a new sample"
+        );
+        // The paraphrase rule must catch it, post-commit (where paragraphs are
+        // complete -- the caller feeds the answer in as it streams).
+        let mut g = LoopGuard::new(&cfg);
+        let h = g
+            .push_tail(REPORTED_PARAPHRASE_LOOP)
+            .expect("the reported 6-paragraph restatement must be caught");
+        assert!(h.real_span > 0, "a hit must say what to cut: {h:?}");
+        // The cut must keep the FIRST statement and drop the restatements.
+        let kept = g.text_before(h.real_span);
+        assert!(
+            kept.chars().count() > 40,
+            "the first statement must survive the cut, kept {} chars",
+            kept.chars().count()
+        );
+        assert!(
+            kept.chars().count() < REPORTED_PARAPHRASE_LOOP.chars().count(),
+            "the restatements must be dropped"
+        );
+    }
+
+    /// The paraphrase rule must fire PRE-commit, not only post-commit.
+    ///
+    /// Measured on the live gateway: with the rule only in `judge_tail`, a
+    /// 6-paragraph restatement was fully relayed before the hit, so the client
+    /// kept every copy and the correction merely appended more text. Pre-commit
+    /// is where this shape can actually be stopped with zero client bytes.
+    #[test]
+    fn t43_paraphrase_loop_is_caught_before_commit() {
+        let cfg = cfg();
+        let mut g = LoopGuard::new(&cfg);
+        let hit = g
+            .push(REPORTED_PARAPHRASE_LOOP)
+            .expect("pre-commit must catch the reported restatement");
+        assert!(hit.real_span > 0, "the hit must report what to cut: {hit:?}");
+    }
+
+    /// Real model answers must NEVER be cut by the paraphrase rule.
+    ///
+    /// These are 15 genuine answers captured from the live model (933..4287
+    /// chars), deliberately including the shapes most likely to false-positive:
+    /// markdown tables, code blocks, checklists, and answers that summarise
+    /// first and then expand. Fault injection: lowering `PARAPHRASE_LCS_CHARS`
+    /// to 12 makes this test fail, which is what keeps the threshold honest.
+    const REAL_ANSWERS: &[&str] = &[
+        "HTTP 状态码是服务器对客户端请求的响应结果的三位数字代码，由 RFC 9110 等标准定义。它的第一位数字表示响应类别，共分为五类。每一类都对应着不同的语义和处理方式，理解这些类别对于开发、调试和运维 Web 应用都非常重要。下面逐一详细说明。\n\n## 一、1xx：信息性状态码（Informational）\n\n1xx 表示服务器已收到请求，正在继续处理，属于临时性响应。这类状态码不会作为最终响应出现，客户端通常会在收到 1xx 后继续等待最终结果。它们主要用于协议层面的协商和连接管理。\n\n**例子 1：100 Continue**\n客户端在发送较大的请求体之前，可以先发送带有 `Expect: 100-continue` 头的请求。服务器如果愿意接收请求体，就返回 `100 Continue`，客户端随后才真正发送数据。这样可以避免在服务器拒绝请求时白白传输大量数据，是一种优化机制。\n\n**例子 2：101 Switching Protocols**\n当客户端请求升级协议时（例如通过 `Upgrade: websocket` 头请求从 HTTP 升级到 WebSocket），服务器如果同意，就返回 `101 Switching Protocols`，此后连接上的通信将按照新协议进行。这是 WebSocket 握手成功的关键状态码。\n\n需要注意的是，1xx 响应是中间响应，HTTP/1.1 中它们不以空行结束，而是紧接着后续响应；在现代 HTTP/2 和 HTTP/3 中，1xx 的处理方式有所不同，但语义保持一致。\n\n## 二、2xx：成功状态码（Successful）\n\n2xx 表示请求已被服务器成功接收、理解并处理。这是最\"令人愉快\"的一类状态码，具体语义因方法而异：GET 表示资源已获取，POST 表示已处理，等等。\n\n**例子 1：200 OK**\n最通用的成功状态码，表示请求成功，响应体中包含所请求的资源或操作结果。对于 GET 请求，响应体就是资源内容；对于 POST 请求，响应体可能是操作结果。几乎所有正常的网页浏览都会产生大量 200 响应。\n\n**例子 2：201 Created**\n表示请求成功并且导致服务器创建了新资源，通常用于 POST 或 PUT 请求。响应中一般会通过 `Location` 头指出新资源的 URI。例如在 RESTful API 中创建一条新记录后返回 201 并附带新资源的地址，这是符合规范的常见做法。\n\n此外还有 204 No Content（成功但无响应体，常用于 DELETE 或 PUT）、206 Partial Content（范围请求成功，用于断点续传和视频流）等，它们都在特定场景下表达更精确的\"成功\"含义。\n\n## 三、3xx：重定向状态码（Redirection）\n\n3xx 表示客户端需要采取进一步操作才能完成请求，通常意味着资源位于别处，或者需要使用缓存副本。这类状态码分为永久重定向和临时重定向，二者的区别对搜索引擎优化和缓存行为有实际影响。\n\n**例子 1：301 Moved Permanently**\n表示请求的资源已永久移动到新位置，响应中的 `Location` 头给出新 URI。客户端和搜索引擎应当更新书签和索引。常见于网站更换域名或 URL 结构永久调整时。由于浏览器会缓存 301，配置错误可能导致难以撤销的问题，需要谨慎使用。\n\n**例子 2：302 Found**\n表示资源临时位于另一个 URI。与 301 不同，客户端不应更新书签，后续请求仍应使用原 URI。它常用于登录后的临时跳转、A/B 测试分流等场景。历史上 302 的实现曾与规范不符（早期浏览器会自动把 POST 改为 GET），因此后来又引入了 307 和 308 来明确保持方法和请求体的语义。\n\n其他常见成员包括 304 Not Modified（配合缓存验证，表示资源未变化，可继续使用缓存）、307 Temporary Redirect（临时重定向且保持请求方法不变）、308 Permanent Redirect（永久重定向且保持方法不变）。\n\n## 四、4xx：客户端错误状态码（Client Error）\n\n4xx 表示请求本身存在问题，错误的责任在客户端一侧，例如请求语法错误、缺少认证、资源不存在、方法不被允许等。服务器理解了请求但无法或拒绝处理。客户端通常不应原样重试（除非问题被修正）。\n\n**例子 1：404 Not Found**\n表示服务器找不到请求的资源。这是最广为人知的错误码，常见于输入了错误的 URL 或资源已被删除。需要注意的是，出于安全考虑，有些服务器会对本应返回 403 的请求也返回 404，以避免泄露资源是否存在的信息。\n\n**例子 2：401 Unauthorized**\n表示请求缺少有效的身份认证凭据。虽然名字叫\"未授权\"，实际含义是\"未认证\"——客户端需要提供凭证（如通过 `WWW-Authenticate` 头指示的认证方式）。与之相对的是 403 Forbidden，表示身份已确认但无权访问。\n\n其他重要成员包括 400 Bad Request（请求语法错误）、403 Forbidden（拒绝访问）、405 Method Not Allowed（方法不被支持）、409 Conflict（资源状态冲突）、429 Too Many Requests（触发限流）等。合理使用 4xx 能让 API 的错误语义更清晰。\n\n## 五、5xx：服务器错误状态码（Server Error）\n\n5xx 表示服务器在处理一个看似有效的请求时遇到了错误，责任在服务器一侧。这类错误通常意味着服务端存在缺陷、过载或依赖故障。客户端可以稍后重试（尤其是 503），但根本修复需要服务端介入。\n\n**例子 1：500 Internal Server Error**\n最通用的服务器错误，表示服务器遇到意外情况，无法完成请求。它往往源于未捕获的异常、代码缺陷或配置错误。对客户端而言，500 通常不透露具体原因（出于安全考虑），详细错误应记录在服务端日志中。\n\n**例子 2：503 Service Unavailable**\n表示服务器暂时无法处理请求，通常由于过载或维护。响应中可以通过 `Retry-After` 头告知客户端何时可以重试。在负载均衡和限流场景中，503 常被用来表达\"服务暂时不可用，请稍后再试\"，是熔断和降级策略中常见的返回码。\n\n其他成员包括 502 Bad Gateway（网关从上游收到无效响应）、504 Gateway Timeout（网关等待上游超时）等，这些在反向代理和微服务架构中尤其常见，能帮助快速定位故障发生在哪一层。\n\n## 总结\n\n五类状态码通过首位数字形成清晰的语义分层：1xx 是过程性的中间信息，2xx 是成功，3xx 是重定向与缓存协商，4xx 是客户端侧问题，5xx 是服务端侧问题。实际开发中，不仅要正确选择状态码，还要理解同类内部各码之间的细微差别（如 301 与 302、401 与 403、502 与 504），这样才能让接口行为符合标准、便于调试，也利于缓存、代理、搜索引擎等中间环节正确工作。",
+        "| 名称 | 地址 | 超时 | 重试 |\n|------|------|------|------|\n| 华东支付网关 | https://api-east.pay.example.com/v2 | 5s | 3 |\n| 华南支付网关 | https://api-south.pay.example.com/v2 | 6s | 2 |\n| 华北消息队列 | amqp://mq-north.example.com:5672 | 10s | 5 |\n| 用户中心主库 | jdbc:mysql://db-user-primary.example.com:3306 | 30s | 1 |\n| 用户中心从库 | jdbc:mysql://db-user-replica.example.com:3307 | 30s | 2 |\n| 风控引擎 | http://risk-engine.example.com:8080/check | 3s | 4 |\n| 短信服务商A | https://sms-a.example.com/send | 8s | 3 |\n| 短信服务商B | https://sms-b.example.com/send | 8s | 2 |\n| 对象存储主节点 | https://oss-primary.example.com | 15s | 2 |\n| 对象存储备节点 | https://oss-backup.example.com | 20s | 3 |\n| 日志采集服务 | udp://log-collector.example.com:5140 | 2s | 1 |\n| 缓存集群 | redis://cache-cluster.example.com:6379 | 1s | 5 |\n| 第三方物流接口 | https://logistics.example.com/api/v1 | 12s | 3 |\n| 发票开具服务 | https://invoice.example.com/open | 25s | 2 |\n| 报表导出服务 | https://report.example.com/export | 60s | 1 |",
+        "# SSE 流式输出详解\n\n## 一、什么是 SSE\n\n**SSE（Server-Sent Events，服务器发送事件）** 是一种基于 HTTP 的**单向、服务器到客户端**的推送技术。服务器可以持续向客户端发送数据流，客户端只需建立一个连接就能不断接收消息。\n\n浏览器端通过 `EventSource` API 使用：\n\n```js\nconst es = new EventSource('/stream');\nes.onmessage = (e) => console.log(e.data);\n```\n\n> 注：LLM 应用（如 ChatGPT）里的\"流式输出\"，前端常用 `fetch` + `ReadableStream` 读取，后端按 SSE 的 `data: ...\\n\\n` 格式发送，本质仍是 SSE 协议。\n\n---\n\n## 二、SSE 与普通 HTTP 响应的区别\n\n| 维度 | 普通 HTTP 响应 | SSE 流式响应 |\n|------|---------------|-------------|\n| 响应方式 | 一次性返回完整 body | 分块持续发送，连接保持打开 |\n| 连接生命周期 | 响应结束即关闭 | 长连接，直到主动断开 |\n| 传输头 | `Content-Length` 或分块 | `Content-Type: text/event-stream`、`Transfer-Encoding: chunked` |\n| 数据单位 | 完整 JSON/HTML | `data: ...\\n\\n` 事件块 |\n| 方向 | 请求-响应一次交互 | 服务器→客户端单向持续推送 |\n| 适用场景 | 常规接口 | 打字机效果、日志实时输出、进度通知 |\n| 客户端处理 | `res.json()` 等 | 读取 stream、逐块解析 |\n\n**核心差异：** 普通响应是\"一问一答的完整包裹\"；SSE 是\"一问之后，服务器把答案一小块一小块地递过来\"。\n\n---\n\n## 三、SSE 的消息格式\n\n每行一个字段，事件之间用**空行（`\\n\\n`）**分隔：\n\n```\ndata: 第一段内容\\n\\n\ndata: 第二段内容\\n\\n\n\nevent: done\\n\ndata: [DONE]\\n\\n\n```\n\n常用字段：\n- `data:` 消息内容（可多行，多行会拼接）\n- `event:` 自定义事件名（客户端用 `addEventListener` 监听）\n- `id:` 断线重连时的游标\n- `retry:` 重连间隔毫秒\n- 以 `:` 开头的行是注释（可用作心跳）\n\n---\n\n## 四、实现要点\n\n### 1. 服务端关键 Header\n\n```http\nContent-Type: text/event-stream; charset=utf-8\nCache-Control: no-cache\nConnection: keep-alive\nX-Accel-Buffering: no   # 关键：禁用 Nginx 缓冲，否则不会实时\n```\n\n### 2. 后端伪代码（Node/Express）\n\n```js\napp.get('/stream', (req, res) => {\n  res.setHeader('Content-Type', 'text/event-stream');\n  res.setHeader('Cache-Control', 'no-cache');\n  res.setHeader('Connection', 'keep-alive');\n  res.flushHeaders();          // 立即发送头部，避开默认缓冲\n\n  const timer = setInterval(() => {\n    res.write(`data: ${JSON.stringify({ t: Date.now() })}\\n\\n`);\n  }, 1000);\n\n  req.on('close', () => clearInterval(timer)); // 客户端断开要清理资源\n});\n```\n\n### 3. 必须\"立即 flush\"\n\n- 框架（Express、Flask、Django、Spring）默认会缓冲响应，**第一块数据可能卡住不发出**。\n- 措施：调用 `flushHeaders()` / `res.flush()` / 关闭中间件缓冲，或用 `transfer-encoding: chunked`。\n- 反向代理（Nginx）要 `proxy_buffering off;`，否则流被整段缓存，前端看到的还是\"一次性返回\"。\n\n### 4. 前端容错解析\n\n```js\nconst resp = await fetch('/stream');\nconst reader = resp.body.getReader();\nconst decoder = new TextDecoder();\nlet buf = '';\nwhile (true) {\n  const { done, value } = await reader.read();\n  if (done) break;\n  buf += decoder.decode(value, { stream: true }); // 用 stream 模式避免乱码\n  let idx;\n  while ((idx = buf.indexOf('\\n\\n')) >= 0) {\n    const chunk = buf.slice(0, idx);\n    buf = buf.slice(idx + 2);\n    // 解析 \"data: ...\"\n  }\n}\n```\n\n要点：\n- 用 `TextDecoder(..., { stream: true })` 处理**跨块的多字节字符被截断**问题。\n- 按 `\\n\\n` 切分事件，不要按单次 `read()` 回调切分。\n- 处理 `data:` 可能跨多个 chunk 到达的情况。\n- 遇到 `[DONE]` 或流结束要停止读取并更新 UI。\n\n### 5. 断线重连与心跳\n\n- `EventSource` 默认会**自动重连**（普通 fetch 不会，需自己实现）。\n- 长时间无数据时，中间代理可能判定超时断连；周期性发送 `: ping\\n\\n`（注释行）作为心跳保活。\n- 生产环境注意 `retry` 和 `id` 的使用，配合 `Last-Event-ID` 实现断点续传。\n\n### 6. 生命周期与资源清理\n\n- 监听 `close` / `aborted` 事件，停止定时器、关闭数据库游标、中止上游 LLM 请求。\n- 客户端主动断开（关页面、取消）不要让服务端泄漏连接。\n\n### 7. 与 WebSocket 的选择\n\n- SSE：**单向**（服务器→客户端）、纯 HTTP、自动重连、实现简单，适合日志/LLM 流式输出。\n- WebSocket：**双向**、全双工，适合需要频繁双向交互的场景。\n- 需要客户端中途\"取消/发消息\"时，SSE 方案常用\"另一个 HTTP 请求发起取消\"来弥补。\n\n### 8. 常见坑总结\n\n| 坑 | 解决 |\n|----|------|\n| 前端收不到数据，最后一起收到 | 绕过 Nginx 缓冲、服务端 flush |\n| 中文乱码/截断 | `TextDecoder({stream:true})` + 按 `\\n\\n` 切 |\n| 连接自动断 | 心跳、设置代理超时 |\n| 内存泄漏 | 监听 close，清理定时器/上游请求 |\n| 代理或 CDN 不支持 | 检查 `text/event-stream` 透传 |\n\n---\n\n**一句话总结：** SSE 流式输出就是把普通 HTTP 的\"完整响应\"改造成\"长连接 + 分块文本事件\"，核心在于**服务端及时 flush、禁用中间层缓冲、客户端流式解析并按事件边界切分**，同时处理好断线重连、心跳和资源清理。",
+        "# Rust 后端项目目录结构示例\n\n下面以典型的 **Web 后端服务**(基于 `axum` / `actix-web` 等框架) 为例,给出一个清晰、可扩展的目录结构,并逐项说明职责。\n\n---\n\n## 整体目录树\n\n```\nmy-backend/\n├── Cargo.toml\n├── Cargo.lock\n├── .env\n├── .env.example\n├── .gitignore\n├── Dockerfile\n├── docker-compose.yml\n├── README.md\n│\n├── migrations/               # 数据库迁移文件(SQL)\n│   ├── 20240101_init.sql\n│   └── ...\n│\n├── config/                   # 环境相关配置文件\n│   ├── default.toml\n│   ├── development.toml\n│   └── production.toml\n│\n├── tests/                    # 集成测试\n│   ├── api_user.rs\n│   └── common/\n│       └── mod.rs            # 测试工具/初始化\n│\n└── src/\n    ├── main.rs               # 程序入口\n    ├── lib.rs                # 库入口(可选,便于测试复用)\n    ├── config.rs             # 配置加载\n    ├── state.rs              # 全局共享状态(AppState)\n    ├── error.rs              # 统一错误类型 & 错误响应\n    ├── telemetry.rs          # 日志 / tracing / metrics 初始化\n    │\n    ├── routes/               # 路由定义层\n    │   ├── mod.rs\n    │   ├── user.rs\n    │   └── health.rs\n    │\n    ├── handlers/             # 请求处理层(Controller)\n    │   ├── mod.rs\n    │   ├── user.rs\n    │   └── health.rs\n    │\n    ├── services/             # 业务逻辑层\n    │   ├── mod.rs\n    │   └── user.rs\n    │\n    ├── repositories/         # 数据访问层(DAO)\n    │   ├── mod.rs\n    │   └── user.rs\n    │\n    ├── models/               # 数据模型\n    │   ├── mod.rs\n    │   ├── entity/           # 数据库实体\n    │   │   └── user.rs\n    │   ├── dto/              # 请求/响应 DTO\n    │   │   └── user.rs\n    │   └── error.rs          # 模型层错误(可选)\n    │\n    ├── middleware/           # 中间件\n    │   ├── mod.rs\n    │   ├── auth.rs\n    │   └── request_id.rs\n    │\n    ├── db/                   # 数据库连接 & 连接池\n    │   ├── mod.rs\n    │   └── pool.rs\n    │\n    └── utils/                # 通用工具\n        ├── mod.rs\n        ├── crypto.rs\n        └── pagination.rs\n```\n\n---\n\n## 各模块职责说明\n\n### 顶层文件\n\n| 文件/目录 | 职责 |\n|---|---|\n| `Cargo.toml` / `Cargo.lock` | 依赖声明与锁定 |\n| `.env` / `.env.example` | 本地敏感配置(密钥、DB URL),不提交真实 `.env` |\n| `Dockerfile` / `docker-compose.yml` | 容器化构建与本地依赖编排(DB、Redis 等) |\n| `README.md` | 项目说明 |\n\n### `migrations/`\n数据库 schema 迁移脚本(常用 `sqlx migrate` 或 `diesel migration`)。**只增不改**,保证历史可追溯。\n\n### `config/`\n不同环境的配置文件(TOML/YAML),与 `.env` 互补:`.env` 放密钥,`config/` 放结构化参数(超时、分页大小、连接池大小等)。\n\n### `tests/`\nRust 的集成测试目录。所有 `.rs` 文件被当作独立 crate 编译,用来做 API 端到端测试。`common/` 放测试公共工具(启动应用、准备 DB)。\n\n---\n\n### `src/` 内部\n\n#### `main.rs`\n程序入口。职责:\n- 加载配置、初始化 `tracing`\n- 建立数据库连接池\n- 构建 `AppState`\n- 组装路由 + 中间件\n- 启动 HTTP 服务器\n\n#### `lib.rs`(可选)\n把核心逻辑作为一个库暴露,便于 `tests/` 复用、也便于以后拆成多 crate(workspace)。\n\n#### `config.rs`\n定义 `Config` 结构体,从 `.env` + `config/*.toml` 读取并校验,提供全局强类型配置。\n\n#### `state.rs`\n定义 `AppState`,集中持有所需的共享依赖(数据库池、Redis 客户端、配置等),通过 `axum::State` 注入到 handler。**避免使用全局单例**,依赖显式传递。\n\n#### `error.rs`\n定义统一的 `AppError` 枚举,实现:\n- `IntoResponse`(axum 需要)\n- `From<sqlx::Error>`、`From<ValidationError>` 等转换\n保证所有 handler 用同一个错误出口,统一返回 JSON 错误格式。\n\n#### `telemetry.rs`\n初始化日志与可观测性:`tracing-subscriber`、`tracing-opentelemetry`、请求 ID 注入、metrics 导出。\n\n#### `routes/`\n**路由层**:只声明 URI、HTTP 方法、绑定 handler 与中间件。不写业务逻辑。\n```\n/health        -> health_handler\n/api/v1/users  -> user_handler::*\n```\n\n#### `handlers/`\n**控制层(Controller)**:接收请求,解析 `Path/Query/Json` → 调用 `services` → 构造响应。**不直接访问数据库**。主要负责:入参反序列化、鉴权上下文提取、调用 service、组装 DTO。\n\n#### `services/`\n**业务逻辑层**:事务边界、领域规则、跨 repository 编排。例如\"注册用户\"= 校验邮箱唯一 + hash 密码 + 写库 + 发事件。**不关心 HTTP**。\n\n#### `repositories/`\n**数据访问层(DAO)**:封装 SQL 或 ORM 调用,把 `sqlx::Error` 转成领域错误。service 通过 trait 依赖它,便于 mock 测试。\n\n#### `models/`\n- `entity/`:与数据库表一一对应(或 ORM 生成)\n- `dto/`:API 的请求体 / 响应体,字段名与前端约定\n- `error.rs`:领域错误类型(可选,或合并进 `src/error.rs`)\n\n**关键原则**:entity 与 dto **分离**,避免 DB 字段泄露到 API。\n\n#### `middleware/`\n自定义中间件:`auth`(JWT 校验并注入用户到请求扩展)、`request_id`、限流、CORS 配置等。\n\n#### `db/`\n连接池创建与调优(`sqlx::PgPool::connect_with`、max_connections、timeout),以及事务辅助函数。\n\n#### `utils/`\n无状态纯函数工具:crypto、分页(query 参数 → offset/limit + 总数封装)、时间格式化等。\n\n---\n\n## 设计要点总结\n\n1. **分层清晰**:`routes → handlers → services → repositories`,单向依赖,上层不越界调用 DB。\n2. **依赖注入**:通过 `AppState` 显式传递依赖,而非全局变量。\n3. **错误统一**:一个 `AppError`,一个响应格式。\n4. **entity / dto 分离**:数据库结构与 API 契约解耦。\n5. **可测试**:service 依赖 repository trait;`tests/` 目录做集成测试。\n6. **可选演进**:当项目变大时,把 `src/` 拆成 workspace(`crates/domain`、`crates/api`、`crates/infra`)。\n\n按需裁剪即可:小项目可以省掉 `services/` 直接 handler 调 repository;大型项目则可以升级成多 crate workspace。",
+        "排查间歇性失败的网络请求，核心是**先定位失败发生在哪一层（DNS/TCP/TLS/HTTP/应用）**，再用证据收敛范围。以下是完整步骤。\n\n## 一、先量化问题：定义\"失败\"\n\n1. **明确失败特征**\n   - 错误类型：超时（connect/read）、连接重置（RST）、DNS 解析失败、HTTP 5xx/4xx、TLS 握手失败、响应内容错误。\n   - 频率与时间分布：每天几次？集中在某时段？与流量峰值相关？\n   - 影响范围：只影响特定客户端/地域/运营商？还是服务端全局？\n\n2. **建立可重复的测量方法**\n   - 写脚本持续探测（如每 10s 一次），记录时间戳、错误码、耗时分解（DNS、connect、TTFB、总时长）。\n   - 保留失败样本的完整日志，避免\"偶发\"变成无据可查。\n\n## 二、分层定位：沿请求路径逐跳验证\n\n按 客户端 → DNS → 网络 → 负载均衡 → 服务端 → 下游依赖 的顺序排查。\n\n### 1. DNS 层\n- 检查是否间歇性解析失败或解析到不同 IP（多 A 记录轮询、GSLB）。\n- 方法：`dig @resolver domain` 多次执行，对比结果；客户端用 `getent hosts` 或抓包看 DNS 响应。\n- 关注：TTL 过短导致频繁解析、本地 DNS 缓存污染、解析超时。\n\n### 2. TCP 层\n- 现象：connect timeout、连接被拒绝、RST。\n- 方法：\n  - `curl -v --connect-timeout 5` 观察连接建立。\n  - 抓包（见第三步）看 SYN 是否重传、是否有 RST、三次握手耗时。\n- 关注：SYN 队列溢出（服务端 `netstat -s | grep -i listen`）、连接数打满、NAT/防火墙状态表超时、客户端源端口耗尽。\n\n### 3. TLS 层\n- 现象：握手超时、证书错误、协议版本/加密套件不兼容。\n- 方法：`openssl s_client -connect host:443 -servername host`，重复执行；抓包看握手是否卡在某一步（如 ClientHello 后无响应）。\n- 关注：证书链偶尔拉取失败（OCSP/CRL）、中间设备干扰、会话票据问题。\n\n### 4. HTTP/应用层\n- 现象：5xx、响应慢、超时、空响应。\n- 方法：\n  - 服务端日志按请求 ID 关联，看失败请求是否到达服务端（没到 → 网络/网关问题；到了 → 服务端问题）。\n  - 检查超时配置：上游超时、连接池等待超时、keep-alive 空闲超时导致复用失效（经典\"间歇性失败\"来源）。\n  - 检查负载均衡健康检查是否误摘节点、是否有节点偶发 5xx。\n\n### 5. 下游依赖\n- 数据库慢查询/连接池耗尽、缓存雪崩、第三方 API 限流（429）等都可能表现为上游请求间歇失败。\n- 用链路追踪（trace）确认失败请求卡在哪一跳。\n\n## 三、抓包与日志取证\n\n1. **客户端/边缘抓包**\n   - `tcpdump -i any -w cap.pcap 'host x.x.x.x and port 443'`，失败时段的包重点看：重传、RST、零窗口、握手耗时尖峰。\n   - 用 Wireshark 的 `tcp.analysis.flags`、`http.response.code >= 500` 过滤。\n2. **服务端抓包/日志**\n   - 对比客户端发出时间与服务端收到时间，判断延迟发生在网络还是处理。\n   - 打开 access log 记录上游耗时、连接复用状态、请求 ID。\n3. **关联分析**\n   - 把失败时间点与系统指标（CPU、连接数、GC、带宽、限流计数）对齐，找相关性。\n\n## 四、复现与假设验证\n\n- 构造压力场景：并发连接数、长连接空闲后复用、特定地域/运营商路径。\n- 逐项排除：改 DNS、绕负载均衡直连后端、关闭 keep-alive、调大超时/连接池，看失败率是否变化。\n- 每次只改一个变量，记录前后失败率。\n\n## 五、常见根因清单（对照检查）\n\n| 现象 | 常见原因 |\n|---|---|\n| 间歇 connect timeout | SYN 队列满、防火墙状态表满、NAT 超时 |\n| 间歇 RST | 空闲连接被中间设备回收、服务端 keep-alive 超时短于客户端 |\n| 间歇 5xx | 某后端节点故障、健康检查滞后、限流 |\n| 间歇 DNS 失败 | 解析超时、TTL 过短、本地缓存 |\n| 高峰失败 | 连接池/线程池耗尽、带宽打满 |\n| 特定运营商失败 | 路由问题、MTU/分片、中间设备干扰 |\n\n## 六、修复与验证\n\n- 针对根因修复（如调大 keep-alive 一致配置、增加连接池、修复健康检查、加 DNS 缓存）。\n- 上线后持续用第一步的探测脚本监控失败率，设定告警阈值，确认收敛。\n\n**关键原则**：间歇性问题必须靠**持续探测 + 失败样本留存 + 分层对比**来定位，避免靠猜测。优先确认\"请求是否到达服务端\"，这一步能直接把问题空间砍成两半。",
+        "一句话总结：限制提醒间隔的最小值，是为了防止通知刷屏、保护用户体验与系统稳定性，同时避免误配置带来的资源浪费。\n\n第一，从用户体验看，提醒间隔过小会导致高频打扰。用户设置提醒的初衷是“在合适的时间被提示”，而不是被连续轰炸。若最小间隔不受限制，用户可能误设成几秒一次，触发大量通知，造成注意力打断、反感甚至卸载应用，反而背离提醒的价值。\n\n第二，从系统稳定性与资源消耗看，过小的间隔会放大后端压力。每次提醒都涉及定时调度、消息推送、日志写入等开销，间隔越短，单位时间内请求与计算量越大，可能引发队列堆积、推送通道限流、数据库写入飙升，严重时影响其他用户。设置下限相当于给系统留出缓冲。\n\n第三，从业务与配置合理性看，最小值是一种防护性约束。它能拦住误操作、脚本化滥用和异常配置，避免“提醒”退化成骚扰或刷量工具；同时也为产品定义清晰的语义边界，让用户理解提醒是低频、有意义的触达，而非无成本的高频广播。",
+        "好的，先复述您的要求：\n\n- 提醒间隔有最小值限制：**最小 5 分钟**（不能设置得比 5 分钟更短）；\n- 提醒间隔有默认值：**默认 10 分钟**（用户没有指定时使用 10 分钟）。\n\n下面说明我会怎么实现：\n\n1. **定义常量**\n   - `MIN_INTERVAL_MINUTES = 5`\n   - `DEFAULT_INTERVAL_MINUTES = 10`\n\n2. **解析与校验输入**\n   - 如果用户没有提供间隔值（为空/未设置），取默认值 10 分钟。\n   - 如果提供了值，先做类型与数值校验（必须是数字、为正数）。\n   - 再与最小值比较：若小于 5 分钟，则拒绝或回退——具体有两种策略，需要和您确认：\n     - **策略 A（报错）**：直接提示\"间隔不能小于 5 分钟\"，要求重新输入；\n     - **策略 B（纠正）**：自动提升到 5 分钟，并给出提示。\n   - 我默认倾向 **策略 A**（显式报错更符合\"最小限制\"的语义），如需纠正式可切换。\n\n3. **统一出口**\n   - 所有设置提醒的入口都走同一个校验函数，保证默认值与最小值规则只在一处生效，避免各调用点行为不一致。\n\n4. **测试覆盖**\n   - 未设置 → 10；\n   - 设置为 3 → 报错（或纠正为 5，取决于策略）；\n   - 设置为 5 → 通过；\n   - 设置为 10 → 通过；\n   - 边界值与非数字输入。\n\n需要您确认一点：低于 5 分钟时，您希望**报错拒绝**还是**自动纠正为 5 分钟**？确认后我按对应策略实现。",
+        "从数学运算的角度看，幂等性指的是对某个对象反复施加同一种运算，结果与只施加一次相同。最直观的例子是绝对值函数：对任意实数先取一次绝对值得到非负数，再取绝对值仍然是同一个数，即 ||x|| = |x|。类似地，集合运算中的并集也满足幂等性：A ∪ A = A。这个角度的核心是“f(f(x)) = f(x)”，强调运算的重复不产生额外变化。\n\n从编程与函数设计的角度看，幂等性描述的是一个操作被执行一次或多次，对系统状态产生的影响相同。例如 HTTP 的 PUT 请求通常被设计为幂等的：把某个资源设置为指定内容，执行一次和执行十次，最终资源状态一致。与之相对，POST 创建订单往往不是幂等的，重复提交可能生成多笔订单。这个角度关注的是“副作用是否可重复而无害”，是接口设计和重试机制的基础。\n\n从分布式系统与工程实践的角度看，幂等性是保证消息重复投递、网络超时重试等场景下数据正确性的关键属性。系统通常通过唯一请求 ID、去重表、乐观锁或状态机等手段实现幂等，使得同一条消息即使被消费多次，也只产生一次业务效果。这个角度强调的是“在不可靠环境中实现可靠结果”，幂等性成为容错与一致性的重要保障。",
+        "# 新人上手说明\n\n## 一、背景\n\n欢迎加入团队。本说明面向刚入职的新同学，帮助你快速了解工作环境、熟悉基本流程，并在最短时间内独立开展日常工作。\n\n我们所在的团队主要负责[填写团队职责，例如：产品研发/客户支持/内容运营]相关工作，日常协作以[填写协作方式，例如：项目制/需求驱动]为主，沟通渠道包括[填写工具，例如：企业微信、飞书、邮件]。团队现有成员分工如下：项目负责人负责整体规划与资源协调，资深同事负责技术/业务指导，你作为新人将先从辅助性任务入手，逐步过渡到独立承担模块。\n\n在正式上手之前，你需要知道三件事：第一，团队重视流程规范，所有任务都要有记录、有跟踪；第二，遇到问题先自己查资料，查不到再问人，提问时要说清楚背景和你已尝试的方法；第三，新人期一般为[填写周期，例如：1个月]，期间会有导师带教和定期反馈。\n\n本说明分为三部分：先讲背景（即本节），再讲步骤（第二部分），最后讲注意事项（第三部分），请完整阅读后再开始操作。\n\n## 二、步骤\n\n**第1步：完成入职基础配置（第1天）**\n- 领取办公设备，开通企业邮箱、即时通讯工具、项目管理平台账号。\n- 在人事系统完成个人信息登记，确认考勤方式和请假流程。\n- 加入团队群组，修改群昵称为「姓名-岗位」。\n\n**第2步：熟悉环境与资料（第1-2天）**\n- 阅读团队共享文档库中的《团队介绍》《项目清单》《常见问题FAQ》。\n- 向导师索取近期的项目周报和会议纪要，了解当前工作重点。\n- 走一遍办公区，认识对接的行政、IT、财务联系人。\n\n**第3步：明确岗位职责与考核要求（第2-3天）**\n- 与直属上级进行一次15-30分钟的面谈，确认试用期目标、汇报节奏和考核标准。\n- 把面谈要点整理成文档，发给上级确认，避免理解偏差。\n\n**第4步：跟随导师完成首个实操任务（第1周内）**\n- 由导师分配一个低风险的小任务（如整理数据、撰写初稿、跟进一个简单需求）。\n- 按照「接收任务→确认需求→执行→自检→提交→复盘」的流程走一遍，导师全程指导。\n- 任务完成后请导师给出书面或口头反馈，记录改进点。\n\n**第5步：独立承接任务并纳入日常节奏（第2周起）**\n- 在项目管理平台认领任务，按团队约定的格式更新进度。\n- 参加每日/每周例会，学会用「进展-问题-计划」三段式汇报。\n- 每周五向导师提交一份简短周报，内容包括完成事项、遇到的问题、下周计划。\n\n**第6步：阶段性复盘（新人期末）**\n- 对照第3步确认的目标逐项自查，形成总结。\n- 与上级进行一次正式复盘面谈，明确转正或后续培养方向。\n\n## 三、注意事项\n\n1. **权限与保密**：只申请岗位必需的权限，离职或调岗时及时交还；客户资料、内部数据不得外传，发送外部邮件前确认收件人和附件。\n2. **提问方式**：优先查阅文档和搜索历史记录；提问时提供背景、已尝试的方法和期望结果，避免只问「这个怎么做」。\n3. **任务确认**：接到任务先复述一遍需求和截止时间，得到确认再动手，防止方向性返工。\n4. **记录留痕**：重要沟通尽量用文字或邮件确认，会议要有纪要，任务变更要同步到平台，方便追溯。\n5. **时间管理**：新人期任务杂，建议每天上班前花10分钟列当日清单，下班前检查完成情况；遇到多任务冲突及时向上级求助排序，不要自行硬扛。\n6. **反馈与求助**：导师和上级的反馈要记录并落实；遇到卡点超过半天没有进展，要主动求助，不要等到截止日期才暴露问题。\n7. **合规与安全**：遵守公司考勤、报销、设备使用等制度；不安装未经批准的软件，不点击可疑链接，发现异常及时报告IT。\n8. **心态调整**：新人期出错是正常的，关键是及时上报、复盘原因、避免重复；不要因为怕犯错而隐瞒问题。\n\n以上三部分请完整阅读并保存，后续如有流程更新，以团队最新通知为准。祝顺利上手。",
+        "结论：流式响应必须做首字节延迟控制，因为流式接口的“响应已开始”是不可回退的状态，首字节一旦发出，状态码、头部和错误处理空间就被锁死；延迟控制是在发出首字节前保留决策、缓冲和失败切换的窗口。\n\n理由：\n1. 不可回退性：HTTP 响应头/状态码只能发一次。首字节发出后若上游失败、超时或返回错误，无法再改成 502/503 或 JSON 错误体，只能中途断流，客户端体验和可观测性都差。\n2. 错误与降级窗口：延迟首字节可等待上游首个有效数据块、鉴权/配额/路由检查完成，失败时走非流式错误响应或重试/切换后端。\n3. 连接与资源保护：避免“假流式”——连接已建立但长时间无数据，客户端/网关超时、连接堆积；同时防止上游慢启动时过早占用流式通道。\n4. 缓存与压缩：部分网关/CDN 需要一定缓冲才能压缩、合并头部或判断内容类型；过早首字节会绕过或破坏这些机制。\n5. 用户体验与可观测性：控制首字节延迟可在“快速失败”和“尽快出字”间取平衡；过早起流会把上游抖动直接暴露给用户，且难以区分“慢”与“挂”。\n6. 背压与顺序：首字节前可完成会话初始化、排序/去重、权限校验，确保流内容一致；否则中途发现无权限只能断流。\n\n因此首字节延迟控制本质是用少量延迟换错误处理、降级和协议正确性的空间。",
+    ];
+
+    /// A shared phrase across UNRELATED sections is not a restatement.
+    ///
+    /// Real answers repeat technical tokens (`Content-Type: text/event-stream`,
+    /// a URL, an import line) in far-apart sections. Those pairs do share a long
+    /// run, so without the neighbour limit two such mentions in a row would read
+    /// as the same paragraph re-said. This pins `PARAPHRASE_NEIGHBOUR_PARAS`:
+    /// removing the limit makes this test fail.
+    ///
+    /// The two later mentions are CONSECUTIVE (that satisfies the run rule) and
+    /// sit more than the neighbour limit away from the original.
+    #[test]
+    fn t42_far_apart_shared_phrase_is_not_a_paraphrase_loop() {
+        let cfg = cfg();
+        let mut lines: Vec<String> = vec![
+            "传输头里最常见的写法是 `Content-Type: text/event-stream`，它告诉浏览器这是一个事件流。"
+                .to_string(),
+        ];
+        for i in 0..7 {
+            lines.push(format!(
+                "第 {} 条注意事项：这里说明一个与流式传输无关的实现细节，内容各不相同。",
+                i + 1
+            ));
+        }
+        lines.push(
+            "另外要记得，服务端必须返回 `Content-Type: text/event-stream`，否则浏览器不会当作流处理。"
+                .to_string(),
+        );
+        lines.push(
+            "还有一点，反向代理也要透传 `Content-Type: text/event-stream`，不能改写成普通 JSON。"
+                .to_string(),
+        );
+        let text = lines.join("\n");
+        let mut g = LoopGuard::new(&cfg);
+        assert!(
+            g.push_tail(&text).is_none(),
+            "far-apart mentions of one MIME type are not a restatement loop"
+        );
+    }
+
+    #[test]
+    fn t41_real_answers_are_never_cut_by_the_paraphrase_rule() {
+        let cfg = cfg();
+        for (i, text) in REAL_ANSWERS.iter().enumerate() {
+            let mut g = LoopGuard::new(&cfg);
+            if let Some(h) = g.push_tail(text) {
+                panic!(
+                    "real answer #{i} ({} chars) was cut as a paraphrase loop: unit {:?} repeats {}",
+                    text.chars().count(),
+                    h.unit.chars().take(40).collect::<String>(),
+                    h.repeats
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t03_pure_newline_repeat_does_not_hit()
+ {
         assert!(hit(&"\n".repeat(200)).is_none(), "R5: blank-only repetition is not degenerate output");
     }
 
