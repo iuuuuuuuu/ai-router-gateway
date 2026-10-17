@@ -55,7 +55,7 @@ node .agents/skills/agent-notes/scripts/verify-archived-agent-notes.ts
 ## Consequences
 
 - **收益**：决定记录第一次有了会变红的门禁 —— 目录、文件名、头块、必备节、备选方案、归档封印都能被机械核对；「必须写」的判据从口头纪律变成清单，判不准时从严有了默认答案。生命周期使 `proposed` 与 `implemented` 分居，被否路线能以 `rejected` 形态冻结保留，不必删掉。
-- **代价**：仓库多一份 skill 副本（约 190KB 的 Markdown 与 TS），且**副本会与上游 skill 漂移** —— 上游改了校验规则，本仓库不会自动跟进，需要人工同步。这是有意接受的：门禁必须在 clone 后立刻可跑，不能依赖「先装 skill」。
+- **代价**：仓库多一份 skill 副本（实测 142KB，`du -sk .agents/skills/agent-notes`），且**副本会与上游 skill 漂移** —— 上游改了校验规则，本仓库不会自动跟进，需要人工同步（升级方式写在副本的 `README.md` 里）。这是有意接受的：门禁必须在 clone 后立刻可跑，不能依赖「先装 skill」。
 - **代价**：两套记录并存带来的检索成本。找一条决策要先看日期：2026-10-17 之前的在 `DECISIONS.md`，之后在笔记树。判据简单，但新人不会自然知道，所以 `docs/README.md` 与 `docs/AGENTS.md` 都写了这条分界。
 - **已知上限**：脚本只校验结构，不校验语义。「`## Alternatives considered` 里写的是不是真考虑过的方案」「`## Decision` 是不是现在时」这两件事永远是人的判断。不要把门禁全绿当成笔记写得好。
 
