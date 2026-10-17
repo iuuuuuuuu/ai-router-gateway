@@ -36,7 +36,9 @@ cargo test --release
 
 `.github/workflows/ci.yml` 在每次 push 到 `main` 与每个 PR 上跑 `cargo test --release --locked`（`windows-latest`）。它与本机命令的**唯一差别**是 `--locked`：`Cargo.lock` 与 `Cargo.toml` 不一致时直接失败，而不是在云端静默解析出一组新依赖。
 
-**★ CI 绿只代表这张表里的集成测试过了，不证明 I1 在真实实例上成立。** 真机验收（真实 `gw-server.exe` + 真实 Tauri 客户端 + 真实数据面请求）仍只在本机跑，见 §3。范围取舍与备选见 [.agents/notes/implemented/process/2026-10-17-ci-gates.md](../.agents/notes/implemented/process/2026-10-17-ci-gates.md)。
+**★ CI 绿只代表这张表里的集成测试过了，不证明 I1 在真实实例上成立。** 真机验收（真实 `gw-server.exe` + 真实 Tauri 客户端 + 真实数据面请求）仍只在本机跑，见 §3。CI 的范围取舍见 [DECISIONS.md](DECISIONS.md) D09 与其 2026-10-17 翻案说明。
+
+**★ CI 也顺带守一条本机守不住的东西：主机时区无关性。** `windows-latest` 的默认时区是 UTC，而开发机是 `+08:00`。凡是把本地时间写进断言、或用 `chrono::Local` 渲染却被拿来与固定偏移字符串比较的测试，本机永远绿、CI 红。首次上线 CI 时就抓到了一例（`since_from_days_is_an_exact_rfc3339_boundary`）。**在断言里钉偏移（`FixedOffset` / `Utc`），不要让测试继承 `Local`。**
 
 ---
 

@@ -42,10 +42,9 @@
 | 2026-10-17 之前 | [DECISIONS.md](DECISIONS.md) 的 `D01`–`D17` | **冻结只读**：不再新增，也不因新决策改写旧条目正文；被推翻时在该条末尾加一行翻案说明并链到新笔记 |
 | 2026-10-17 起 | [../.agents/notes/](../.agents/notes/) | 路径即状态与分类，带脚本门禁（CI 里跑） |
 
-笔记树的结构、`{lifecycle}/{class}` 封闭集、什么必须写 / 什么不写、以及三条门禁命令，见
-[.agents/notes/implemented/process/2026-10-17-agent-notes-adoption.md](../.agents/notes/implemented/process/2026-10-17-agent-notes-adoption.md)；
-CI 跑哪些门禁、为什么不跑真机验收，见
-[.agents/notes/implemented/process/2026-10-17-ci-gates.md](../.agents/notes/implemented/process/2026-10-17-ci-gates.md)。
+笔记树的规范（`{lifecycle}/{class}` 封闭集、什么必须写 / 什么不写、三条门禁命令）以
+[.agents/skills/agent-notes/SKILL.md](../.agents/skills/agent-notes/SKILL.md) 为准；
+本仓库跑哪些门禁、为什么不跑真机验收，见 [AGENTS.md](AGENTS.md) §5.5 与 [TESTING.md](TESTING.md) §0.1。
 
 ## 写文档的约定
 

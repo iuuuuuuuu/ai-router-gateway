@@ -10,30 +10,55 @@
  * 退出码：全部注入都按预期变红、对照副本为绿 → 0；任何一条没按预期 → 1。
  *
  * 无本机路径、无网络、无外部依赖；只在系统临时目录里建副本，跑完即删。
+ * 注入样本是**自合成的**，不读仓库里的真实笔记 —— 笔记树可以是空的，
+ * 元门禁必须照样能证明门禁会红。
  */
 import { execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const scriptsDir = join(repoRoot, ".agents", "skills", "agent-notes", "scripts");
-const realNotes = join(repoRoot, ".agents", "notes");
+
+const SAMPLE_NAME = "2026-10-17-sample.md";
 
 /**
- * 注入用的样本笔记：取 implemented/process/ 下第一篇。
- * 不写死文件名 —— 笔记会改名或归档，写死会让元门禁随笔记树一起腐烂。
+ * 合成一篇「格式合法」的 implemented 笔记。
+ *
+ * 刻意不读仓库里的真实笔记：笔记树允许为空，而元门禁的职责是证明
+ * 「三条校验脚本会红」，这件事与仓库当前有没有笔记无关。早期版本从
+ * `implemented/process/` 里挑一篇真笔记当样本，清空笔记树后它直接崩了 ——
+ * 元门禁随被检查对象一起腐烂，正是它要防的那种假。
  */
-function pickSample() {
-  const dir = join(realNotes, "implemented", "process");
-  const file = readdirSync(dir).filter((n) => n.endsWith(".md")).sort()[0];
-  if (!file) throw new Error("implemented/process/ 下没有笔记，元门禁没有可注入的样本");
-  return join(dir, file);
+function sampleText(title = "注入样本", body = "样本正文。") {
+  return [
+    `# Agent Note: ${title}`,
+    "",
+    "Status: implemented",
+    "",
+    "## Problem",
+    "",
+    "元门禁用的合成样本。",
+    "",
+    "## Decision",
+    "",
+    body,
+    "",
+    "## Alternatives considered",
+    "",
+    "- **不合成样本，改用仓库里的真笔记。** 理由是真笔记天然符合格式，样本不会写错；"
+      + "但笔记树允许为空，清空后元门禁会因为没有样本而崩，等于让被检查对象决定检查器能不能跑。",
+    "",
+    "## Consequences",
+    "",
+    "- **收益**：元门禁与笔记树内容解耦。",
+    "- **代价**：样本与真实笔记的格式会漂移；靠 `verify-agent-note-format.ts` 的对照步骤兜住。",
+    "",
+  ].join("\n");
 }
 
-const sample = pickSample();
-const SAMPLE_NAME = basename(sample);
 const work = mkdtempSync(join(tmpdir(), "notes-gate-inject-"));
 let failures = 0;
 
@@ -52,16 +77,12 @@ function runGate(script, notesRoot) {
   }
 }
 
-/**
- * 重建一份干净笔记副本：整份 implemented/process/ 都拷过去。
- * 只拷单篇会让「笔记间相对链接」那一步一上来就红（它引用的兄弟篇不在副本里），
- * 于是死链注入会「红得对、但红错了原因」—— 那不是有效的故障注入。
- */
+/** 重建一份干净笔记副本：合成一篇格式合法的样本笔记。 */
 function seed() {
   const root = join(work, "notes");
   rmSync(root, { recursive: true, force: true });
-  mkdirSync(join(root, "implemented"), { recursive: true });
-  cpSync(join(realNotes, "implemented", "process"), join(root, "implemented", "process"), { recursive: true });
+  mkdirSync(join(root, "implemented", "process"), { recursive: true });
+  writeFileSync(join(root, "implemented", "process", SAMPLE_NAME), sampleText(), "utf8");
   return root;
 }
 
@@ -84,13 +105,13 @@ function append(file, text) {
 }
 
 try {
-  // 0. 对照：未经注入的副本必须全绿。若这一步就红，后面所有「红」都不算数。
+  // 0. 对照：未经注入的合成副本必须全绿。若这一步就红，后面所有「红」都不算数。
+  //    同时它也是「合成的样本本身格式合法」的证明 —— 样本写错会让每条注入
+  //    都「红得对但红错了原因」。
   {
-    const root = join(work, "notes");
-    rmSync(root, { recursive: true, force: true });
-    cpSync(realNotes, root, { recursive: true });
-    check("control: 真实笔记副本", "verify-agent-note-tree.ts", root, "green");
-    check("control: 真实笔记副本", "verify-agent-note-format.ts", root, "green");
+    const root = seed();
+    check("control: 未注入的合成样本", "verify-agent-note-tree.ts", root, "green");
+    check("control: 未注入的合成样本", "verify-agent-note-format.ts", root, "green");
   }
 
   // 1. tree —— 未知 class 目录（空目录不构成笔记，必须放一篇进去）

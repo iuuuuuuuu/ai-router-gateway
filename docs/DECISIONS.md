@@ -144,7 +144,9 @@ Node 那列是**裸 http server**（未装依赖）；真实 Fastify + SQLite �
 
 **何时该翻案**：某条真机探针被改造成无 GUI、参数化、不含本机凭据（`tools/start-client.mjs` 是先例）时，把**那一条**搬进 CI；服务端真要支持 Linux 时再加 Linux job，但必须先在 WSL 上跑绿再上云。
 
-> **2026-10-17 翻案说明**：原文结论是「仓库没有 CI」。按其自身写的翻案条件（「探针能在无 GUI 环境稳定复现核心断言时，把**那部分**搬进 CI」），本次接入 CI 的是 `cargo test --release` 与笔记门禁，**GUI 真机验收仍留在本机** —— 原文关于「真机验收不能搬上云端」的结论未变。决策与备选的完整理由见 [.agents/notes/implemented/process/2026-10-17-ci-gates.md](../.agents/notes/implemented/process/2026-10-17-ci-gates.md)。
+> **2026-10-17 翻案说明**：原文结论是「仓库没有 CI」。按其自身写的翻案条件（「探针能在无 GUI 环境稳定复现核心断言时，把**那部分**搬进 CI」），本次接入 CI 的是 `cargo test --release --locked` 与笔记门禁，**GUI 真机验收仍留在本机** —— 原文关于「真机验收不能搬上云端」的结论未变。
+>
+> **首次上线即兑现了它的价值**：`windows-latest` 默认时区是 UTC，而开发机是 `+08:00`，CI 当场抓到 `store::tests::since_from_days_is_an_exact_rfc3339_boundary` 把主机时区写进了断言 —— 这条缺陷在本机永远绿。修法是让 `since_from_days` 泛型化、测试钉 `FixedOffset`，见 [TESTING.md](TESTING.md) §0.1。
 
 ---
 

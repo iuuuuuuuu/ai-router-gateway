@@ -1,4 +1,4 @@
-# 仓库门禁（见 docs/DECISIONS.md D09 的 2026-10-17 翻案、.agents/notes/implemented/process/2026-10-17-ci-gates.md）。
+# 仓库门禁（见 docs/DECISIONS.md D09 的 2026-10-17 翻案说明）。
 #
 # 只跑「本机与云端等价」的两类门禁：
 #   1. Agent Note 三线校验（目录/格式/归档封印）——纯文本校验，不需要 GUI 与真实上游。

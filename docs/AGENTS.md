@@ -149,9 +149,9 @@ loop guard 另加一条 **I6**：提交后命中退化时，客户端已收到�
 
 ### 5.5 决策笔记（`.agents/notes/`）与 CI
 
-**决策记录分两处，按首次提出日分界**：2026-10-17 之前的在 [DECISIONS.md](DECISIONS.md)（`D01`–`D17`，**冻结只读**，被推翻时在该条末尾加翻案说明）；之后的写 [../.agents/notes/](../.agents/notes/)。同一个决策只登记一处。分工理由见 [笔记树引入笔记](../.agents/notes/implemented/process/2026-10-17-agent-notes-adoption.md)。
+**决策记录分两处，按首次提出日分界**：2026-10-17 之前的在 [DECISIONS.md](DECISIONS.md)（`D01`–`D17`，**冻结只读**，被推翻时在该条末尾加翻案说明）；之后的写 [../.agents/notes/](../.agents/notes/)。同一个决策只登记一处。
 
-**笔记结构**：`.agents/notes/{proposed,implemented,rejected,archived}/{feature,bug-fix,simplification,architecture,process,testing}/yyyy-mm-dd-topic.md`。路径即状态与分类；`archived/` 由 `manifest.json` 做 SHA-256 封印，**冻结不可改**。规范全文在 `.agents/skills/agent-notes/`（随仓库分发，不用另装）。
+**笔记结构**：`.agents/notes/{proposed,implemented,rejected,archived}/{feature,bug-fix,simplification,architecture,process,testing}/yyyy-mm-dd-topic.md`。路径即状态与分类；`archived/` 由 `manifest.json` 做 SHA-256 封印，**冻结不可改**。**规范以 [.agents/skills/agent-notes/SKILL.md](../.agents/skills/agent-notes/SKILL.md) 为准**（随仓库分发，不用另装），本页只写本仓库的落地约定。
 
 **什么必须写**：改了行为、架构、跨文件契约、流程与工具链、测试策略、落盘 / 网络 / 配置格式，或其他维护者日后可能重访的决定。**什么不写**：纯格式化、错别字、无歧义重命名、不改行为的样式与依赖补丁、版本打标、常规 CRUD、单模块内看 diff 即懂的修复。判不准时从严。
 
@@ -163,7 +163,7 @@ node .agents/skills/agent-notes/scripts/verify-agent-note-format.ts
 node .agents/skills/agent-notes/scripts/verify-archived-agent-notes.ts
 ```
 
-**CI 跑什么**（`.github/workflows/ci.yml`）：笔记三线校验 + `node tools/verify-notes-gates.mjs`（元门禁：逐条故障注入证明那三条真的会变红）在 ubuntu；`cargo test --release --locked` 在 windows。**★ CI 绿不等于可以发版** —— 真机验收仍只在本机跑，发版前置见 [RUNBOOK.md](RUNBOOK.md) §1.1。CI 的范围边界与备选见 [CI 门禁笔记](../.agents/notes/implemented/process/2026-10-17-ci-gates.md)。
+**CI 跑什么**（`.github/workflows/ci.yml`）：笔记三线校验 + `node tools/verify-notes-gates.mjs`（元门禁：逐条故障注入证明那三条真的会变红）在 ubuntu；`cargo test --release --locked` 在 windows。**★ CI 绿不等于可以发版** —— 真机验收仍只在本机跑，发版前置见 [RUNBOOK.md](RUNBOOK.md) §1.1。为什么真机验收不上云、为什么加 `--locked`，见 [DECISIONS.md](DECISIONS.md) D09 与其 2026-10-17 翻案说明。
 
 ## 6. 不要做的事
 
