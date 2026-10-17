@@ -73,7 +73,7 @@ cargo test --release    # 主门禁
 
 | 文件 | 说明 |
 |---|---|
-| `gw-client_0.4.7_x64-setup.exe` | 桌面控制台 NSIS 安装包（内含 `gw-server` sidecar，安装后托盘常驻、可开机自启） |
+| `gw-client_0.4.8_x64-setup.exe` | 桌面控制台 NSIS 安装包（内含 `gw-server` sidecar，安装后托盘常驻、可开机自启） |
 | `gw-server-x86_64-pc-windows-msvc.exe` | 仅服务端，裸跑用（见上「快速开始」） |
 | `SHA256SUMS.txt` | 上述文件的 SHA256 校验和 |
 
