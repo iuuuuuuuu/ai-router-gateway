@@ -165,7 +165,13 @@ fn build_filters(request_id: Option<&str>, group_id: Option<&str>, since: Option
 /// Kept as a pure function of an explicit `now` so the boundary is unit
 /// testable without a clock: a test that called `Local::now()` itself would
 /// race the millisecond it asserts on.
-pub fn since_from_days(days: Option<u32>, now: chrono::DateTime<chrono::Local>) -> Option<String> {
+///
+/// Generic over the time zone so a test can pin the offset instead of
+/// inheriting the host's. That matters because the cutoff is rendered with the
+/// SAME offset the caller's rows were written with (the string comparison above
+/// assumes one shared offset): a test asserting a `+08:00` literal against a
+/// `Local`-rendered cutoff passes on a +08:00 machine and fails on a UTC runner.
+pub fn since_from_days<Z: chrono::TimeZone>(days: Option<u32>, now: chrono::DateTime<Z>) -> Option<String> {
     let d = days?;
     if d == 0 {
         return None;
@@ -1051,11 +1057,18 @@ mod tests {
     /// `since_from_days` is the whole time-filter boundary: it must produce a
     /// cutoff that is EXACTLY `days` before `now`, in the same RFC3339-millis
     /// shape `routes::iso_now` writes (the string comparison depends on it).
+    ///
+    /// The offset is PINNED to +08:00 rather than inherited from `Local`.
+    /// The cutoff is rendered in whatever zone `now` carries, so a test that
+    /// used `Local` while asserting a `+08:00` literal passed on a +08:00
+    /// machine and failed on a UTC CI runner — it tested the host, not the
+    /// function.
     #[test]
     fn since_from_days_is_an_exact_rfc3339_boundary() {
+        let plus8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-16T12:00:00.000+08:00")
             .unwrap()
-            .with_timezone(&chrono::Local);
+            .with_timezone(&plus8);
         let one = since_from_days(Some(1), now).unwrap();
         assert_eq!(one, "2026-10-15T12:00:00.000+08:00");
         let seven = since_from_days(Some(7), now).unwrap();
@@ -1064,6 +1077,16 @@ mod tests {
         // keeps every pre-existing caller's result identical.
         assert_eq!(since_from_days(None, now), None);
         assert_eq!(since_from_days(Some(0), now), None);
+
+        // The rendered offset follows the caller's zone, and UTC renders as
+        // `Z`. Without this the test above could be satisfied by a function
+        // that hardcoded `+08:00` instead of formatting the given instant.
+        // 2026-10-16T04:00:00+08:00 is the same instant as 2026-10-15T20:00:00Z,
+        // so one day earlier is 2026-10-14T20:00:00Z.
+        let utc_now = chrono::DateTime::parse_from_rfc3339("2026-10-16T04:00:00.000+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(since_from_days(Some(1), utc_now).unwrap(), "2026-10-14T20:00:00.000Z");
     }
 
     /// The window really excludes older rows, and really keeps newer ones.
@@ -1073,10 +1096,14 @@ mod tests {
     fn a_days_window_includes_recent_rows_and_excludes_old_ones() {
         let st = Store::open_memory().unwrap();
         // Fixed instants; the cutoff is computed from a fixed `now` too, so the
-        // assertion cannot race the clock.
+        // assertion cannot race the clock. The offset is pinned to +08:00 to
+        // match the offset the rows below are written with: `build_filters`
+        // compares `ts` as a STRING, so a cutoff rendered in a different zone
+        // would be comparing two different calendars.
+        let plus8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-16T12:00:00.000+08:00")
             .unwrap()
-            .with_timezone(&chrono::Local);
+            .with_timezone(&plus8);
         st.insert_request_log(&req_log_at("2026-10-16T11:00:00.000+08:00", "g1", 1.0)).unwrap(); // 1h ago
         st.insert_request_log(&req_log_at("2026-10-10T12:00:00.000+08:00", "g1", 8.0)).unwrap(); // 6d ago
         st.insert_request_log(&req_log_at("2026-09-01T12:00:00.000+08:00", "g1", 64.0)).unwrap(); // 45d ago
@@ -1126,9 +1153,10 @@ mod tests {
     #[test]
     fn a_days_window_also_filters_the_log_pages_and_their_total() {
         let st = Store::open_memory().unwrap();
+        let plus8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-16T12:00:00.000+08:00")
             .unwrap()
-            .with_timezone(&chrono::Local);
+            .with_timezone(&plus8);
         let one = since_from_days(Some(1), now);
         st.insert_request_log(&req_log_at("2026-10-16T11:00:00.000+08:00", "g1", 1.0)).unwrap();
         st.insert_request_log(&req_log_at("2026-09-01T12:00:00.000+08:00", "g1", 64.0)).unwrap();
