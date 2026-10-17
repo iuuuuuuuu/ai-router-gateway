@@ -55,7 +55,7 @@ cargo test --release    # 主门禁
 | 我想…… | 翻这份 |
 |---|---|
 | **开始动手改代码** | [docs/AGENTS.md](docs/AGENTS.md) —— 开发入口（环境命令、硬约束、工作流、验证纪律） |
-| 知道「为什么当初这么选」/ 想推翻旧结论 | [docs/DECISIONS.md](docs/DECISIONS.md) |
+| 知道「为什么当初这么选」/ 想推翻旧结论 | [docs/DECISIONS.md](docs/DECISIONS.md)（2026-10-17 及之前）· [.agents/notes/](.agents/notes/)（之后） |
 | 发版、本机跑客户端、按现象排障、回滚 | [docs/RUNBOOK.md](docs/RUNBOOK.md) |
 | 写测试 / 跑验收 / 怀疑门禁是不是假的 | [docs/TESTING.md](docs/TESTING.md) |
 | 看用户可见行为规格 | [docs/FEATURES.md](docs/FEATURES.md) |

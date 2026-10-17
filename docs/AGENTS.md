@@ -111,7 +111,7 @@ loop guard 另加一条 **I6**：提交后命中退化时，客户端已收到�
 1. **先读文档**：本页 → 与改动相关的主题文档（[文档地图](README.md)）。
 2. **改代码**：改动范围只落在被指派的部分；连带影响可自主修掉，不相关的**不碰**。
 3. **写/改测试**：新能力必须有能**真的变红**的门禁（见 §5.1）。改判定阈值 → 同步钉住该数字的测试。
-4. **同步文档**：行为变化 → [FEATURES.md](FEATURES.md)；决策变化 → [DECISIONS.md](DECISIONS.md)；流程变化 → [RUNBOOK.md](RUNBOOK.md)。
+4. **同步文档**：行为变化 → [FEATURES.md](FEATURES.md)；决策变化 → 2026-10-17 之前的写 [DECISIONS.md](DECISIONS.md)，之后写 [../.agents/notes/](../.agents/notes/)（见 §5.5）；流程变化 → [RUNBOOK.md](RUNBOOK.md)。
 5. **提交**：见 §5.3（显式列路径，禁 `git add -A`）。
 6. **发版**：见 [RUNBOOK.md](RUNBOOK.md)。
 
@@ -147,6 +147,24 @@ loop guard 另加一条 **I6**：提交后命中退化时，客户端已收到�
 
 **小心 / 不误删 / 不扩大范围。** 只删点名的那一个对象；删前确认**解析后的绝对路径**（防 junction / 符号链接穿透）；批量清理的匹配条件**必须锚定本仓库路径**，绝不用通用文件名（如 `node.exe` / `vite.js`）作唯一条件；**先列清单再执行**，不得「先杀后核」。
 
+### 5.5 决策笔记（`.agents/notes/`）与 CI
+
+**决策记录分两处，按首次提出日分界**：2026-10-17 之前的在 [DECISIONS.md](DECISIONS.md)（`D01`–`D17`，**冻结只读**，被推翻时在该条末尾加翻案说明）；之后的写 [../.agents/notes/](../.agents/notes/)。同一个决策只登记一处。分工理由见 [笔记树引入笔记](../.agents/notes/implemented/process/2026-10-17-agent-notes-adoption.md)。
+
+**笔记结构**：`.agents/notes/{proposed,implemented,rejected,archived}/{feature,bug-fix,simplification,architecture,process,testing}/yyyy-mm-dd-topic.md`。路径即状态与分类；`archived/` 由 `manifest.json` 做 SHA-256 封印，**冻结不可改**。规范全文在 `.agents/skills/agent-notes/`（随仓库分发，不用另装）。
+
+**什么必须写**：改了行为、架构、跨文件契约、流程与工具链、测试策略、落盘 / 网络 / 配置格式，或其他维护者日后可能重访的决定。**什么不写**：纯格式化、错别字、无歧义重命名、不改行为的样式与依赖补丁、版本打标、常规 CRUD、单模块内看 diff 即懂的修复。判不准时从严。
+
+**三条门禁命令**（仓库根执行，Node 24+ 原生跑 TS，无需装依赖）：
+
+```bash
+node .agents/skills/agent-notes/scripts/verify-agent-note-tree.ts
+node .agents/skills/agent-notes/scripts/verify-agent-note-format.ts
+node .agents/skills/agent-notes/scripts/verify-archived-agent-notes.ts
+```
+
+**CI 跑什么**（`.github/workflows/ci.yml`）：笔记三线校验 + `node tools/verify-notes-gates.mjs`（元门禁：逐条故障注入证明那三条真的会变红）在 ubuntu；`cargo test --release --locked` 在 windows。**★ CI 绿不等于可以发版** —— 真机验收仍只在本机跑，发版前置见 [RUNBOOK.md](RUNBOOK.md) §1.1。CI 的范围边界与备选见 [CI 门禁笔记](../.agents/notes/implemented/process/2026-10-17-ci-gates.md)。
+
 ## 6. 不要做的事
 
 - 不要为了「看起来更完整」而补文档章节 —— 只写读不出来的。
@@ -155,3 +173,5 @@ loop guard 另加一条 **I6**：提交后命中退化时，客户端已收到�
 - 不要用 `node_modules/.bin` 的 shim 跑批量构建（§2.1）。
 - 不要把本机绝对路径、真实密钥、探针产物写进仓库文件。
 - 不要在没有授权时推远端或开 PR。
+- **不要把「CI 绿」当成「测过了」**，也不要给 CI 加 `|| true` / `continue-on-error` 之类的软化（§5.1）。
+- **不要改写 `archived/` 里的笔记**（封印会红），也不要绕过笔记门禁提交。

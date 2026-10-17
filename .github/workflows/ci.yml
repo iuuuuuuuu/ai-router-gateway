@@ -1,0 +1,81 @@
+# 仓库门禁（见 docs/DECISIONS.md D09 的 2026-10-17 翻案、.agents/notes/implemented/process/2026-10-17-ci-gates.md）。
+#
+# 只跑「本机与云端等价」的两类门禁：
+#   1. Agent Note 三线校验（目录/格式/归档封印）——纯文本校验，不需要 GUI 与真实上游。
+#   2. cargo test --release —— 主门禁，假上游走 127.0.0.1 真 socket，不依赖外网。
+# ★ 真机验收（真实 gw-server.exe + 真实 Tauri 客户端 + 真实数据面请求）仍在 Windows 本机跑，
+#   云端 CI 跑不出同等证据，不许拿本工作流冒充它。
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  agent-notes:
+    name: Agent notes gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 归档封印要与「变更前」的 manifest 对比，浅克隆拿不到基线。
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # Node 24 原生剥离 TS 类型，脚本无需安装任何依赖（仓库无根 package.json）。
+      # 三个脚本各自非零退出即整步失败；不要用 `|| true` 或 `;` 串联。
+      - name: Verify note tree
+        run: node .agents/skills/agent-notes/scripts/verify-agent-note-tree.ts
+
+      - name: Verify note format
+        run: node .agents/skills/agent-notes/scripts/verify-agent-note-format.ts
+
+      - name: Verify archive seals
+        env:
+          # 默认 HEAD 在干净检出上等于「与自身对比」，查不出 append-only 违规。
+          # PR 用 base sha；push 用上一个 tip（新分支推送为全 0，脚本会跳过该段）。
+          AGENT_NOTE_ARCHIVE_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node .agents/skills/agent-notes/scripts/verify-archived-agent-notes.ts
+
+      # 元门禁：对上面三条脚本逐条做故障注入，证明它们真的会变红。
+      # 一条恒 exit 0 的校验与一条真的校验，在「跑绿了」上长得一模一样；
+      # 没有这一步，上面三步全绿也可能什么也没验证。
+      - name: Prove the note gates can actually fail
+        run: node tools/verify-notes-gates.mjs
+
+  server-tests:
+    name: Server tests (cargo test --release)
+    runs-on: windows-latest
+    defaults:
+      run:
+        # 仓库根没有 Cargo.toml；cargo 必须在 server/ 下跑。
+        working-directory: server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      # --locked：Cargo.lock 与 Cargo.toml 不一致时直接失败，而不是在 CI 里静默改依赖版本。
+      - name: cargo test --release
+        run: cargo test --release --locked

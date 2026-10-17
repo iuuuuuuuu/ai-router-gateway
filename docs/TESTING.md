@@ -12,24 +12,31 @@ cd server
 cargo test --release
 ```
 
-**2026-10-15 实测结果：170 passed / 0 failed / 0 ignored**。
+**2026-10-17 实测结果：202 passed / 0 failed / 0 ignored**（本机 `cargo test --release --locked`，退出码 0）。
 
-共 12 个测试目标（`lib.rs` + `main.rs` + 9 个集成测试文件 + doc-tests；其中 `main.rs` 与 doc-tests 各 0 用例）。有用例的分项：
+共 13 个测试目标（`lib.rs` + `main.rs` + 10 个集成测试文件 + doc-tests；其中 `main.rs` 与 doc-tests 各 0 用例）。有用例的分项：
 
 | 目标 | 条数 | 覆盖 |
 |---|---|---|
-| `unittests src/lib.rs` | 47 | `loopguard` 判定 + `proxy` + `inflight` + `routes` + `store` |
+| `unittests src/lib.rs` | 68 | `loopguard` 判定 + `proxy` + `inflight` + `routes` + `store` |
 | `channel_models` | 13 | 上游 models 拉取（空列表 vs 不可识别载荷、超时、去重） |
 | `exposed_auto` | 7 | 暴露模型按成员自动派生 |
 | `group_overrides` | 9 | 组级覆盖与 I4 校验 |
-| `group_wildcard` | 5 | 通配路由（含 **EXACT WINS**） |
+| `group_wildcard` | 8 | 通配路由（含 **EXACT WINS**） |
+| `holdback_cap` | 3 | 提交前暂存上限（`loop_guard_tail_chars` 与纠正轮数共同约束） |
 | `inflight` | 10 | 实时并发计数 |
-| `loopguard` | 22 | R1–R6 判定、钳位、纠正路径 |
+| `loopguard` | 27 | R1–R6 判定、钳位、纠正路径 |
 | `matrix` | 31 | 500/429/401/404/hang/垃圾/空体/流中断/错误帧/EOF 提前/tier 循环/日志成本精确断言/I4 校验与 clamp/空库统计 |
 | `reasoning` | 12 | 思考透传（同协议回放 / 跨协议翻译 / 边界） |
 | `roundtrip` | 14 | 3 协议 buffered+stream + 4 跨协议组合 + 4 工具调用参数保真 |
 
 ★ 跑之前先确认**工作树状态**：有在途未提交改动时，「在某个提交上跑测试」实际测的是**工作树**。要证明「修复前应当红」的红基线，必须用 `git worktree add` 检出纯净副本再跑。
+
+### 0.1 云端 CI 跑什么、不跑什么
+
+`.github/workflows/ci.yml` 在每次 push 到 `main` 与每个 PR 上跑 `cargo test --release --locked`（`windows-latest`）。它与本机命令的**唯一差别**是 `--locked`：`Cargo.lock` 与 `Cargo.toml` 不一致时直接失败，而不是在云端静默解析出一组新依赖。
+
+**★ CI 绿只代表这张表里的集成测试过了，不证明 I1 在真实实例上成立。** 真机验收（真实 `gw-server.exe` + 真实 Tauri 客户端 + 真实数据面请求）仍只在本机跑，见 §3。范围取舍与备选见 [.agents/notes/implemented/process/2026-10-17-ci-gates.md](../.agents/notes/implemented/process/2026-10-17-ci-gates.md)。
 
 ---
 

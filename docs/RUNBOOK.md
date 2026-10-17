@@ -67,7 +67,8 @@ cd ../client; pnpm tauri build
 | 安装包文件名 | `README.md`「下载与安装」表 |
 | 新版本能力与版本表 | `docs/方案.md`（版本表 + 新增能力章节） |
 | 用户可见行为变化 | `docs/FEATURES.md` |
-| 决策变化 | `docs/DECISIONS.md` |
+| 决策变化（2026-10-17 之前） | `docs/DECISIONS.md` |
+| 决策变化（2026-10-17 起） | `.agents/notes/`（见 [AGENTS.md](AGENTS.md) §5.5） |
 | 发版流程变化 | 本文件 |
 
 ---

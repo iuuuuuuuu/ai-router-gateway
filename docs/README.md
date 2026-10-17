@@ -8,7 +8,7 @@
 | 我想…… | 翻这份 |
 |---|---|
 | **开始动手改代码** | [AGENTS.md](AGENTS.md) —— 开发入口，开工第一件事 |
-| 知道「为什么当初这么选」/ 想推翻旧结论 | [DECISIONS.md](DECISIONS.md) |
+| 知道「为什么当初这么选」/ 想推翻旧结论 | [DECISIONS.md](DECISIONS.md)（2026-10-17 及之前的决策）· [../.agents/notes/](../.agents/notes/)（之后的决策，见下「决策记录怎么分家」） |
 | 发版、在本机把客户端跑起来、按现象排障、回滚 | [RUNBOOK.md](RUNBOOK.md) |
 | 写测试 / 跑验收 / 怀疑门禁是不是假的 | [TESTING.md](TESTING.md) |
 | 改用户能看见的行为之前对齐语义 | [FEATURES.md](FEATURES.md) |
@@ -31,6 +31,21 @@
 | [loopguard-spec.md](loopguard-spec.md) | 死循环输出拦截规格（判定语义、诚实边界） | 改 loopguard 时 |
 | [reasoning-passthrough-spec.md](reasoning-passthrough-spec.md) | 思考透传规格（同协议回放 / 跨协议翻译 / 边界） | 改思考字段时 |
 | [review/](review/) | 三篇历史审查（选型、落地、事故复盘） | **只追加不改写**；结论过时在 DECISIONS.md 里翻案 |
+| [../.agents/notes/](../.agents/notes/) | Agent Notes 决策笔记树：`{proposed,implemented,rejected,archived}/{分类}/` | 新增决策时（见下「决策记录怎么分家」） |
+
+## 决策记录怎么分家（2026-10-17 起）
+
+仓库有**两套**决策记录，按**首次提出日**分界，同一个决策只登记一处：
+
+| 首次提出日 | 记在哪 | 形态 |
+|---|---|---|
+| 2026-10-17 之前 | [DECISIONS.md](DECISIONS.md) 的 `D01`–`D17` | **冻结只读**：不再新增，也不因新决策改写旧条目正文；被推翻时在该条末尾加一行翻案说明并链到新笔记 |
+| 2026-10-17 起 | [../.agents/notes/](../.agents/notes/) | 路径即状态与分类，带脚本门禁（CI 里跑） |
+
+笔记树的结构、`{lifecycle}/{class}` 封闭集、什么必须写 / 什么不写、以及三条门禁命令，见
+[.agents/notes/implemented/process/2026-10-17-agent-notes-adoption.md](../.agents/notes/implemented/process/2026-10-17-agent-notes-adoption.md)；
+CI 跑哪些门禁、为什么不跑真机验收，见
+[.agents/notes/implemented/process/2026-10-17-ci-gates.md](../.agents/notes/implemented/process/2026-10-17-ci-gates.md)。
 
 ## 写文档的约定
 
