@@ -193,7 +193,76 @@ try {
     check("Archived 行没紧邻 Status", "verify-archived-agent-notes.ts", root, "red");
   }
 
-  // 10. 元注入：把校验脚本换成恒 exit 0 的桩，注入器必须报 FAIL。
+  // 10. 0.4.1 新增行为 —— 必须被接受，不能被误杀。
+  //     每一条都同时是「旧版会红、新版才绿」的证据：若校验脚本回退到旧逻辑，
+  //     这些正向用例立刻变红，所以它们不是走过场。
+  {
+    // tree：CommonMark 尖括号目标 [text](<path>)。旧版不剥 <>，会把
+    // "<../...>" 当成字面路径解析，对已存在的文件也报死链。
+    const root = seed();
+    mkdirSync(join(root, "implemented", "process"), { recursive: true });
+    writeFileSync(join(root, "implemented", "process", "2026-10-18-sibling.md"), sampleText("兄弟篇"), "utf8");
+    append(
+      join(root, "implemented", "process", SAMPLE_NAME),
+      "\n见 [兄弟篇](<./2026-10-18-sibling.md>)\n",
+    );
+    check("尖括号目标指向存在的笔记（旧版会误报死链）", "verify-agent-note-tree.ts", root, "green");
+  }
+
+  {
+    // tree：尖括号目标指向不存在的文件 —— 剥掉 <> 之后仍然必须判死链，
+    // 不能因为「支持尖括号」就把校验放宽成跳过。
+    const root = seed();
+    append(
+      join(root, "implemented", "process", SAMPLE_NAME),
+      "\n见 [不存在](<./2099-01-01-nope.md>)\n",
+    );
+    check("尖括号目标指向不存在的笔记", "verify-agent-note-tree.ts", root, "red");
+  }
+
+  {
+    // format：## 后果与边界 是 ## Consequences 的合法别名。
+    const root = seed();
+    const f = join(root, "implemented", "process", SAMPLE_NAME);
+    writeFileSync(f, readFileSync(f, "utf8").replace(/^## Consequences$/m, "## 后果与边界"), "utf8");
+    check("## 后果与边界 被接受为 Consequences", "verify-agent-note-format.ts", root, "green");
+  }
+
+  {
+    // format：## 其他做法 是备选方案节的合法别名。
+    const root = seed();
+    const f = join(root, "implemented", "process", SAMPLE_NAME);
+    writeFileSync(f, readFileSync(f, "utf8").replace(/^## Alternatives considered$/m, "## 其他做法"), "utf8");
+    check("## 其他做法 被接受为备选方案", "verify-agent-note-format.ts", root, "green");
+  }
+
+  {
+    // archived：archived/AGENTS.md 是目录说明，不是被封的笔记，必须跳过。
+    // 旧版会把它当归档笔记查头部布局（要求 L3 Status / L4 Archived），必然报错。
+    const root = join(work, "notes");
+    rmSync(root, { recursive: true, force: true });
+    mkdirSync(join(root, "archived"), { recursive: true });
+    writeFileSync(join(root, "archived", "AGENTS.md"), "# 归档目录说明\n\n这里放已封存的笔记。\n", "utf8");
+    check("archived/AGENTS.md 被跳过（不是归档笔记）", "verify-archived-agent-notes.ts", root, "green");
+  }
+
+  // 11. 版本锚：`.synced-version` 必须存在且是形如 0.4.1 的版本号。
+  //     它本身不证明「副本是最新的」，但副本被手工改动却忘了同步版本号时，
+  //     至少这里还能看出记录的是哪一版；没有它，漂移完全不可追溯。
+  {
+    const verFile = join(repoRoot, ".agents", "skills", "agent-notes", ".synced-version");
+    let ver = "";
+    try {
+      ver = readFileSync(verFile, "utf8").trim();
+    } catch {
+      ver = "";
+    }
+    const ok = /^\d+\.\d+\.\d+$/.test(ver);
+    console.log(`${ok ? "PASS" : "FAIL"}  version .synced-version = ${ver || "<缺失>"}`);
+    if (!ok) failures += 1;
+  }
+
+  // 12. 元注入：把校验脚本换成恒 exit 0 的桩，注入器必须报 FAIL。
   //     没有这一步，本脚本自己就可能是假绿（永远打印 PASS）。
   {
     const stubDir = join(work, "stub");

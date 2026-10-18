@@ -43,8 +43,16 @@
 | 2026-10-17 起 | [../.agents/notes/](../.agents/notes/) | 路径即状态与分类，带脚本门禁（CI 里跑） |
 
 笔记树的规范（`{lifecycle}/{class}` 封闭集、什么必须写 / 什么不写、三条门禁命令）以
-[.agents/skills/agent-notes/SKILL.md](../.agents/skills/agent-notes/SKILL.md) 为准；
+[.agents/skills/agent-notes/SKILL.md](../.agents/skills/agent-notes/SKILL.md) 为准（副本版本 `.agents/skills/agent-notes/.synced-version` = `0.4.1`）；
 本仓库跑哪些门禁、为什么不跑真机验收，见 [AGENTS.md](AGENTS.md) §5.5 与 [TESTING.md](TESTING.md) §0.1。
+
+现有笔记（写新笔记前先看这三篇的行文与结构）：
+
+| 笔记 | 内容 |
+|---|---|
+| [CI 门禁的范围](../.agents/notes/implemented/process/2026-10-17-ci-gates.md) | 为什么只上两类门禁、为什么真机验收不进 CI、`--locked` 的理由 |
+| [主机时区无关性](../.agents/notes/implemented/bug-fix/2026-10-17-timezone-portability.md) | CI 首次变红抓到的测试缺陷，以及「测试不许继承 `Local`」这条约束 |
+| [笔记树与门禁的落地形态](../.agents/notes/implemented/process/2026-10-18-notes-gates.md) | 笔记如何填充、规范副本如何升级、元门禁覆盖哪些行为 |
 
 ## 写文档的约定
 

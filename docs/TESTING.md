@@ -38,7 +38,9 @@ cargo test --release
 
 **★ CI 绿只代表这张表里的集成测试过了，不证明 I1 在真实实例上成立。** 真机验收（真实 `gw-server.exe` + 真实 Tauri 客户端 + 真实数据面请求）仍只在本机跑，见 §3。CI 的范围取舍见 [DECISIONS.md](DECISIONS.md) D09 与其 2026-10-17 翻案说明。
 
-**★ CI 也顺带守一条本机守不住的东西：主机时区无关性。** `windows-latest` 的默认时区是 UTC，而开发机是 `+08:00`。凡是把本地时间写进断言、或用 `chrono::Local` 渲染却被拿来与固定偏移字符串比较的测试，本机永远绿、CI 红。首次上线 CI 时就抓到了一例（`since_from_days_is_an_exact_rfc3339_boundary`）。**在断言里钉偏移（`FixedOffset` / `Utc`），不要让测试继承 `Local`。**
+**★ CI 也顺带守一条本机守不住的东西：主机时区无关性。** `windows-latest` 的默认时区是 UTC，而开发机是 `+08:00`。凡是把本地时间写进断言、或用 `chrono::Local` 渲染却被拿来与固定偏移字符串比较的测试，本机永远绿、CI 红。首次上线 CI 时就抓到了一例（`since_from_days_is_an_exact_rfc3339_boundary`）。**在断言里钉偏移（`FixedOffset` / `Utc`），不要让测试继承 `Local`。** 完整来龙去脉见 [主机时区无关性](../.agents/notes/implemented/bug-fix/2026-10-17-timezone-portability.md)。
+
+**另一个 job：笔记门禁**（`ubuntu-latest`）。跑三条笔记校验脚本，再跑 `node tools/verify-notes-gates.mjs` —— 后者是**元门禁**，对那三条脚本逐条做故障注入（未知分类、文件名不合规、死链、缺备选节、提案标题混进 implemented、Status 不符、缺 manifest、封印后篡改、归档头部布局错），每条都必须变红；另有对照副本必须为绿，以及一条「把脚本换成恒 `exit 0` 的桩、注入器必须识别」的自检。它还检查规范副本的 `.synced-version` 是合法版本号。细节见 [笔记树与门禁的落地形态](../.agents/notes/implemented/process/2026-10-18-notes-gates.md)。
 
 ---
 

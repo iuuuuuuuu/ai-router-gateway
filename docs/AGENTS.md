@@ -151,17 +151,21 @@ loop guard 另加一条 **I6**：提交后命中退化时，客户端已收到�
 
 **决策记录分两处，按首次提出日分界**：2026-10-17 之前的在 [DECISIONS.md](DECISIONS.md)（`D01`–`D17`，**冻结只读**，被推翻时在该条末尾加翻案说明）；之后的写 [../.agents/notes/](../.agents/notes/)。同一个决策只登记一处。
 
-**笔记结构**：`.agents/notes/{proposed,implemented,rejected,archived}/{feature,bug-fix,simplification,architecture,process,testing}/yyyy-mm-dd-topic.md`。路径即状态与分类；`archived/` 由 `manifest.json` 做 SHA-256 封印，**冻结不可改**。**规范以 [.agents/skills/agent-notes/SKILL.md](../.agents/skills/agent-notes/SKILL.md) 为准**（随仓库分发，不用另装），本页只写本仓库的落地约定。
+**笔记结构**：`.agents/notes/{proposed,implemented,rejected,archived}/{feature,bug-fix,simplification,architecture,process,testing}/yyyy-mm-dd-topic.md`。路径即状态与分类；`archived/` 由 `manifest.json` 做 SHA-256 封印，**冻结不可改**。**规范以 [.agents/skills/agent-notes/SKILL.md](../.agents/skills/agent-notes/SKILL.md) 为准**（随仓库分发的副本，版本见 `.agents/skills/agent-notes/.synced-version`，当前 `0.4.1`），本页只写本仓库的落地约定。
+
+**现有笔记**：[CI 门禁的范围](../.agents/notes/implemented/process/2026-10-17-ci-gates.md) · [主机时区无关性](../.agents/notes/implemented/bug-fix/2026-10-17-timezone-portability.md) · [笔记树与门禁的落地形态](../.agents/notes/implemented/process/2026-10-18-notes-gates.md)。写新笔记前先看这三篇的行文与结构，比读规范快。
 
 **什么必须写**：改了行为、架构、跨文件契约、流程与工具链、测试策略、落盘 / 网络 / 配置格式，或其他维护者日后可能重访的决定。**什么不写**：纯格式化、错别字、无歧义重命名、不改行为的样式与依赖补丁、版本打标、常规 CRUD、单模块内看 diff 即懂的修复。判不准时从严。
 
-**三条门禁命令**（仓库根执行，Node 24+ 原生跑 TS，无需装依赖）：
+**写完或改完任何笔记必须跑验证**，不得以「没配校验入口」为由跳过。三条命令在仓库根执行（Node 24+ 原生剥离 TS 类型，无需装依赖）：
 
 ```bash
 node .agents/skills/agent-notes/scripts/verify-agent-note-tree.ts
 node .agents/skills/agent-notes/scripts/verify-agent-note-format.ts
 node .agents/skills/agent-notes/scripts/verify-archived-agent-notes.ts
 ```
+
+**升级规范副本**：把上游的 `SKILL.md` / `scripts/` / `references/` / `templates/` 整份覆盖过来，更新 `.synced-version`，然后跑 `node tools/verify-notes-gates.mjs` —— 它会逐条故障注入，证明新脚本仍会变红。**不要手工改副本里的脚本**，改了就和上游分叉。
 
 **CI 跑什么**（`.github/workflows/ci.yml`）：笔记三线校验 + `node tools/verify-notes-gates.mjs`（元门禁：逐条故障注入证明那三条真的会变红）在 ubuntu；`cargo test --release --locked` 在 windows。**★ CI 绿不等于可以发版** —— 真机验收仍只在本机跑，发版前置见 [RUNBOOK.md](RUNBOOK.md) §1.1。为什么真机验收不上云、为什么加 `--locked`，见 [DECISIONS.md](DECISIONS.md) D09 与其 2026-10-17 翻案说明。
 
