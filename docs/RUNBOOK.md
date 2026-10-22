@@ -1,7 +1,7 @@
 # 运维与发版手册（RUNBOOK）
 
 > 发版、在本机把东西跑起来、按现象排障、回滚的**非显然步骤**。
-> 最后核对：2026-10-17。**已发布最新版 = v0.4.8**（tag 与 GitHub Release 都存在）。
+> 最后核对：2026-10-22。**已发布最新版 = v0.5.0**（tag 与 GitHub Release 都存在）。
 
 ---
 
@@ -12,6 +12,8 @@
 1. **完整实机测试**：本轮 diff 影响到的功能逐条真跑（见 [TESTING.md](TESTING.md)）。**编译过 / 单测绿 / SHA256 对得上都不算实测。**
 2. **自审代码逐行确认**。
 3. **测试或自审发现问题 → 先修好重测，不许带着问题发。**
+4. **确认要发版的那个提交上 CI 是绿的**（`gh run list`）。不要从一个 CI 红的提交上打标签。
+5. **只有 Windows 能在本机完整验证**：macOS / Linux 的安装包必须在 CI 的原生 runner 上产出，本机跑不出来（Linux 需要 webkit2gtk，macOS 的 dmg 需要 `hdiutil` 与 `lipo`）。所以「本机实测通过」只覆盖 Windows，另外两个平台的保证上限是 CI 的构建 + 冒烟门禁，见 [跨平台发布流水线](../.agents/notes/implemented/process/2026-10-22-cross-platform-release.md) 的诚实边界一节。
 
 ### 1.2 版本号要同步改四处（漏一处就出错）
 
@@ -22,9 +24,9 @@
 | `client/src-tauri/tauri.conf.json` | `version` |
 | `server/Cargo.lock` + `client/src-tauri/Cargo.lock` | 各自包的版本行 |
 
-漏改的后果：产物名（`gw-client_<版本>_x64-setup.exe`）与代码里的版本对不上。
+漏改的后果：产物名（`gw-client_<版本>_x64-setup.exe`）与代码里的版本对不上。这四处由 release 流水线的 `verify-version` job 自动比对，任一不一致直接失败——但**不要依赖它兜底**，本地先改齐。
 
-### 1.3 构建顺序
+### 1.3 构建顺序（本机，仅 Windows）
 
 ```powershell
 # 1) 服务端 release（产物就是 sidecar 的来源）
@@ -37,28 +39,60 @@ copy server\target\release\gw-server.exe client\src-tauri\binaries\gw-server-x86
 cd ../client; pnpm tauri build
 ```
 
-★ **sidecar 必须来自 `cargo build --release`**，不能随手拷一个 exe（历史上提交过非规范产物，见 [DECISIONS.md](DECISIONS.md) D12）。sidecar **入库**，随版本一起提交。
+★ **sidecar 必须来自 `cargo build --release`**，不能随手拷一个 exe（历史上提交过非规范产物，见 [DECISIONS.md](DECISIONS.md) D12）。sidecar **入库**，随版本一起提交——入库那份**只服务于本机开发**，CI 打包时一律现编，不复用它。
 
 ★ 脚本化构建**直接调 JS 入口**（`node node_modules/vite/bin/vite.js build` / `node node_modules/@tauri-apps/cli/tauri.js build`），绕开 `node_modules/.bin` shim（见 [AGENTS.md](AGENTS.md) §2.1）。本机的 `tools/_build-client.sh` 只是这两条命令的封装，**不入库**。
 
+★ 本机 pnpm 版本注意：`client/package.json` 的 `pnpm.onlyBuiltDependencies` 只有 **pnpm 10** 读，pnpm 11 会忽略它并让 esbuild 的安装脚本被拦（`ERR_PNPM_IGNORED_BUILDS`）。发版相关构建用 pnpm 10。
+
 产物位置：`client/src-tauri/target/release/bundle/nsis/gw-client_<版本>_x64-setup.exe`。
+
+### 1.3.1 三平台发版（正式流程）
+
+正式发布**不靠本机打包**，而是打标签让 CI 在三个原生 runner 上产出：
+
+```bash
+git tag -a v0.5.0 -m "v0.5.0 —— <一句话>"
+git push origin v0.5.0
+gh run watch --workflow=Release
+```
+
+流水线（`.github/workflows/release.yml`）依次做：`verify-version` 比对四处版本 → 三个 build job（windows-latest / macos-latest / ubuntu-22.04）各自现编 sidecar、**冒烟测试 sidecar**、打包、断言产物数量与体积 → `publish` 生成 `SHA256SUMS.txt` 并建 Release。
+
+**macOS 的 sidecar 必须准备三份**：`gw-server-aarch64-apple-darwin`、`gw-server-x86_64-apple-darwin` 和 lipo 出来的 `gw-server-universal-apple-darwin`。`tauri build --target universal-apple-darwin` 会按两个架构各走一遍构建，每遍的 build script 按自己那个 triple 找 externalBin，缺一个就在 `resource path ... doesn't exist` 处失败。
+
+**标签打错了怎么办**：只要 `publish` job 没跑成功（没有产生 Release），可以删远端标签重打：
+
+```bash
+git push origin :refs/tags/v0.5.0 && git tag -d v0.5.0
+git tag -a v0.5.0 -m "..." <正确的提交> && git push origin v0.5.0
+```
+
+**一旦 Release 已经建出来，不要再移动标签**——已发布的产物和标签必须对得上，改内容就发新版本号。
 
 ### 1.4 发布产物清单
 
-一次发布包含三个文件（与 GitHub Release 一致）：
+一次发布包含 8 个文件（三平台，与 GitHub Release 一致）：
 
-| 文件 | 说明 |
-|---|---|
-| `gw-client_<版本>_x64-setup.exe` | 桌面控制台 NSIS 安装包（内含 `gw-server` sidecar） |
-| `gw-server-x86_64-pc-windows-msvc.exe` | 仅服务端，裸跑用 |
-| `SHA256SUMS.txt` | 上面两个文件的 SHA256 |
+| 文件 | 平台 | 说明 |
+|---|---|---|
+| `gw-client_<版本>_x64-setup.exe` | Windows 10/11 x64 | NSIS 安装包（内含 `gw-server.exe`） |
+| `gw-client_<版本>_universal.dmg` | macOS 11+ | universal 包，Intel 与 Apple Silicon 同一个文件 |
+| `gw-client_<版本>_amd64.deb` | Linux x64 | Debian/Ubuntu 安装包 |
+| `gw-client_<版本>_amd64.AppImage` | Linux x64 | 免安装可执行 |
+| `gw-server-x86_64-pc-windows-msvc.exe` | Windows | 仅服务端，裸跑用 |
+| `gw-server-universal-apple-darwin` | macOS | 仅服务端，universal |
+| `gw-server-x86_64-unknown-linux-gnu` | Linux | 仅服务端 |
+| `SHA256SUMS.txt` | — | 上面七个文件的 SHA256 |
 
 `SHA256SUMS.txt` 格式（两空格分隔）：
 
 ```
-<sha256>  gw-client_0.4.6_x64-setup.exe
+<sha256>  gw-client_0.5.0_x64-setup.exe
 <sha256>  gw-server-x86_64-pc-windows-msvc.exe
 ```
+
+**三个平台都未做代码签名 / Apple 公证**：Windows 会弹 SmartScreen，macOS 会弹 Gatekeeper。绕过步骤写在 Release 说明里，不要删。
 
 ### 1.5 发布后要同步的文档
 
@@ -70,6 +104,7 @@ cd ../client; pnpm tauri build
 | 决策变化（2026-10-17 之前） | `docs/DECISIONS.md` |
 | 决策变化（2026-10-17 起） | `.agents/notes/`（见 [AGENTS.md](AGENTS.md) §5.5） |
 | 发版流程变化 | 本文件 |
+| 各文档页首的「已发布最新版」 | 六份 docs 页首 + `docs/方案.md` 的版本记录表 |
 
 ---
 
