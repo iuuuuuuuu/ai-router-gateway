@@ -137,8 +137,11 @@ jobs:
         working-directory: server
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      # universal 的 sidecar 必须自己也是 universal，否则 .app 里一半架构的
-      # 用户会在启动网关时拿到 "bad CPU type"。
+      # `tauri build --target universal-apple-darwin` 内部会按 aarch64 和 x86_64
+      # 各编一遍，每一遍的 build script 都会按**自己那个 triple** 去找 externalBin，
+      # 所以两个架构的单架构 sidecar 都必须存在；只放一个 universal 的会在
+      # 「resource path binaries/gw-server-aarch64-apple-darwin doesn't exist」处失败。
+      # 再额外 lipo 一份 universal 的，供冒烟测试与裸二进制分发使用。
       - name: Build sidecar (universal macOS)
         if: matrix.target == 'universal-apple-darwin'
         working-directory: server
@@ -147,6 +150,10 @@ jobs:
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
           mkdir -p ../client/src-tauri/binaries
+          for arch in aarch64-apple-darwin x86_64-apple-darwin; do
+            cp "target/$arch/release/gw-server" "../client/src-tauri/binaries/gw-server-$arch"
+            lipo -info "../client/src-tauri/binaries/gw-server-$arch"
+          done
           lipo -create \
             target/aarch64-apple-darwin/release/gw-server \
             target/x86_64-apple-darwin/release/gw-server \
@@ -182,6 +189,28 @@ jobs:
       - name: Build installers
         working-directory: client
         run: pnpm tauri build --target ${{ matrix.target }}
+
+      # 光看「打包成功」不足以保证 universal 真的 universal：如果合并阶段没把
+      # 内置的 gw-server lipo 起来，Intel 机器照样能装上一个只有 arm64 网关的包，
+      # 装完启动网关才报 "bad CPU type"。这里直接查二者都含两个架构。
+      - name: Assert macOS bundle is really universal
+        if: matrix.target == 'universal-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP=$(ls -d client/src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app)
+          echo "app bundle: $APP"
+          CLIENT_BIN="$APP/Contents/MacOS/gw-client"
+          [ -f "$CLIENT_BIN" ] || { echo "::error::app 里没有 gw-client"; exit 1; }
+          lipo -info "$CLIENT_BIN"
+          lipo -info "$CLIENT_BIN" | grep -q 'x86_64' || { echo "::error::主程序缺 x86_64"; exit 1; }
+          lipo -info "$CLIENT_BIN" | grep -q 'arm64' || { echo "::error::主程序缺 arm64"; exit 1; }
+          SERVER_BIN=$(find "$APP" -type f -name 'gw-server*' | head -1)
+          [ -n "$SERVER_BIN" ] || { echo "::error::app 里没有 gw-server sidecar"; exit 1; }
+          echo "sidecar: $SERVER_BIN"
+          lipo -info "$SERVER_BIN"
+          lipo -info "$SERVER_BIN" | grep -q 'x86_64' || { echo "::error::sidecar 缺 x86_64，Intel Mac 装上去会 bad CPU type"; exit 1; }
+          lipo -info "$SERVER_BIN" | grep -q 'arm64' || { echo "::error::sidecar 缺 arm64"; exit 1; }
 
       # ---------- 收集产物 ----------
       - name: Collect artifacts

@@ -26,6 +26,10 @@ Status: implemented
 
 **macOS 的 sidecar 必须自己也是 universal 的**：分别编 `aarch64-apple-darwin` 与 `x86_64-apple-darwin`，再用 `lipo -create` 合成 `gw-server-universal-apple-darwin`。只把 app 做成 universal、sidecar 留单架构，会让一半用户装得上但网关起不来（`bad CPU type`）。
 
+**但只准备 universal 那一个 sidecar 不够——两个单架构的也必须存在。** `tauri build --target universal-apple-darwin` 内部会按 `aarch64-apple-darwin` 和 `x86_64-apple-darwin` 各走一遍构建，每一遍的 build script 都按**自己那个 triple** 解析 externalBin。v0.5.0 首次发版就栽在这里：`resource path binaries/gw-server-aarch64-apple-darwin doesn't exist`，Windows 与 Linux 两个 job 成功而 macOS 失败。所以 `binaries/` 下要同时放 `gw-server-aarch64-apple-darwin`、`gw-server-x86_64-apple-darwin` 和 lipo 出来的 universal 那份，三份各司其职。
+
+**「打包成功」不等于「真的 universal」**。合并阶段若没把内置的 `gw-server` lipo 起来，Intel 机器照样能装上只有 arm64 网关的包，症状要等用户启动网关才出现。所以在打包之后、收集之前又加了一道 `lipo -info` 断言：`.app` 里的主程序和 sidecar 都必须同时含 `x86_64` 与 `arm64`，缺一个就 `::error::` 失败。这道断言是上面的失败换来的——第一次发版时它是缺的。
+
 **发布前有两道真实门禁**：
 
 1. `verify-version` job 比对标签、`tauri.conf.json`、两份 `Cargo.toml` 的版本号，四者不一致直接失败。错配的标签会在发布页上显示成正确版本，装到用户机器上才发现不对。
@@ -73,3 +77,4 @@ Status: implemented
 - **版本校验的判据**：四份版本号（标签 / `tauri.conf.json` / 两份 `Cargo.toml`）由 job 比对，任一不一致即 `::error::` 退出。
 - **`--locked` 一致性**：两份 `Cargo.lock` 已同步到 0.5.0，`cargo metadata --locked` 在两个 crate 上均 exit 0。
 - **GitHub Actions 实跑**：见 v0.5.0 的 release 工作流运行记录（三个 build job + 版本校验 + 发布 job）。
+- **首次发版时 macOS job 真红，Windows / Linux 真绿**：日志给出 `resource path binaries/gw-server-aarch64-apple-darwin doesn't exist`，据此定位到「universal 构建会分架构重跑 build script」这个机制。这条记录的价值在于：它证明这套门禁不是摆设——一个只在本机 Windows 上验证过的流水线，第一次上三平台就暴露了在本机永远看不到的问题。
