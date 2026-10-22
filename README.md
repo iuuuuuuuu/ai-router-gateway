@@ -6,8 +6,8 @@
 
 ## 结构
 
-- `server/` — Rust 网关（axum + reqwest + rusqlite），产出单文件 `gw-server.exe`（约 5MB）
-- `client/` — Tauri 2 + Vue 3 桌面控制台，托管网关进程（sidecar）、开机自启（默认关）
+- `server/` — Rust 网关（axum + reqwest + rusqlite），产出单文件 `gw-server`（Windows 上为 `gw-server.exe`，约 5MB）
+- `client/` — Tauri 2 + Vue 3 桌面控制台，托管网关进程（sidecar）、开机自启（默认关）。支持 Windows 10/11、macOS（Intel + Apple Silicon）、Linux
 - `docs/` — 设计与规格文档，见下「文档索引」
 - `tools/` — 开发期探针与构建脚本（绝大多数不入库）
 
@@ -20,6 +20,8 @@ $env:GW_DATA_DIR="D:/data"   # 目录（自动接 gateway.db）或 gateway.db �
 ./target/release/gw-server.exe
 ```
 
+bash / zsh 下等价（`GW_DATA_DIR=/data ./target/release/gw-server`），三平台通用的都是这一个环境变量。
+
 配置持久化在 SQLite；首次启动用默认配置，之后通过管理面 `PUT /admin/api/config`（或客户端 UI）修改并热更新（监听地址除外，需重启）。
 
 ## 客户端开发
@@ -28,7 +30,7 @@ $env:GW_DATA_DIR="D:/data"   # 目录（自动接 gateway.db）或 gateway.db �
 cd client
 pnpm install
 pnpm tauri dev    # 桌面窗口 + 自动拉起网关
-pnpm tauri build  # NSIS 安装包 + sidecar 打包
+pnpm tauri build  # 本平台安装包 + sidecar 打包（Windows: nsis / macOS: dmg / Linux: deb+AppImage）
 ```
 
 带调试口启动（真机验收探针需要）：`node tools/start-client.mjs client/src-tauri/target/release 9223`
@@ -71,11 +73,29 @@ cargo test --release    # 主门禁
 
 最新版本见 [Releases](https://github.com/iuuuuuuuu/ai-router-gateway/releases)。
 
-| 文件 | 说明 |
+| 平台 | 文件 | 说明 |
+|---|---|---|
+| Windows 10 / 11 (x64) | `gw-client_<ver>_x64-setup.exe` | 桌面控制台 NSIS 安装包（内含 `gw-server` sidecar，安装后托盘常驻、可开机自启） |
+| macOS 11+ (Intel + Apple Silicon) | `gw-client_<ver>_universal.dmg` | universal 包，同一个 dmg 两种芯片都能装 |
+| Linux (x64) | `gw-client_<ver>_amd64.deb` | Debian / Ubuntu 系安装包 |
+| Linux (x64) | `gw-client_<ver>_amd64.AppImage` | 免安装，`chmod +x` 后直接运行 |
+| 仅服务端 | `gw-server-*` | 裸跑用，不需要桌面控制台（见上「快速开始」） |
+| — | `SHA256SUMS.txt` | 上述文件的 SHA256 校验和 |
+
+**当前未做代码签名与 Apple 公证**，三个平台首次运行都会被系统拦一次：
+
+- **Windows**：SmartScreen 提示「Windows 已保护你的电脑」→「更多信息」→「仍要运行」。
+- **macOS**：提示「无法验证开发者」→ 在 Finder 里**右键**点应用选「打开」，再确认一次；或执行
+  `xattr -dr com.apple.quarantine /Applications/gw-client.app`。
+- **Linux**：`.deb` 用 `sudo dpkg -i` 安装；`.AppImage` 需要先 `chmod +x`。
+
+**数据目录**（`gateway.db` 与日志所在位置）：
+
+| 平台 | 位置 |
 |---|---|
-| `gw-client_0.4.8_x64-setup.exe` | 桌面控制台 NSIS 安装包（内含 `gw-server` sidecar，安装后托盘常驻、可开机自启） |
-| `gw-server-x86_64-pc-windows-msvc.exe` | 仅服务端，裸跑用（见上「快速开始」） |
-| `SHA256SUMS.txt` | 上述文件的 SHA256 校验和 |
+| Windows | 客户端 exe 同目录（与旧版一致，升级不会搬动已有数据库） |
+| macOS | `~/Library/Application Support/com.gawaty.client/` |
+| Linux | `~/.local/share/com.gawaty.client/` |
 
 ## 许可证
 

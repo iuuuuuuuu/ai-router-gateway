@@ -79,3 +79,105 @@ jobs:
       # --locked：Cargo.lock 与 Cargo.toml 不一致时直接失败，而不是在 CI 里静默改依赖版本。
       - name: cargo test --release
         run: cargo test --release --locked
+
+  # 客户端必须能在三个平台各自编译通过。
+  #
+  # 为什么需要：main.rs 里有大量 `#[cfg(windows)] / #[cfg(not(windows))]` 分支，
+  # 只在 Windows 上编译等于另一边的代码从来没被编译器看过一眼——那种错误只有到
+  # 发版那天才会暴露，而那时已经打了标签。这里每次都过一遍编译器。
+  #
+  # 只做 cargo check（不打包、不发版）：真正的安装包由 release.yml 产出。
+  # 但 check 也要真实：`tauri-build` 会在构建脚本里校验 externalBin 指向的文件是否存在，
+  # 所以必须先真的编出 server 并放到 Tauri 约定的名字上，否则这一步会直接失败
+  # （已实测：抽掉 sidecar 后 check 报 `resource path ... doesn't exist`）。用 debug 构建
+  # 即可，产物不发布，只要文件真实存在且能编过。
+  client-check:
+    name: Client check (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows
+            os: windows-latest
+            triple: x86_64-pc-windows-msvc
+          - label: macos
+            os: macos-latest
+            triple: aarch64-apple-darwin
+          - label: linux
+            os: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # 固定 10：client/package.json 的 `pnpm.onlyBuiltDependencies` 只有 pnpm 10 读。
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: client/pnpm-lock.yaml
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - name: Install Linux system deps
+        if: matrix.label == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf libxdo-dev libssl-dev \
+            build-essential curl wget file
+
+      - name: Cache cargo (server)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+          key: server-${{ matrix.triple }}
+
+      - name: Cache cargo (client)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: client/src-tauri
+          key: client-${{ matrix.triple }}
+
+      - name: Build server for staging
+        working-directory: server
+        run: cargo build --locked --target ${{ matrix.triple }}
+
+      - name: Stage sidecar
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p client/src-tauri/binaries
+          # Tauri 在 Windows 上要求的文件名带 .exe，其它平台不带；名字对不上就直接
+          # 报 `resource path ... doesn't exist`，不会静默降级。
+          if [ "${{ matrix.label }}" = "windows" ]; then
+            SRC="server/target/${{ matrix.triple }}/debug/gw-server.exe"
+            DEST="client/src-tauri/binaries/gw-server-${{ matrix.triple }}.exe"
+          else
+            SRC="server/target/${{ matrix.triple }}/debug/gw-server"
+            DEST="client/src-tauri/binaries/gw-server-${{ matrix.triple }}"
+          fi
+          cp "$SRC" "$DEST"
+          ls -l client/src-tauri/binaries/
+
+      - name: Build frontend
+        working-directory: client
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      # generate_context! / tauri-build 会读 tauri.conf.json 与图标文件，
+      # 所以这一步同时覆盖「配置写坏了」「图标缺了」这类错误。
+      - name: cargo check
+        working-directory: client/src-tauri
+        run: cargo check --locked --target ${{ matrix.triple }}

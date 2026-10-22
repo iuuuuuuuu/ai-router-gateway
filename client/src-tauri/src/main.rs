@@ -1,8 +1,9 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
@@ -13,6 +14,46 @@ struct GatewayChild(Mutex<Option<Child>>);
 /// Marker arg the autostart registration passes so a login launch stays in the
 /// tray instead of popping the window in the user's face.
 const AUTOSTART_ARG: &str = "--from-autostart";
+
+/// The directory the gateway keeps `gateway.db` / `gateway.log` in.
+///
+/// Set once during `setup()` from the Tauri path resolver, because the right
+/// answer differs per platform and the helper functions below have no
+/// `AppHandle`:
+///
+/// * Windows keeps it next to the exe — the layout every existing install
+///   already has, so upgrading must not move a user's database.
+/// * macOS and Linux use the platform data dir (`~/Library/Application
+///   Support/...`, `~/.local/share/...`). Next-to-the-exe is NOT usable there:
+///   on macOS that is `Contents/MacOS/` inside the .app bundle, which is
+///   code-signed and replaced wholesale on update, so the database would be
+///   destroyed by the next upgrade.
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+fn gw_data_dir() -> PathBuf {
+    match DATA_DIR.get() {
+        Some(d) => d.clone(),
+        // Only reachable if something asks before setup() ran. Falling back to
+        // the exe dir keeps the old behaviour instead of panicking.
+        None => exe_dir(),
+    }
+}
+
+fn exe_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The sidecar's file name as bundled: Tauri strips the `.exe` suffix on Unix.
+fn gateway_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "gw-server.exe"
+    } else {
+        "gw-server"
+    }
+}
 
 /// What the window-state plugin is allowed to persist between runs.
 ///
@@ -28,15 +69,6 @@ fn window_state_flags() -> StateFlags {
     StateFlags::all() & !StateFlags::VISIBLE & !StateFlags::DECORATIONS
 }
 
-fn gw_data_dir() -> std::path::PathBuf {
-    // keep db next to the exe in release; local dir in dev
-    if cfg!(debug_assertions) {
-        std::env::current_dir().unwrap().join("data")
-    } else {
-        std::env::current_exe().unwrap().parent().unwrap().to_path_buf()
-    }
-}
-
 fn gateway_running(port: u16) -> bool {
     TcpStream::connect(("127.0.0.1", port)).is_ok()
 }
@@ -48,20 +80,23 @@ fn spawn_gateway(app: &tauri::AppHandle) -> Result<(), String> {
     }
     let dir = gw_data_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let exe = dir.join("gw-server.exe");
-    // dev fallback: reuse the server workspace build output
+    let name = gateway_exe_name();
+    let exe = dir.join(name);
+    // Dev fallback: reuse the server workspace build output. Only reached when
+    // the sidecar has not been copied next to the client yet.
     let exe = if exe.exists() {
         exe
     } else {
         let alt = std::env::current_dir()
             .unwrap()
-            .join("../../server/target/release/gw-server.exe");
+            .join("../../server/target/release")
+            .join(name);
         if alt.exists() {
-            // copy next to client exe so upgrades are self-contained
+            // copy next to the client exe so upgrades are self-contained
             std::fs::copy(&alt, &exe).map_err(|e| e.to_string())?;
             exe
         } else {
-            return Err(format!("gw-server.exe not found: {}", alt.display()));
+            return Err(format!("{name} not found: {}", alt.display()));
         }
     };
     let mut cmd = Command::new(&exe);
@@ -100,7 +135,7 @@ fn spawn_gateway(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 /// Where spawn_gateway records the gateway pid.
-fn gateway_pid_path() -> std::path::PathBuf {
+fn gateway_pid_path() -> PathBuf {
     gw_data_dir().join("gateway.pid")
 }
 
@@ -128,6 +163,57 @@ fn process_image_name(pid: u32) -> Option<String> {
     Some(line.split("\",\"").next()?.trim_start_matches('"').to_string())
 }
 
+/// Same guard as the Windows `tasklist` path: never signal a pid that the OS
+/// has recycled into an unrelated process. `ps -o comm=` prints the executable
+/// basename on both Linux and macOS, which is what we compare against.
+#[cfg(not(windows))]
+fn process_image_name(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    // macOS reports the full path for some binaries; keep the basename.
+    Some(name.rsplit('/').next().unwrap_or(&name).to_string())
+}
+
+#[cfg(windows)]
+fn terminate_pid(pid: u32) {
+    let pid_arg = pid.to_string();
+    let _ = run_hidden("taskkill", &["/PID", &pid_arg, "/F"]);
+}
+
+/// Ask politely, then insist. Windows only gets the `/F` form above, so this
+/// path is the gentler of the two: SIGTERM lets the gateway release its SQLite
+/// handle before we fall back to SIGKILL.
+#[cfg(not(windows))]
+fn terminate_pid(pid: u32) {
+    let pid_arg = pid.to_string();
+    let _ = Command::new("kill").args(["-TERM", &pid_arg]).status();
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if !pid_alive(pid) {
+            return;
+        }
+    }
+    let _ = Command::new("kill").args(["-KILL", &pid_arg]).status();
+}
+
+#[cfg(not(windows))]
+fn pid_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// Stop the gateway. "退出（停止网关）" must always leave the machine clean: if we
 /// spawned the gateway we kill our own child, and if an earlier client instance
 /// did (spawn_gateway returns early once 9090 answers) we fall back to the pid
@@ -146,26 +232,16 @@ fn kill_gateway(app: &tauri::AppHandle) {
     else {
         return;
     };
-    #[cfg(not(windows))]
-    let _ = pid;
-    #[cfg(windows)]
-    {
-        if process_image_name(pid).as_deref() == Some("gw-server.exe") {
-            let pid_arg = pid.to_string();
-            let _ = run_hidden("taskkill", &["/PID", &pid_arg, "/F"]);
-            tray_debug(&format!("kill_gateway: killed orphan gw-server pid {pid}"));
-        }
+    if process_image_name(pid).as_deref() == Some(gateway_exe_name()) {
+        terminate_pid(pid);
+        tray_debug(&format!("kill_gateway: killed orphan gw-server pid {pid}"));
     }
     let _ = std::fs::remove_file(gateway_pid_path());
 }
 
 /// Where run/quit-flag.ps1 drops the graceful-quit request.
-fn quit_flag_path() -> std::path::PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join("quit.flag")
+fn quit_flag_path() -> PathBuf {
+    exe_dir().join("quit.flag")
 }
 
 /// Quit from a worker thread so RunEvent::Exit still runs (it stops the gateway
@@ -201,19 +277,25 @@ fn watch_quit_flag(app: tauri::AppHandle) {
 }
 
 fn tray_debug(msg: &str) {
-    if let Ok(dir) = std::env::current_exe().map(|p| p.parent().map(|d| d.to_path_buf())) {
-        if let Some(dir) = dir {
-            let line = format!("{msg}\n");
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("tray-debug.log"))
-                .and_then(|mut f| {
-                    use std::io::Write;
-                    f.write_all(line.as_bytes())
-                });
+    let line = format!("{msg}\n");
+    // Prefer the data dir (writable on every platform); fall back to the exe
+    // dir only if the data dir does not exist yet.
+    let log_dir = {
+        let d = gw_data_dir();
+        if d.exists() {
+            d
+        } else {
+            exe_dir()
         }
-    }
+    };
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_dir.join("tray-debug.log"))
+        .and_then(|mut f| {
+            use std::io::Write;
+            f.write_all(line.as_bytes())
+        });
 }
 
 fn show_main(app: &tauri::AppHandle) {
@@ -264,6 +346,24 @@ fn setup_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Windows keeps the database next to the exe (the layout every existing
+/// install already has). Elsewhere the exe lives inside a read-only or
+/// update-replaced bundle, so the platform data dir is the only place a
+/// database can survive an upgrade.
+fn resolve_data_dir(app: &tauri::AppHandle) -> PathBuf {
+    if cfg!(windows) {
+        return exe_dir();
+    }
+    // Debug builds keep the historical `./data` so dev runs stay self-contained
+    // and disposable, matching what the Windows dev path does.
+    if cfg!(debug_assertions) {
+        return std::env::current_dir().unwrap().join("data");
+    }
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| exe_dir())
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -279,6 +379,10 @@ fn main() {
         .manage(GatewayChild(Mutex::new(None)))
         .setup(|app| {
             let handle = app.handle().clone();
+            // Resolve before any worker thread can ask for it.
+            let data_dir = resolve_data_dir(&handle);
+            let _ = std::fs::create_dir_all(&data_dir);
+            let _ = DATA_DIR.set(data_dir);
             let from_autostart = std::env::args().any(|a| a == AUTOSTART_ARG);
             std::thread::spawn(move || {
                 if let Err(e) = spawn_gateway(&handle) {
@@ -288,7 +392,7 @@ fn main() {
             setup_tray(&app.handle())?;
             watch_quit_flag(app.handle().clone());
             if from_autostart {
-                // logged in with Windows: sit in the tray, do not steal focus
+                // launched at login: sit in the tray, do not steal focus
                 if let Some(w) = app.get_webview_window("main") {
                     let _ = w.hide();
                 }
