@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
                 l.https_enabled,
             )
         })
-        .unwrap_or_else(|| ("0.0.0.0:8080".into(), "0.0.0.0:8443".into(), true));
+        .unwrap_or_else(|| ("0.0.0.0:38080".into(), "0.0.0.0:38443".into(), true));
 
     let (cert, key) = tls::ensure_self_signed().expect("self-signed cert");
     let tls_cfg = axum_server::tls_rustls::RustlsConfig::from_der(vec![cert], key).await?;

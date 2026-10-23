@@ -500,11 +500,11 @@ onMounted(() => {
         </div>
 
         <div class="grid grid-cols-1 gap-x-5 gap-y-4 sm:grid-cols-2">
-          <Field label="HTTP 监听" hint="host:port，例如 0.0.0.0:8080">
+          <Field label="HTTP 监听" hint="host:port，例如 0.0.0.0:38080">
             <TInput
               v-model="listen.http"
               mono
-              placeholder="0.0.0.0:8080"
+              placeholder="0.0.0.0:38080"
               @input="markDirty()"
             />
           </Field>
@@ -512,7 +512,7 @@ onMounted(() => {
             <TInput
               v-model="listen.https"
               mono
-              placeholder="0.0.0.0:8443"
+              placeholder="0.0.0.0:38443"
               @input="markDirty()"
             />
           </Field>

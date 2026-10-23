@@ -52,8 +52,8 @@ node node_modules/@tauri-apps/cli/tauri.js build
 
 | 面 | 默认 | 说明 |
 |---|---|---|
-| 数据面 HTTP | `0.0.0.0:8080` | `/v1/chat/completions` `/v1/messages` `/v1beta/models/{m}:generateContent` `/v1/models` `/healthz` |
-| 数据面 HTTPS | `0.0.0.0:8443` | 同上，内置自签证书（SAN：localhost + 127.0.0.1） |
+| 数据面 HTTP | `0.0.0.0:38080` | `/v1/chat/completions` `/v1/messages` `/v1beta/models/{m}:generateContent` `/v1/models` `/healthz` |
+| 数据面 HTTPS | `0.0.0.0:38443` | 同上，内置自签证书（SAN：localhost + 127.0.0.1） |
 | 管理面 | `127.0.0.1:9090` | `/admin/api/*`，默认只绑回环 |
 
 ### 2.3 数据与配置

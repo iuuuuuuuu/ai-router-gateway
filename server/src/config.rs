@@ -192,8 +192,8 @@ pub struct ListenConfig {
     pub https_enabled: bool,
 }
 
-fn d_http_addr() -> String { "0.0.0.0:8080".into() }
-fn d_https_addr() -> String { "0.0.0.0:8443".into() }
+fn d_http_addr() -> String { "0.0.0.0:38080".into() }
+fn d_https_addr() -> String { "0.0.0.0:38443".into() }
 
 impl Default for ListenConfig {
     fn default() -> Self {

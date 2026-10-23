@@ -48,8 +48,8 @@ cargo test --release    # 主门禁
 
 | 面 | 端口 | 说明 |
 |---|---|---|
-| 数据面 HTTP | 8080 | `/v1/chat/completions` `/v1/messages` `/v1beta/models/{m}:generateContent` `/v1/models` `/healthz` |
-| 数据面 HTTPS | 8443 | 同上，内置自签证书（localhost/127.0.0.1） |
+| 数据面 HTTP | 38080 | `/v1/chat/completions` `/v1/messages` `/v1beta/models/{m}:generateContent` `/v1/models` `/healthz` |
+| 数据面 HTTPS | 38443 | 同上，内置自签证书（localhost/127.0.0.1） |
 | 管理面 | 127.0.0.1:9090 | `/admin/api/*`（config/logs/stats/health/test-channel/cooldown） |
 
 ## 文档索引
