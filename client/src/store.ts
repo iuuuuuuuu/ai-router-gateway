@@ -1,5 +1,5 @@
 // Shared application state: one loaded config document, shared by every page.
-// Pages mutate `state.cfg` in place and call markDirty(); the shell owns saving.
+// Inline edits use markDirty(); explicit save actions persist an isolated candidate.
 import { computed, reactive } from "vue";
 import { api, type AdminConfig, type Channel, type ModelBinding, type Group, type ApiKey } from "./api";
 import { toast } from "./toast";
@@ -41,7 +41,7 @@ export async function loadConfig(force = false) {
 
 export function normalize(cfg: any): AdminConfig {
   const c: AdminConfig = {
-    listen: cfg?.listen ?? { http: "0.0.0.0:8080", https: "0.0.0.0:8443", https_enabled: true },
+    listen: cfg?.listen ?? { http: "0.0.0.0:38080", https: "0.0.0.0:38443", https_enabled: true },
     admin: cfg?.admin ?? { bind: "127.0.0.1:9090", key: null },
     // 默认关闭：同级按列表顺序依次尝试（与 server/src/config.rs 的 d_auto_weight 一致）。
     auto_weight: cfg?.auto_weight ?? false,
@@ -91,10 +91,17 @@ function configProblems(cfg: AdminConfig): string[] {
 }
 
 export async function saveConfig(): Promise<boolean> {
-  if (!state.cfg) return false;
+  return persistConfigChange(() => {});
+}
+
+/** 在独立副本上提交；成功才发布到共享状态，失败保留表单与原配置供重试。 */
+export async function persistConfigChange(change: (cfg: AdminConfig) => void): Promise<boolean> {
+  if (!state.cfg || state.saving) return false;
+  const candidate: AdminConfig = JSON.parse(JSON.stringify(state.cfg));
+  change(candidate);
   // ★ 本地先拦一道：悬空引用不是「保存失败」而是「配置本身不成立」，
   //   说清数量与前几条，并告诉用户去哪儿处理，而不是把服务端 raw 400 甩出去。
-  const problems = configProblems(state.cfg);
+  const problems = configProblems(candidate);
   if (problems.length) {
     toast.err(
       `保存失败：配置里还有 ${problems.length} 处失效引用 —— ${problems.slice(0, 3).join("；")}` +
@@ -104,8 +111,28 @@ export async function saveConfig(): Promise<boolean> {
   }
   state.saving = true;
   try {
-    const res = await api.putConfig(JSON.parse(JSON.stringify(state.cfg)));
-    state.dirty = false;
+    // 服务端会按成员重算暴露模型；同步本地派生值，避免保存后仍显示旧列表。
+    const bindings = new Map(candidate.models.map(m => [m.id, m]));
+    for (const group of candidate.groups) {
+      const exposed = new Set<string>();
+      for (const tier of [...group.tiers].sort((a, b) => a.level - b.level)) {
+        for (const member of tier.members) {
+          const model = bindings.get(member.model_id);
+          if (model) exposed.add(model.exposed);
+        }
+      }
+      group.exposed_models = [...exposed];
+    }
+    const before = JSON.stringify(state.cfg);
+    const res = await api.putConfig(candidate);
+    if (JSON.stringify(state.cfg) === before) {
+      state.cfg = candidate;
+      state.dirty = false;
+    } else {
+      // 保留请求期间的新编辑，同时发布本次已落库的操作，避免新增项在本地丢失。
+      change(state.cfg);
+      state.dirty = true;
+    }
     state.version++;
     toast.ok(`配置已保存（版本 ${res?.config_version ?? "?"}）`);
     return true;

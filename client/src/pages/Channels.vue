@@ -10,7 +10,7 @@ import {
 } from "../components/ui";
 import ChannelCard from "../components/channels/ChannelCard.vue";
 import { api, type Channel, type InflightSnapshot, type ModelBinding } from "../api";
-import { channels, groupsUsingModel, markDirty, models, modelsOfChannel, state, uid } from "../store";
+import { channels, groupsUsingModel, markDirty, models, modelsOfChannel, persistConfigChange, state, uid } from "../store";
 import { toast } from "../toast";
 // fmtSec：界面时长统一显示成中文「秒」。v0.4.4 在 runFetch() 与 test() 里用上了它，
 // 却漏了这行 import —— 两处都在 try 里，于是 ReferenceError 被自己的 catch 抓住，
@@ -168,12 +168,13 @@ function openEdit(ch: Channel) {
 }
 
 function closeModal() {
+  if (state.saving) return;
   modalOpen.value = false;
 }
 
-function save() {
+async function save() {
   const cfg = state.cfg;
-  if (!cfg) return;
+  if (!cfg || state.saving) return;
   const name = form.name.trim();
   const baseUrl = form.base_url.trim();
   if (!name) { error.value = "渠道名称不能为空。"; return; }
@@ -196,10 +197,15 @@ function save() {
     weight: prev?.weight ?? 1,
     headers: parseHeaders(form.headersText),
   };
-  const i = cfg.channels.findIndex(c => c.id === editingId.value);
-  if (editingId.value && i >= 0) cfg.channels[i] = payload;
-  else cfg.channels.push(payload);
-  markDirty();
+  const saved = await persistConfigChange(next => {
+    const i = next.channels.findIndex(c => c.id === editingId.value);
+    if (editingId.value && i >= 0) next.channels[i] = payload;
+    else next.channels.push(payload);
+  });
+  if (!saved) {
+    error.value = "保存未成功，输入已保留，请重试。";
+    return;
+  }
   modalOpen.value = false;
   toast.ok(editingId.value ? "渠道「" + name + "」已更新" : "渠道「" + name + "」已添加");
 }
@@ -264,12 +270,13 @@ function openEditModel(m: ModelBinding) {
 }
 
 function closeModelModal() {
+  if (state.saving) return;
   modelModalOpen.value = false;
 }
 
-function saveModel() {
+async function saveModel() {
   const cfg = state.cfg;
-  if (!cfg) return;
+  if (!cfg || state.saving) return;
   if (!modelForm.channel_id) { modelError.value = "请先选择所属渠道（没有渠道时请先添加渠道）。"; return; }
   const exposed = modelForm.exposed.trim();
   const upstream = modelForm.upstream.trim();
@@ -293,10 +300,15 @@ function saveModel() {
     ],
     enabled: modelForm.enabled,
   };
-  const i = cfg.models.findIndex(m => m.id === modelEditingId.value);
-  if (modelEditingId.value && i >= 0) cfg.models[i] = payload;
-  else cfg.models.push(payload);
-  markDirty();
+  const saved = await persistConfigChange(next => {
+    const i = next.models.findIndex(m => m.id === modelEditingId.value);
+    if (modelEditingId.value && i >= 0) next.models[i] = payload;
+    else next.models.push(payload);
+  });
+  if (!saved) {
+    modelError.value = "保存未成功，输入已保留，请重试。";
+    return;
+  }
   epoch.value++;
   expanded[payload.channel_id] = true;
   modelModalOpen.value = false;
@@ -392,11 +404,11 @@ async function runFetch() {
 
 /**
  * 导入勾选的上游模型：每个模型名生成一条绑定（暴露名 = 上游名），默认启用、四档价格 0。
- * 已在本渠道绑定过的上游名直接跳过，不产生重复绑定。整批改完只 markDirty() 一次，由顶栏统一保存。
+ * 已在本渠道绑定过的上游名直接跳过，不产生重复绑定。整批一次提交，持久化成功后才关闭弹窗。
  */
-function importFetched() {
-  const cfg = state.cfg;
-  if (!cfg) return;
+async function importFetched() {
+  if (!state.cfg || state.saving) return;
+  const cfg: NonNullable<typeof state.cfg> = JSON.parse(JSON.stringify(state.cfg));
   const ch = fetchChannelId.value;
   if (!ch) { fetchErr.value = true; fetchMsg.value = "请先选择要导入到的渠道。"; return; }
   const bound = new Set(cfg.models.filter(m => m.channel_id === ch).map(m => m.upstream));
@@ -421,7 +433,12 @@ function importFetched() {
     fetchMsg.value = skipped ? "勾选的模型都已在本渠道绑定过了。" : "请先勾选要导入的模型。";
     return;
   }
-  markDirty();
+  const saved = await persistConfigChange(next => { next.models = cfg.models; });
+  if (!saved) {
+    fetchErr.value = true;
+    fetchMsg.value = "保存未成功，勾选已保留，请重试。";
+    return;
+  }
   epoch.value++;
   expanded[ch] = true;
   modelModalOpen.value = false;
@@ -684,7 +701,7 @@ function confirmRemoveModel() {
 
       <template #footer>
         <Btn @click="closeModal">取消</Btn>
-        <Btn variant="primary" data-test="save-channel" @click="save"><Check :size="13" /> 保存</Btn>
+        <Btn variant="primary" data-test="save-channel" :disabled="state.saving" @click="save"><Check :size="13" /> 保存</Btn>
       </template>
     </Modal>
 
@@ -846,12 +863,12 @@ function confirmRemoveModel() {
         <Btn @click="closeModelModal">取消</Btn>
         <Btn
           v-if="modelEditingId || modelMode === 'manual'"
-          variant="primary" data-test="save-model" @click="saveModel"
+          variant="primary" data-test="save-model" :disabled="state.saving" @click="saveModel"
         ><Check :size="13" /> 保存</Btn>
         <Btn
           v-else
           variant="primary" data-test="model-fetch-import"
-          :disabled="!selectedCount || fetching" @click="importFetched"
+          :disabled="!selectedCount || fetching || state.saving" @click="importFetched"
         ><Download :size="13" /> 导入所选（{{ selectedCount }}）</Btn>
       </template>
     </Modal>

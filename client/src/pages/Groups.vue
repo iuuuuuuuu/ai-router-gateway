@@ -10,7 +10,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { ChevronDown, Copy, LayoutDashboard, Plus, RefreshCw, Trash2, Waypoints } from "@lucide/vue";
 import { Badge, Btn, Card, Empty, IconBtn, Modal } from "../components/ui";
 import { openGroupDetail, openModelDetail } from "../nav";
-import { apiKeys, bindingLabel, channelName, groups, groupsUsingModel, markDirty, models, state, uid } from "../store";
+import { apiKeys, bindingLabel, channelName, groups, groupsUsingModel, markDirty, models, persistConfigChange, state, uid } from "../store";
 import { toast } from "../toast";
 import { fmtSec } from "../format";
 import {
@@ -339,11 +339,10 @@ function refreshAll() { void loadStats(); void loadGroupMembers(); }
 
 /* ------------------------------- 新建分组 ------------------------------- */
 // 新增分组不再开弹窗：直接建一个空壳塞进配置、进详情页填内容。
-// 只进内存（markDirty），要落库仍然得点顶栏「保存」—— 与其它页面同一套语义。
+// 创建成功落库后才进入详情，避免后续模型与密钥操作引用尚未保存的分组。
 // 起手给一个一级空层，用户到了详情页的模型配置区就能直接加成员，不用先点「添加一级」。
-function createGroup() {
-  const cfg = state.cfg;
-  if (!cfg) return;
+async function createGroup() {
+  if (!state.cfg || state.saving) return;
   const g: Group = {
     id: uid("grp"),
     name: "新分组",
@@ -351,9 +350,9 @@ function createGroup() {
     tiers: [{ level: 1, members: [] }],
     overrides: { retry: null },
   };
-  cfg.groups.push(g);
-  markDirty();
-  toast.ok("已添加分组，接着填名称与模型配置（暴露模型由成员自动汇总）");
+  const saved = await persistConfigChange(next => { next.groups.push(g); });
+  if (!saved) return;
+  toast.ok("分组已保存，接着填名称与模型配置（暴露模型由成员自动汇总）");
   openGroupDetail(g.id);
 }
 

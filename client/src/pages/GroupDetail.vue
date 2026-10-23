@@ -3,7 +3,7 @@
 // + 该分组的用量统计 + 请求日志 + 切换日志 + 冷却状态。
 // 2026-10-14：「模型配置」原本是一个独立子页（nav.groupView === "models"），已并入本页 ——
 // 层级 / 成员 / 权重直接在当前页面编辑，不再跳来跳去。本页因此同时管两份草稿（分组设置一份、
-// 路由层级一份），各自有独立的「保存 / 放弃」按钮，落库仍由顶栏「保存」统一负责。
+// 路由层级一份），各自有独立的「保存 / 放弃」按钮，点击本卡保存即持久化。
 // 进入页面时用 Promise.all 一次性并发拉全四份数据，页签切换只切本地视图；
 // 三个页签各自分页（请求日志 / 切换日志走服务端 limit+offset，冷却状态是本地分片），
 // 翻页只重拉两份日志，stats / health / 成员不动。
@@ -17,7 +17,7 @@ import {
   api, type CooldownRow as ApiCooldownRow, type Group, type GroupMember, type GroupMembersPayload,
   type RequestLog, type RetryConfig, type StatsPayload, type SwitchLog, type Tier, type TierMember,
 } from "../api";
-import { apiKeys, bindingLabel, channelName, markDirty, models, state } from "../store";
+import { apiKeys, bindingLabel, channelName, markDirty, models, persistConfigChange, state } from "../store";
 import { closeGroupDetail, openModelDetail } from "../nav";
 import { toast } from "../toast";
 import type { EChartsCoreOption } from "echarts/core";
@@ -494,6 +494,37 @@ const memberCount = computed(() =>
   sortedTiers.value.reduce((n, t) => n + (t.members?.length ?? 0), 0));
 const groupKeys = computed(() => apiKeys.value.filter(k => k.group_id === props.group?.id));
 const enabledKeys = computed(() => groupKeys.value.filter(k => k.enabled).length);
+const keyName = ref("");
+const keyValue = ref("");
+const keyError = ref("");
+async function addGroupKey() {
+  if (state.saving || !state.cfg) return;
+  keyError.value = "";
+  const key = keyValue.value.trim();
+  if (!key) { keyError.value = "请输入密钥。"; return; }
+  if (state.cfg.api_keys.some(k => k.key === key)) {
+    keyError.value = "该密钥已存在，请使用其他密钥。";
+    return;
+  }
+  const entry = { key, name: keyName.value.trim(), group_id: props.group.id, enabled: true };
+  if (await persistConfigChange(cfg => { cfg.api_keys.push(entry); })) {
+    keyName.value = "";
+    keyValue.value = "";
+  } else {
+    keyError.value = "保存未成功，输入已保留，请重试。";
+  }
+}
+async function toggleGroupKey(key: string) {
+  await persistConfigChange(cfg => {
+    const entry = cfg.api_keys.find(k => k.key === key && k.group_id === props.group.id);
+    if (entry) entry.enabled = !entry.enabled;
+  });
+}
+async function deleteGroupKey(key: string) {
+  await persistConfigChange(cfg => {
+    cfg.api_keys = cfg.api_keys.filter(k => !(k.key === key && k.group_id === props.group.id));
+  });
+}
 
 /** 本分组层级里引用到的渠道 id（冷却列表按它过滤）。 */
 const groupChannelIds = computed<Set<string>>(() => {
@@ -958,8 +989,9 @@ const sDirty = computed(() => {
 
 const sValid = computed(() => !sNameError.value && sBudget.value.ok);
 
-/** 写回配置（只进内存 + markDirty，落库交给顶栏「保存」）。 */
-function saveSettings() {
+/** 提交分组设置，成功后发布到共享配置；失败保留草稿。 */
+async function saveSettings() {
+  if (state.saving) return;
   const cfg = state.cfg;
   const g = props.group;
   if (!cfg || !g || !sValid.value) return;
@@ -976,11 +1008,13 @@ function saveSettings() {
     //   服务端会把它当成「跟随全局」（None 序列化成 "retry": null）。
     overrides: { retry: sRetry.value ? normRetry(sRetry.value) : null },
   };
-  const i = cfg.groups.findIndex(x => x.id === g.id);
-  if (i >= 0) cfg.groups.splice(i, 1, clean);
-  else cfg.groups.push(clean);
-  markDirty();
-  toast.ok(`已更新分组「${clean.name || clean.id}」的设置`);
+  const saved = await persistConfigChange(next => {
+    const i = next.groups.findIndex(x => x.id === g.id);
+    if (i >= 0) next.groups.splice(i, 1, clean);
+    else next.groups.push(clean);
+  });
+  if (!saved) return;
+  toast.ok(`已保存分组「${clean.name || clean.id}」的设置`);
 }
 
 /**
@@ -1000,7 +1034,7 @@ function resetSettings() {
 // 2026-10-14 从原本的独立「模型配置」页（原 client/src/pages/GroupModels.vue，已删除）搬进来，逻辑一字未改，
 // 只是从「整页」变成「分组详情页里的一张卡」：这样层级 / 成员 / 权重不用跳页就能改。
 // 编辑的是一份草稿（进入时深拷贝 props.group），只有点本卡的「保存模型配置」才写回 state.cfg
-// 并 markDirty()；「放弃修改」把草稿重新克隆一遍。落库仍然由顶栏「保存」统一负责。
+// 并直接持久化；「放弃修改」把草稿重新克隆一遍。
 //
 // ★ 本卡与「分组设置」卡各管一半字段，写回时必须原样带回对方那半：
 //   本卡的 saveTiers() 带回 overrides（组级策略配置）；saveSettings() 带回 tiers。
@@ -1283,8 +1317,8 @@ const blockReason = computed(() => emptyTierError.value || dupErrors.value[0] ||
 
 /* -------------------------------- 写回 -------------------------------- */
 
-function saveTiers() {
-  if (!tierValid.value) return;
+async function saveTiers() {
+  if (!tierValid.value || state.saving) return;
   const cfg = state.cfg;
   const g = props.group;
   if (!cfg) return;
@@ -1304,12 +1338,14 @@ function saveTiers() {
     //   等于把用户在同一页「分组设置」卡里配好的组级配置静默抹掉。
     overrides: g.overrides ? JSON.parse(JSON.stringify(g.overrides)) : { retry: null },
   };
-  const index = cfg.groups.findIndex(x => x.id === g.id);
-  if (index >= 0) cfg.groups.splice(index, 1, clean);
-  else cfg.groups.push(clean);
-  markDirty();
+  const saved = await persistConfigChange(next => {
+    const index = next.groups.findIndex(x => x.id === g.id);
+    if (index >= 0) next.groups.splice(index, 1, clean);
+    else next.groups.push(clean);
+  });
+  if (!saved) return;
   draft.value = clone(clean);
-  toast.ok(`已更新「${clean.name || clean.id}」的模型配置`);
+  toast.ok(`已保存「${clean.name || clean.id}」的模型配置`);
 }
 </script>
 
@@ -1699,7 +1735,7 @@ function saveTiers() {
               </Btn>
               <Btn
                 size="sm" variant="primary" data-test="gm-save"
-                :disabled="!tierValid || !tierDirty" @click="saveTiers"
+                :disabled="state.saving || !tierValid || !tierDirty" @click="saveTiers"
               >保存模型配置</Btn>
             </div>
           </div>
@@ -1905,7 +1941,7 @@ function saveTiers() {
             v-if="draft.tiers.length"
             class="border-t border-line-soft px-4 py-2.5 text-[11.5px] leading-4 text-ink-3"
             data-test="gd-tier-note"
-          >↑ 全部失败 → 回到一级（最多 {{ maxCycles }} 轮）；本卡改动只进内存，要落库请点顶栏的「保存」。</p>
+          >↑ 全部失败 → 回到一级（最多 {{ maxCycles }} 轮）；点击「保存模型配置」即持久化，无需再点顶栏保存。</p>
         </Card>
 
         <!-- 密钥列表（脱敏） -->
@@ -1914,6 +1950,12 @@ function saveTiers() {
             <KeyRound :size="15" class="text-ink-3" />
             <h2 class="text-[13.5px] font-semibold text-ink">密钥</h2>
             <span class="ml-auto text-[12px] text-ink-3">列表只显示前 8 位；点「复制」取完整密钥</span>
+          </div>
+          <div class="flex flex-wrap items-end gap-2 border-b border-line-soft px-4 py-3" data-test="group-key-form">
+            <Field label="名称"><TInput v-model="keyName" :disabled="state.saving" data-test="group-key-name" placeholder="例如：开发环境" /></Field>
+            <Field label="密钥"><TInput v-model="keyValue" type="password" :disabled="state.saving" data-test="group-key-value" autocomplete="new-password" placeholder="输入客户端调用密钥" /></Field>
+            <Btn variant="primary" :disabled="state.saving || !keyValue.trim()" data-test="group-key-add" @click="addGroupKey"><Plus :size="13" /> 添加并保存</Btn>
+            <Alert v-if="keyError" tone="err" class="w-full" data-test="group-key-error">{{ keyError }}</Alert>
           </div>
           <div v-if="groupKeys.length" class="overflow-x-auto">
             <table class="w-full text-[12.5px]">
@@ -1939,6 +1981,8 @@ function saveTiers() {
                       title="复制完整密钥"
                       @click="copyKey(k.key)"
                     ><Copy :size="14" /></IconBtn>
+                    <Btn size="sm" :disabled="state.saving" :data-test="'group-key-toggle-' + i" @click="toggleGroupKey(k.key)">{{ k.enabled ? "停用" : "启用" }}</Btn>
+                    <Btn size="sm" :disabled="state.saving" :data-test="'group-key-delete-' + i" @click="deleteGroupKey(k.key)">删除</Btn>
                   </td>
                 </tr>
               </tbody>
