@@ -141,6 +141,44 @@ async function confirmPurge() {
   }
 }
 
+/* ------------------------------ 轻量模式 ------------------------------ */
+// 关窗时销毁 WebView2（省内存）还是只隐藏（快）。开关存在客户端数据目录的
+// client-settings.json，由桌面壳持有 —— 界面被销毁后托盘仍要能改回来。
+const lightweight = ref(true);
+const lightweightBusy = ref(false);
+
+async function invokeShell<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {
+  const mod = await import("@tauri-apps/api/core");
+  return mod.invoke<T>(cmd, args);
+}
+
+async function loadLightweight() {
+  if (!inTauri) return;
+  try {
+    const s = await invokeShell<{ lightweight_mode: boolean }>("client_settings");
+    lightweight.value = Boolean(s?.lightweight_mode);
+  } catch (e: any) {
+    toast.err("读取轻量模式设置失败：" + String(e?.message || e));
+  }
+}
+
+async function toggleLightweight() {
+  if (!inTauri || lightweightBusy.value) return;
+  const before = lightweight.value;
+  const next = !before;
+  lightweightBusy.value = true;
+  try {
+    await invokeShell<void>("set_lightweight_mode", { enabled: next });
+    lightweight.value = next;
+    toast.ok(next ? "已开启轻量模式：关闭窗口会释放界面内存" : "已关闭轻量模式：关闭窗口只隐藏界面");
+  } catch (e: any) {
+    lightweight.value = before;
+    toast.err("设置轻量模式失败：" + String(e?.message || e));
+  } finally {
+    lightweightBusy.value = false;
+  }
+}
+
 /* ------------------------------ 开机自启 ------------------------------ */
 // 只影响桌面客户端本身，不写入服务端配置。
 const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -197,6 +235,7 @@ onMounted(() => {
     if (typeof r.loop_guard_reasoning_enabled !== "boolean") r.loop_guard_reasoning_enabled = true;
   }
   void loadAutostart();
+  void loadLightweight();
 });
 </script>
 
@@ -643,6 +682,46 @@ onMounted(() => {
         <Alert v-else tone="info" class="mt-4">
           <span class="inline-flex items-center gap-1.5">
             <Timer :size="13" />当前未开启，需要时手动打开上面的开关即可。
+          </span>
+        </Alert>
+      </Card>
+
+      <!-- ------------------------------ 轻量模式 ------------------------------ -->
+      <Card>
+        <div class="mb-3.5">
+          <h2 class="text-[13.5px] font-semibold text-ink">轻量模式</h2>
+          <p class="mt-0.5 text-[12.5px] text-ink-3">
+            关闭窗口后只剩托盘图标时，决定要不要把界面一并释放掉。
+          </p>
+        </div>
+
+        <div>
+          <TToggle
+            :model-value="lightweight"
+            label="关闭窗口时释放界面内存"
+            :disabled="!inTauri || lightweightBusy"
+            data-test="lightweight-toggle"
+            @update:model-value="toggleLightweight"
+          />
+          <p class="mt-1 text-[11.5px] leading-4 text-ink-3">
+            开启后关窗会销毁界面进程（省下百兆级内存），网关照常转发请求；从托盘再打开会重建界面并恢复配置。
+            若当时还有未保存的改动，这一次只会隐藏窗口，不会丢你的输入。
+          </p>
+        </div>
+
+        <Alert v-if="!inTauri" tone="info" class="mt-4">
+          <span class="inline-flex items-center gap-1.5">
+            <Power :size="13" />仅在桌面客户端中可用。
+          </span>
+        </Alert>
+        <Alert v-else-if="lightweight" tone="ok" class="mt-4">
+          <span class="inline-flex items-center gap-1.5">
+            <Rocket :size="13" />已开启：关窗只保留托盘与网关，界面内存会被释放。
+          </span>
+        </Alert>
+        <Alert v-else tone="info" class="mt-4">
+          <span class="inline-flex items-center gap-1.5">
+            <Timer :size="13" />已关闭：关窗只隐藏界面，再打开更快，但界面内存一直占着。
           </span>
         </Alert>
       </Card>

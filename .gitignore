@@ -247,3 +247,7 @@ Desktop.ini
 /tools/_stats-ui.png
 /tools/_ladder-upstream.mjs
 /tools/_ladder-imm.mjs
+
+# ── 轻量模式真机验收（本机证据，不入库）──
+/tools/_probe-lightweight.mjs
+/tools/_probe-lite-ui.mjs

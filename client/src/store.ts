@@ -19,6 +19,25 @@ export const state = reactive({
 
 export function markDirty() { state.dirty = true }
 
+/**
+ * 页面级本地草稿（例如分组详情里还没点「保存模型配置」的层级编辑）。
+ *
+ * 它们不是 `state.cfg` 的一部分，所以 `state.dirty` 看不到它们；但对用户来说同样是
+ * 「还没保存的工作」。桌面端轻量模式关窗时会销毁 webview，靠 `hasUnsavedWork`
+ * 决定能不能销毁 —— 少登记一处，用户关个窗就把草稿丢了。
+ *
+ * 用 key 作集合：同一个页面重复登记不会叠加，卸载时记得清掉自己那条。
+ */
+const localDrafts = reactive(new Set<string>());
+
+export function setLocalDraft(key: string, dirty: boolean) {
+  if (dirty) localDrafts.add(key);
+  else localDrafts.delete(key);
+}
+
+/** 有没有任何未落库的工作：全局配置改动 + 各页面的本地草稿。 */
+export const hasUnsavedWork = computed(() => state.dirty || localDrafts.size > 0);
+
 export async function loadConfig(force = false) {
   if (state.loading) return;
   if (state.loaded && !force) return;

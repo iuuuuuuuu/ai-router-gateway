@@ -17,7 +17,7 @@ import {
   api, type CooldownRow as ApiCooldownRow, type Group, type GroupMember, type GroupMembersPayload,
   type RequestLog, type RetryConfig, type StatsPayload, type SwitchLog, type Tier, type TierMember,
 } from "../api";
-import { apiKeys, bindingLabel, channelName, markDirty, models, persistConfigChange, state } from "../store";
+import { apiKeys, bindingLabel, channelName, markDirty, models, persistConfigChange, setLocalDraft, state } from "../store";
 import { closeGroupDetail, openModelDetail } from "../nav";
 import { toast } from "../toast";
 import type { EChartsCoreOption } from "echarts/core";
@@ -1061,6 +1061,16 @@ function tierSig(g: Group): string {
   return JSON.stringify((g.tiers ?? []).map(t => (t.members ?? []).map(m => [m.model_id, Number(m.weight) || 0])));
 }
 const tierDirty = computed(() => tierSig(draft.value) !== tierSig(props.group));
+
+/* 两张卡的草稿都只在本页内存里，`state.dirty` 看不到它们（层级编辑不 markDirty）。
+   轻量模式关窗会销毁 webview，所以必须登记，否则用户关个窗就把改了一半的层级丢掉。
+   卸载时清掉自己那条，避免切页后残留成「永远有未保存工作」。 */
+watch(
+  () => tierDirty.value || sDirty.value,
+  (dirty) => setLocalDraft("group-detail:draft", dirty),
+  { immediate: true },
+);
+onUnmounted(() => setLocalDraft("group-detail:draft", false));
 
 function resetDraft() {
   draft.value = clone(props.group);

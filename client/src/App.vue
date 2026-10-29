@@ -5,7 +5,7 @@ import {
   PanelLeftClose, PanelLeftOpen, RefreshCw, Save, CircleAlert, Wifi, WifiOff, LoaderCircle,
   ArrowLeft,
 } from "@lucide/vue";
-import { groups, loadConfig, saveConfig, state, revert } from "./store";
+import { groups, hasUnsavedWork, loadConfig, saveConfig, state, revert } from "./store";
 import { closeGroupDetail, goto, nav, type PageKey } from "./nav";
 import { api } from "./api";
 import Toaster from "./components/Toaster.vue";
@@ -83,6 +83,24 @@ onMounted(async () => {
   timer = window.setInterval(ping, 5000);
 });
 onUnmounted(() => { if (timer) window.clearInterval(timer); });
+
+/* -------------------- 未保存工作 → 桌面壳（关窗能否销毁界面） -------------------- */
+// 轻量模式关窗会销毁整个 webview，未落库的东西会一起没。桌面壳据此决定销毁还是只隐藏：
+// 报 true 就一直安全（最坏只是少省一次内存），报 false 才允许销毁。
+const inTauri = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+let invokeFn: ((cmd: string, args?: any) => Promise<any>) | null = null;
+async function reportUnsaved(unsaved: boolean) {
+  if (!inTauri) return;
+  try {
+    if (!invokeFn) {
+      invokeFn = (await import("@tauri-apps/api/core")).invoke;
+    }
+    await invokeFn("ui_unsaved", { dirty: unsaved });
+  } catch {
+    // 上报失败不弹错：这条只影响「关窗能不能省内存」，不该打扰用户。
+  }
+}
+watch(hasUnsavedWork, (v) => void reportUnsaved(v), { immediate: true });
 
 const heading = computed(() => (nav.modelKey ? "模型详情"
   : detailGroup.value ? "分组详情"

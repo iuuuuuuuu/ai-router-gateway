@@ -10,7 +10,7 @@ import {
 } from "../components/ui";
 import ChannelCard from "../components/channels/ChannelCard.vue";
 import { api, type Channel, type InflightSnapshot, type ModelBinding } from "../api";
-import { channels, groupsUsingModel, markDirty, models, modelsOfChannel, persistConfigChange, state, uid } from "../store";
+import { channels, groupsUsingModel, markDirty, models, modelsOfChannel, persistConfigChange, setLocalDraft, state, uid } from "../store";
 import { toast } from "../toast";
 // fmtSec：界面时长统一显示成中文「秒」。v0.4.4 在 runFetch() 与 test() 里用上了它，
 // 却漏了这行 import —— 两处都在 try 里，于是 ReferenceError 被自己的 catch 抓住，
@@ -232,6 +232,13 @@ const modelForm = reactive({
 
 const channelOptions = computed(() =>
   channels.value.map(c => ({ value: c.id, label: c.name || c.id, hint: c.id })),
+);
+
+// 两个弹窗里的输入都是本地草稿：关窗销毁 webview 时会一起没，所以登记给桌面壳，
+// 由它决定「关窗能不能销毁界面」。放在两个 ref 都声明之后，避免初始化时读到 TDZ。
+watch(
+  () => modalOpen.value || modelModalOpen.value,
+  (open) => setLocalDraft("channels:modal", open),
 );
 
 function openCreateModel(channelId = "") {
