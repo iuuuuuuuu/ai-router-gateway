@@ -24,7 +24,9 @@ if (!BIN) {
 const dataDir = mkdtempSync(join(tmpdir(), 'gw-smoke-'));
 // 默认打真实的 /healthz；允许覆盖仅为「证明断言会红」的故障注入留入口，
 // 流水线一律用默认值，不要拿它把门禁指到一个假地址上蒙绿。
-const HEALTH = process.env.GW_SMOKE_HEALTH_URL || 'http://127.0.0.1:8080/healthz';
+// 端口必须跟 server/src/config.rs 的 d_http_addr 一致：改成 8080 就永远打不中
+// 新默认端口，冒烟会在「60000ms 内未拿到健康响应」处变红（v0.6.0 前实际踩过）。
+const HEALTH = process.env.GW_SMOKE_HEALTH_URL || 'http://127.0.0.1:38080/healthz';
 const DEADLINE_MS = 60_000; // 冷启动 + sqlite 初始化，给足；超时就是失败，不放宽。
 
 let log = '';
